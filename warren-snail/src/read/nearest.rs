@@ -746,6 +746,7 @@ impl Snail {
                 None,
                 kept.set.as_ref(),
                 &most,
+                None,
                 &mut |rows| {
                     let rows: Vec<Vec<Value>> = rows
                         .into_iter()
@@ -844,6 +845,7 @@ impl Snail {
                     q,
                     answer: Answer::new(&q.select).typed(&[table]),
                     most: None,
+                    stop: None,
                     feed: |batch: RecordBatch| {
                         let rows = pipeline::relation_of(&batch)?
                             .rows

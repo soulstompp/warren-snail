@@ -90,10 +90,11 @@ impl Reads for Cached<'_> {
         order: Option<&str>,
         kept: Option<&super::walk::KeySet>,
         most: &std::cell::Cell<Option<u64>>,
+        stop: Option<&std::cell::Cell<bool>>,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round> {
         if kept.is_some() || order.is_some() {
-            return self.reads.read_each(q, order, kept, most, each);
+            return self.reads.read_each(q, order, kept, most, stop, each);
         }
         let key = format!("{q:?}");
         let found = self.kept.places.borrow().get(&key).cloned();
@@ -102,8 +103,9 @@ impl Reads for Cached<'_> {
             rows.each_chunk(each)?;
             return Ok(Round::default());
         }
+        // Kept for every set of values that asks, it is read whole whatever one of them stops.
         let run = Run::new();
-        let round = self.reads.read_each(q, None, None, most, &mut |rows| {
+        let round = self.reads.read_each(q, None, None, most, None, &mut |rows| {
             let mut copy = Vec::with_capacity(rows.len());
             for r in &rows {
                 copy.push(r.clone());

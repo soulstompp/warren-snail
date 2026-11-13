@@ -8,7 +8,7 @@ mod weather;
 
 use warren_snail::catalog::Catalog;
 use warren_snail::read::Snail;
-use weather::{tmp, write};
+use weather::{fresh, tmp, write};
 
 const DDL: &str = "CREATE SCHEMA fo;
      CREATE TABLE fo.src (k integer NOT NULL, v integer, PRIMARY KEY (k));
@@ -327,4 +327,79 @@ fn a_union_all_s_arms_past_its_reader_s_cut_are_never_read() {
             ),
         ],
     );
+}
+
+#[test]
+fn a_set_s_rows_are_handed_on_as_they_are_made() {
+    let mut w = snail("sets");
+    drawn(
+        &mut w,
+        &[
+            (
+                "SELECT x.a, nextval('fo.q') FROM (SELECT nextval('fo.q') AS a, generate_series(1, 2) AS g) x",
+                rows(&["1|2", "3|4"]),
+                None,
+            ),
+            ("SELECT nextval('fo.q'), generate_series(1, 3) LIMIT 2", rows(&["1|1", "2|2"]), Some("2")),
+            (
+                "SELECT nextval('fo.q'), generate_series(1, 2) FROM fo.src LIMIT 3",
+                rows(&["1|1", "2|2", "4|1"]),
+                Some("4"),
+            ),
+            (
+                "SELECT g FROM (SELECT generate_series(1, 100000000) AS g) x LIMIT 3",
+                rows(&["1", "2", "3"]),
+                None,
+            ),
+        ],
+    );
+}
+
+// A scan stops once the cut its rows reach has them all: the blocks past it are never read, their
+// pages predicted and left unread, the rest read as predicted.
+#[test]
+fn a_scan_stops_once_its_cut_has_its_rows() {
+    let path = tmp("pulled-scan.snail");
+    let ddl = "CREATE SCHEMA fo; CREATE TABLE fo.big (k integer NOT NULL, v integer, PRIMARY KEY (k));";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    Snail::open_writing(&path)
+        .unwrap()
+        .execute("INSERT INTO fo.big SELECT g, g * 10 FROM generate_series(1, 20000) g")
+        .unwrap();
+    let asked = |q: &str| {
+        let mut s = fresh(&path);
+        let (b, round) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {e}"));
+        weather::exact(q, &round);
+        let rows: Vec<String> = s
+            .text_of(&b)
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(Option::unwrap_or_default)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect();
+        (rows, round)
+    };
+    let (_, all) = asked("SELECT k, v FROM fo.big");
+    assert!(all.blocks_read > 2, "{all:?}");
+    for (q, want) in [
+        ("SELECT k FROM fo.big LIMIT 3", vec!["1", "2", "3"]),
+        ("SELECT k, v FROM fo.big WHERE v > 100 LIMIT 3", vec!["11|110", "12|120", "13|130"]),
+        ("SELECT x.k FROM (SELECT k FROM fo.big) x LIMIT 3", vec!["1", "2", "3"]),
+        ("SELECT k, generate_series(1, 3) FROM fo.big LIMIT 4", vec!["1|1", "1|2", "1|3", "2|1"]),
+        ("SELECT k FROM fo.big UNION ALL SELECT k FROM fo.big LIMIT 3", vec!["1", "2", "3"]),
+    ] {
+        let (got, round) = asked(q);
+        assert_eq!(got, want, "{q}");
+        assert_eq!(round.blocks_read, 1, "{q}: {round:?}");
+        assert!(round.column_pages_unread > 0, "{q}: {round:?}");
+    }
+    // A sort reads every row first.
+    let (got, round) = asked("SELECT k FROM fo.big ORDER BY v DESC LIMIT 3");
+    assert_eq!(got, ["20000", "19999", "19998"]);
+    assert_eq!(round.blocks_read, all.blocks_read, "{round:?}");
+    assert_eq!(round.column_pages_unread, 0, "{round:?}");
 }

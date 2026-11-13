@@ -138,9 +138,10 @@ impl relations::Reads for Snail {
         order: Option<&str>,
         kept: Option<&KeySet>,
         most: &std::cell::Cell<Option<u64>>,
+        stop: Option<&std::cell::Cell<bool>>,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round> {
-        self.read_blocks(q, order, kept, most, each)
+        self.read_blocks(q, order, kept, most, stop, each)
     }
 
     fn strand_wins(&self, q: &Question, strand: &str) -> Result<bool> {
@@ -694,6 +695,11 @@ pub struct Round {
     pub column_pages_held: u64,
     /// The column pages read from the file.
     pub column_pages_read: u64,
+    /// Of the column pages predicted, and of the directory pages of page maps, those of the blocks
+    /// a read left unread once whoever read its rows read no more: the pages it read are those
+    /// predicted less these and those held.
+    pub column_pages_unread: u64,
+    pub directory_pages_unread: u64,
     /// The entries the round looked at, at every level of the order's directory: none of whose rows
     /// the question holds, some, or every one.
     pub entries: u64,
@@ -745,6 +751,8 @@ impl Round {
         self.column_pages_predicted += table.column_pages_predicted;
         self.column_pages_held += table.column_pages_held;
         self.column_pages_read += table.column_pages_read;
+        self.column_pages_unread += table.column_pages_unread;
+        self.directory_pages_unread += table.directory_pages_unread;
         self.entries += table.entries;
         self.entries_none += table.entries_none;
         self.entries_may += table.entries_may;
@@ -2062,14 +2070,17 @@ impl Snail {
             stream.backward();
         }
         let sorted_at = strand.as_ref().map(|(_, at, _)| at.clone());
-        // Each block's rows go to the pipeline as the scan reads them, in the order.
+        // Each block's rows go to the pipeline as the scan reads them, in the order, none past the
+        // block where its cut has its rows.
         let most = std::cell::Cell::new(None);
+        let stop = std::cell::Cell::new(false);
         let mut told = false;
         let mut blocks = Blocks {
             table,
             q: &base,
             answer: Answer::new(&base.select),
             most: Some(&most),
+            stop: Some(&stop),
             feed: |batch: RecordBatch| {
                 if !told {
                     told = true;
@@ -2084,7 +2095,9 @@ impl Snail {
                 if let Some(at) = &sorted_at {
                     pipeline::in_place(&mut rel.rows, at)?;
                 }
-                stream.feed(rel)
+                stream.feed(rel)?;
+                stop.set(stream.ended());
+                Ok(())
             },
         };
         let read_along = match &strand {
@@ -2124,13 +2137,14 @@ impl Snail {
 
     /// A question of rows on one table, kept to the keys `kept` holds where it is given them: the
     /// round along the order whose pages are fewest, those keys known before it is priced, its rows
-    /// handed to `each` a block at a time as they are read.
+    /// handed to `each` a block at a time as they are read, none past the block where `stop` is set.
     pub(super) fn read_blocks(
         &self,
         q: &Question,
         order: Option<&str>,
         kept: Option<&KeySet>,
         most: &std::cell::Cell<Option<u64>>,
+        stop: Option<&std::cell::Cell<bool>>,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round> {
         let table = &self.catalog.tables[q.sides[0].table];
@@ -2140,6 +2154,7 @@ impl Snail {
             q,
             answer: Answer::new(&q.select).typed(&[table]),
             most: Some(most),
+            stop,
             feed: |batch: RecordBatch| {
                 rows += batch.num_rows() as u64;
                 each(pipeline::relation_of(&batch)?.rows)
@@ -2306,6 +2321,17 @@ impl Snail {
             }
             return Err(e);
         }
+        // A read its reader stopped left its later blocks unread, their pages predicted all the
+        // same; a block it never reached is pruned by no read.
+        let (blocks_read, column_pages_unread, directory_pages_unread) = match part.plan.stopped() {
+            Some(s) => {
+                self.wasted.borrow_mut().retain(|x| {
+                    !(x.table == want.side.table && x.order == w.order && s.left.contains(&x.child))
+                });
+                (s.blocks_read, s.column_pages, s.map_pages)
+            }
+            None => (part.plan.blocks_read(), 0, 0),
+        };
         let round = Round {
             order: table.orders[w.order].name.clone(),
             served: part.served.clone(),
@@ -2321,11 +2347,13 @@ impl Snail {
             column_pages_predicted: part.plan.column_pages,
             column_pages_held,
             column_pages_read,
+            column_pages_unread,
+            directory_pages_unread,
             entries: w.statuses.0 + w.statuses.1 + w.statuses.2,
             entries_none: w.statuses.0,
             entries_may: w.statuses.1,
             entries_must: w.statuses.2,
-            blocks_read: part.plan.blocks_read(),
+            blocks_read,
             rows: 0,
             blocks_pruned: 0,
             pages_written: 0,
@@ -2561,6 +2589,8 @@ struct Blocks<'a, F: FnMut(RecordBatch) -> Result<()>> {
     answer: Answer,
     /// Told the rows the counts say the round may give, before its first block.
     most: Option<&'a std::cell::Cell<Option<u64>>>,
+    /// Set once the pipeline reads no row more.
+    stop: Option<&'a std::cell::Cell<bool>>,
     feed: F,
 }
 
@@ -2569,6 +2599,10 @@ impl<F: FnMut(RecordBatch) -> Result<()>> Sink for Blocks<'_, F> {
         if let Some(m) = self.most {
             m.set(Some(n));
         }
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.is_some_and(std::cell::Cell::get)
     }
 
     fn dictionaries(&mut self, dicts: &[Dict]) {
@@ -2617,6 +2651,10 @@ impl Sink for Told<'_> {
         to: usize,
     ) -> bool {
         self.0.run(outs, from, to)
+    }
+
+    fn stopped(&self) -> bool {
+        self.0.stopped()
     }
 
     fn block_end(&mut self) -> Result<()> {

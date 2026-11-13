@@ -52,6 +52,10 @@ pub trait Sink {
     fn block_end(&mut self) -> Result<()> {
         Ok(())
     }
+    /// Whether whoever reads the rows reads no more: no block past it is read.
+    fn stopped(&self) -> bool {
+        false
+    }
 }
 
 /// A table read alone hands its rows to the answer, its columns the answer's inputs in order.
@@ -650,9 +654,33 @@ pub struct Plan {
     held_read: Counted<u64>,
     /// The bytes of the pages it reads of each leaf.
     written: Vec<u64>,
+    /// The directory pages each block's map adds to `map_pages` as the read reaches it.
+    map_steps: Vec<u64>,
+    /// Where its read stopped, its reader reading no more: the blocks before it read.
+    stopped_at: Counted<Option<usize>>,
+}
+
+/// What a read its reader stopped read and left: the blocks it read, and of those it left, their
+/// column pages, the directory pages of their page maps, and where each lies.
+pub(super) struct Stopped {
+    pub(super) blocks_read: u64,
+    pub(super) column_pages: u64,
+    pub(super) map_pages: u64,
+    pub(super) left: Vec<Extent>,
 }
 
 impl Plan {
+    /// Where its read stopped before its last block, what it read and what it left.
+    pub(super) fn stopped(&self) -> Option<Stopped> {
+        let at = self.stopped_at.get()?;
+        Some(Stopped {
+            blocks_read: at as u64,
+            column_pages: self.reads[at..].iter().map(|br| u64::from(br.pages)).sum(),
+            map_pages: self.map_steps[at..].iter().sum(),
+            left: self.reads[at..].iter().map(|br| br.child).collect(),
+        })
+    }
+
     /// The bytes a row of the blocks the plan reads holds of the held leaves `slots`, as it writes them.
     pub(super) fn bytes_a_row(&self, slots: std::ops::Range<usize>) -> u64 {
         let bytes: u64 = self.written[slots].iter().sum();
@@ -696,6 +724,7 @@ impl Plan {
         let mut last: Option<(u64, u64)> = None;
         let mut n = 0;
         let maps = &self.maps.get_mut().pages;
+        self.map_steps.clear();
         for br in &self.reads {
             let run = map_run_of(br.child).0;
             let pages = run.pages();
@@ -704,9 +733,11 @@ impl Plan {
                 .get(&run.start)
                 .is_some_and(|b| b.len() as u64 >= enough);
             if held || matches!(last, Some((s, p)) if s == run.start && p >= pages) {
+                self.map_steps.push(0);
                 continue;
             }
             n += pages;
+            self.map_steps.push(pages);
             last = Some((run.start, pages));
         }
         self.map_pages = n;
@@ -1247,6 +1278,8 @@ impl Snail {
             held,
             held_read: Default::default(),
             written,
+            map_steps: Vec::new(),
+            stopped_at: Default::default(),
         };
         plan.count_map_pages();
         Ok(plan)
@@ -1485,7 +1518,13 @@ impl Snail {
         }
         let descs = crate::write::leaf_descriptors(table, order)?;
         let tag = super::order_tag(want.side.table, plan.walk.order);
-        for br in &plan.reads[blocks] {
+        let first = blocks.start;
+        for (i, br) in plan.reads[blocks].iter().enumerate() {
+            // Whoever reads the rows reads no more: no block past it is reached.
+            if sink.stopped() {
+                plan.stopped_at.set(Some(first + i));
+                break;
+            }
             let map = self.reached_map(plan, br, tag)?;
             let reads = pages_read_of(&map, br, walk, want.keys);
             debug_assert_eq!(disk_pages(&map, &reads).count() as u32, br.pages);

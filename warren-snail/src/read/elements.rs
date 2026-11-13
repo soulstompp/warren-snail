@@ -1474,6 +1474,7 @@ impl Snail {
                 q: &q,
                 answer: super::answer::Answer::new(&q.select).typed(&[table]),
                 most: None,
+                stop: None,
                 feed: |batch: arrow::array::RecordBatch| {
                     for row in rows_of(&batch)? {
                         let key: Vec<KeyValue> = levels
@@ -1584,6 +1585,7 @@ impl Snail {
                     q: &q,
                     answer: super::answer::Answer::new(&q.select).typed(&[strand]),
                     most: None,
+                    stop: None,
                     feed: |batch: arrow::array::RecordBatch| {
                         for row in rows_of(&batch)? {
                             let probe = match only {

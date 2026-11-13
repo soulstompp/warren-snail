@@ -52,13 +52,15 @@ pub(super) trait Reads {
     ) -> Result<Round>;
     /// A question on one table the question path reads, of rows alone, kept to the keys `kept` holds
     /// of its columns where it is given them, those of the rows made before it that it meets: its
-    /// rows handed to `each` a block at a time as they are read.
+    /// rows handed to `each` a block at a time as they are read, none past the block where `stop` is
+    /// set.
     fn read_each(
         &self,
         q: &Question,
         order: Option<&str>,
         kept: Option<&KeySet>,
         most: &std::cell::Cell<Option<u64>>,
+        stop: Option<&std::cell::Cell<bool>>,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round>;
     /// Whether a question's pages along a strand are fewer than along its order of fewest, with the
@@ -3329,11 +3331,14 @@ impl Reading<'_> {
         let told = std::cell::Cell::new(None);
         let whole_from = self.whole_from.is_some_and(|n| std::ptr::eq(n, node));
         let rows_known = self.rows_known;
+        // Read as the step's whole FROM, it stops once the step reads no row more.
+        let stop = self.halt.filter(|_| whole_from).map(|h| &**h);
         let round = self.reads.read_each(
             &q,
             strand.as_ref().map(|s| s.0.as_str()),
             kept.as_ref().and_then(|k| k.set.as_ref()),
             if whole_from { rows_known } else { &told },
+            stop,
             &mut |rows| {
                 let mut rows: Vec<Vec<Value>> = rows
                     .into_iter()
@@ -7190,6 +7195,8 @@ impl<'s> Ready<'s> {
             }
         }
         let rows_known: std::cell::Cell<Option<u64>> = std::cell::Cell::new(None);
+        // The rows a step's sets make go on as they are made, a chunk at a time.
+        let hands_each = streaming || run.makes_sets();
         let mut feed = |mut rows: Vec<Vec<Value>>, order: Option<usize>| -> Result<()> {
             if halt.get() && fed.get() {
                 return Ok(());
@@ -7213,7 +7220,7 @@ impl<'s> Ready<'s> {
                 rows,
                 order,
             };
-            let each: Option<&mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>> = match streaming {
+            let each: Option<&mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>> = match hands_each {
                 true => Some(&mut put),
                 false => None,
             };
@@ -7609,6 +7616,7 @@ impl Reads for Empty<'_> {
         _order: Option<&str>,
         _kept: Option<&KeySet>,
         _most: &std::cell::Cell<Option<u64>>,
+        _stop: Option<&std::cell::Cell<bool>>,
         _each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round> {
         Ok(Round::default())
@@ -7681,12 +7689,13 @@ impl Reads for Across<'_> {
         order: Option<&str>,
         kept: Option<&KeySet>,
         most: &std::cell::Cell<Option<u64>>,
+        stop: Option<&std::cell::Cell<bool>>,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round> {
         let (s, t) = self.at[q.sides[0].table];
         let mut local = q.clone();
         local.sides[0].table = t;
-        let mut r = self.snails[s].read_blocks(&local, order, kept, most, each)?;
+        let mut r = self.snails[s].read_blocks(&local, order, kept, most, stop, each)?;
         let mut parts = vec![Round::default(); self.snails.len()];
         parts[s] = r.clone();
         r.snails = parts;

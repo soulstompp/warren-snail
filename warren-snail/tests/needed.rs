@@ -108,14 +108,15 @@ fn sorted(batches: &[RecordBatch]) -> Vec<String> {
     rows
 }
 
-/// A question's answer whole, its pages read as predicted.
+/// A question's answer whole, its pages read as predicted, less those of the blocks a cut left
+/// unread.
 fn whole(path: &Path, q: &str) -> (Vec<String>, Round) {
     let (b, round) = fresh(path)
         .ask(q, None)
         .unwrap_or_else(|e| panic!("{q}: {e}"));
     assert_eq!(
         round.column_pages_read,
-        round.column_pages_predicted - round.column_pages_held,
+        round.column_pages_predicted - round.column_pages_held - round.column_pages_unread,
         "{q}: {round:?}"
     );
     (sorted(&[b]), round)

@@ -7511,6 +7511,22 @@ impl<'q> Prepared<'q> {
     /// first's over the row itself, in lockstep (`zipped`); the items are made over the deepest
     /// level's rows, or beside its sets where it makes them (`passes`).
     fn project(&self, row: &[Value], frame: &Frame, computed: Computed) -> Result<Vec<Vec<Value>>> {
+        let mut made = Vec::new();
+        self.project_each(row, frame, computed, &mut |r| {
+            made.push(r);
+            Ok(true)
+        })?;
+        Ok(made)
+    }
+
+    /// The same, each row handed to `each` as it is made, none once `each` takes no more.
+    fn project_each(
+        &self,
+        row: &[Value],
+        frame: &Frame,
+        computed: Computed,
+        each: &mut dyn FnMut(Vec<Value>) -> Result<bool>,
+    ) -> Result<()> {
         // An item made after the sort is NULL until then.
         let before = |i: usize, e: &Expr, c: &Computed| match self.drawn.contains(&i) {
             true => Ok(Value::Null),
@@ -7537,22 +7553,24 @@ impl<'q> Prepared<'q> {
             made
         };
         let Some((deepest, beneath)) = self.levels.split_last().filter(|_| !self.late_sets) else {
-            return Ok(vec![carry(one(&computed)?)]);
+            each(carry(one(&computed)?))?;
+            return Ok(());
         };
-        let mut made = Vec::new();
+        let mut out = |r: Vec<Value>| each(carry(r));
         let mut taking = Taking {
             cut: None,
             key: &[],
-            out: &mut made,
+            out: &mut out,
+            stopped: false,
         };
         each_level(beneath, row, frame, &computed, &mut |c| match self.ends {
             true => self.passes(deepest, row, frame, c, &|i, e| before(i, e, c), &mut taking),
             false => zipped(deepest, row, frame, c, &mut |c| {
-                taking.take(one(&c)?);
-                Ok(true)
+                taking.take(one(&c)?)?;
+                Ok(taking.wants())
             }),
         })?;
-        Ok(made.into_iter().map(carry).collect())
+        Ok(())
     }
 
     /// Its items, then its ORDER BY's expressions beside them.
@@ -7686,7 +7704,7 @@ impl<'q> Prepared<'q> {
             if !given {
                 break;
             }
-            taking.take(made);
+            taking.take(made)?;
         }
         Ok(true)
     }
@@ -7705,7 +7723,7 @@ impl<'q> Prepared<'q> {
     fn late_rows(&self, mut row: Vec<Value>, frame: &Frame, taking: &mut Taking) -> Result<()> {
         if !self.carries() {
             if taking.wants() {
-                taking.take(row);
+                taking.take(row)?;
             }
             return Ok(());
         }
@@ -7736,7 +7754,7 @@ impl<'q> Prepared<'q> {
         };
         let Some((deepest, beneath)) = self.levels.split_last().filter(|_| self.late_sets) else {
             if taking.wants() {
-                taking.take(one(&computed)?);
+                taking.take(one(&computed)?)?;
             }
             return Ok(());
         };
@@ -7747,7 +7765,7 @@ impl<'q> Prepared<'q> {
                     return Ok(false);
                 }
                 zipped(deepest, &from, frame, c, &mut |c| {
-                    taking.take(one(&c)?);
+                    taking.take(one(&c)?)?;
                     Ok(taking.wants())
                 })
             }
@@ -7820,11 +7838,16 @@ impl Prepared<'_> {
             return Ok(rows);
         }
         let mut out = Vec::new();
+        let mut push = |r: Vec<Value>| -> Result<bool> {
+            out.push(r);
+            Ok(true)
+        };
         for (i, row) in rows.into_iter().enumerate() {
             let mut taking = Taking {
                 cut: cut.as_deref_mut(),
                 key: keys.get(i).map_or(&[][..], Vec::as_slice),
-                out: &mut out,
+                out: &mut push,
+                stopped: false,
             };
             if !taking.wants() {
                 break;
@@ -7836,24 +7859,36 @@ impl Prepared<'_> {
 }
 
 /// Where the rows a step makes go as they are made: through its cut where it has one, each sorting
-/// by `key`, or all of them.
+/// by `key`, or all of them; none once where they go takes no more.
 pub(super) struct Taking<'c> {
     cut: Option<&'c mut sorted::Cut>,
     key: &'c [Value],
-    out: &'c mut Vec<Vec<Value>>,
+    out: &'c mut dyn FnMut(Vec<Value>) -> Result<bool>,
+    stopped: bool,
 }
 
 impl Taking<'_> {
     /// Whether it reads one row more.
     fn wants(&self) -> bool {
-        self.cut.as_ref().is_none_or(|c| c.wants())
+        !self.stopped && self.cut.as_ref().is_none_or(|c| c.wants())
     }
 
-    fn take(&mut self, row: Vec<Value>) {
-        match self.cut.as_deref_mut() {
-            Some(c) => c.offer(row, self.key, self.out),
-            None => self.out.push(row),
+    fn take(&mut self, row: Vec<Value>) -> Result<()> {
+        let row = match self.cut.as_deref_mut() {
+            Some(c) => {
+                let mut kept = Vec::new();
+                c.offer(row, self.key, &mut kept);
+                match kept.pop() {
+                    Some(r) => r,
+                    None => return Ok(()),
+                }
+            }
+            None => row,
+        };
+        if !(self.out)(row)? {
+            self.stopped = true;
         }
+        Ok(())
     }
 }
 
@@ -9897,6 +9932,11 @@ impl<'q> StepRun<'q> {
         self.stop.as_ref().is_some_and(|s| s.get())
     }
 
+    /// Whether its select list makes sets, a FROM row becoming as many rows as they give.
+    pub(super) fn makes_sets(&self) -> bool {
+        !self.p.calls.sets.is_empty()
+    }
+
     /// Whether it makes no row more: its LIMIT keeps none past those it has, its rows coming in
     /// their order, or its reader reads none.
     pub(super) fn ended(&self) -> bool {
@@ -10031,12 +10071,15 @@ impl<'q> StepRun<'q> {
         let per_row = windows(&self.p.calls.windows, &rel, &frame, &mut self.running)?;
         // Rows its LIMIT cuts, coming in their order with nothing sorting between, are made one
         // at a time and none past the last it keeps, as PostgreSQL's Limit asks the node beneath
-        // it for no row more.
-        let handed = (by_row.is_some() || cut) && !self.going.sorts;
+        // it for no row more; and where whoever reads them takes them as they come, each is handed
+        // on as it is made, a set's rows among them, a chunk at a time, or one at a time where its
+        // reader reads each as it comes.
+        let handed = (by_row.is_some() || cut || each.is_some()) && !self.going.sorts;
         // Its LIMIT and OFFSET are read as it starts, before any row comes.
         if handed {
             self.going.ended(&self.p, &frame)?;
         }
+        let width = self.p.items.len();
         let mut rows = Vec::with_capacity(rel.rows.len());
         for (row, w) in rel.rows.iter().zip(per_row) {
             if handed && (self.stopped() || self.going.ended(&self.p, &frame)?) {
@@ -10052,16 +10095,32 @@ impl<'q> StepRun<'q> {
                 bound: None,
                 _q: std::marker::PhantomData,
             };
-            let made = self.p.project(row, &frame, computed)?;
             match (handed, each.as_mut()) {
                 (true, Some(each)) => {
-                    let taken = self.going.take(&self.p, &frame, made)?;
-                    if !taken.is_empty() {
-                        each(truncated(taken, self.p.items.len()))?;
+                    let (p, going, stop) = (&self.p, &mut self.going, &self.stop);
+                    let one = self.one_at_a_time;
+                    let (mut chunk, mut bytes) = (Vec::new(), 0);
+                    p.project_each(row, &frame, computed, &mut |r| {
+                        for t in going.take(p, &frame, vec![r])? {
+                            bytes += super::spill::row_width(&t);
+                            chunk.push(t);
+                        }
+                        if one || bytes >= super::spill::CHUNK {
+                            each(truncated(std::mem::take(&mut chunk), width))?;
+                            bytes = 0;
+                        }
+                        let cut = going.cut.as_ref().is_some_and(sorted::Cut::ended);
+                        Ok(!cut && !stop.as_ref().is_some_and(|s| s.get()))
+                    })?;
+                    if !chunk.is_empty() {
+                        each(truncated(chunk, width))?;
                     }
                 }
-                (true, None) => rows.extend(self.going.take(&self.p, &frame, made)?),
-                (false, _) => rows.extend(made),
+                (true, None) => {
+                    let made = self.p.project(row, &frame, computed)?;
+                    rows.extend(self.going.take(&self.p, &frame, made)?)
+                }
+                (false, _) => rows.extend(self.p.project(row, &frame, computed)?),
             }
         }
         // The order holds where an item is the column that held it, and no set repeats a row.
@@ -10823,6 +10882,12 @@ impl<'q> Stream<'q> {
     /// Its question's own step, where it reads the table's rows as they come.
     fn own_step(&self) -> Option<&StepRun<'q>> {
         self.runs.last()?.as_ref()
+    }
+
+    /// Whether it reads no row of the table more: its question is its one step, and makes no row
+    /// more.
+    pub(super) fn ended(&self) -> bool {
+        self.steps.len() == 1 && self.own_step().is_some_and(StepRun::ended)
     }
 
     /// Whether its question is one SELECT that sorts the table's rows and returns one row for each it

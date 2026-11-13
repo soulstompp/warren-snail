@@ -34,6 +34,9 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
+/// Held by each test while it counts, so that no other allocates beside it.
+static COUNTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.a (id bigint NOT NULL, PRIMARY KEY (id));\n\
      CREATE TABLE s.b (id bigint NOT NULL, a_id bigint NOT NULL, v bigint NOT NULL, \
      PRIMARY KEY (id)); CREATE INDEX b_a ON s.b (a_id, id) INCLUDE (v);";
@@ -111,6 +114,7 @@ const BLOCK: u64 = 100;
 
 #[test]
 fn the_room_bounds_what_a_round_holds_however_many_rows_it_answers() {
+    let _alone = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
     let room = 256u64 << 10;
     // The round's own part, beside its rows, as this build holds it: the question read and planned,
     // its plan's bookkeeping of a read, over a few rows held whole, less those rows.
@@ -131,4 +135,38 @@ fn the_room_bounds_what_a_round_holds_however_many_rows_it_answers() {
     // Held whole, they grow with the rows.
     let (whole, ..) = most_held(&snail(1 << 18), 1 << 30);
     assert!(whole > 4 * room, "{whole} bytes held whole");
+}
+
+/// The most a round making a set's rows allocated past what stood before it, all its answer handed
+/// out, and the rows it answered.
+fn most_made(snail: &Snail, sql: &str, room: u64) -> (u64, u64) {
+    let before = NOW.load(Ordering::Relaxed);
+    MOST.store(before, Ordering::Relaxed);
+    let mut a = begin_together(&[snail], sql, Sizes::of(room)).unwrap();
+    let mut rows = 0;
+    while let Some(b) = a.next_batch().unwrap() {
+        rows += b.num_rows() as u64;
+    }
+    let most = (MOST.load(Ordering::Relaxed) - before) as u64;
+    drop(a);
+    (most, rows)
+}
+
+// The rows one row's set makes are handed on as they are made, a chunk at a time: however many it
+// makes past the room, the most the round holds stays near what the room allows.
+#[test]
+fn a_set_s_rows_are_handed_on_as_they_are_made() {
+    let _alone = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
+    let room = 256u64 << 10;
+    let snail = snail(32);
+    let set = |n: i64| format!("SELECT generate_series(1, {n}) AS g");
+    let (few, _) = most_made(&snail, &set(64), 1 << 30);
+    for n in [1i64 << 16, 1 << 18, 1 << 20] {
+        let (most, rows) = most_made(&snail, &set(n), room);
+        assert_eq!(rows, n as u64);
+        assert!(
+            most <= few + 2 * room,
+            "{n} rows: {most} bytes at most, {few} for 64 rows"
+        );
+    }
 }
