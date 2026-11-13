@@ -635,20 +635,22 @@ fn finder_relation(find: &str) -> Result<(String, String)> {
 /// fills it, is not assigned to its column by PostgreSQL's assignment casts. They are checked
 /// before any row is read, as PostgreSQL checks them: a column of the answer holding no value,
 /// every column of an answer of no rows, is given no type by its values, and takes the type its
-/// question gives it, or where none is known fills only NULLs.
+/// question gives it, or where none is known fills only NULLs. A question whose columns its own
+/// reading types, `typed`, gives each its answer's type.
 fn assigned_types(
     catalog: &Catalog,
     question: &str,
     batch: &RecordBatch,
     ti: usize,
     fills: &[(usize, usize)],
+    typed: bool,
 ) -> Result<Vec<ColumnType>> {
     let types = answer_types(batch)?;
     let stated = stated_types(catalog, question);
     let t = &catalog.tables[ti];
     for &(c, i) in fills {
         let col = &t.columns[c];
-        let typed = batch.column(i).null_count() < batch.num_rows();
+        let typed = typed || batch.column(i).null_count() < batch.num_rows();
         let from = if typed {
             Some(types[i])
         } else {
@@ -2027,6 +2029,7 @@ impl Snail {
         if found.is_none() {
             self.returned_calls.clear();
         }
+        let typed = matches!(source, Source::Query { .. });
         let rows = match (source, found.as_ref()) {
             (_, Some(rows)) => rows.clone(),
             (Source::Values(rows), None) => {
@@ -2038,7 +2041,7 @@ impl Snail {
             }
             (Source::Filled(rows), None) => self.filled(table, rows)?,
             (Source::Computed(rows), None) => self.computed(table, rows)?,
-            (Source::Select { question, fill }, None) => {
+            (Source::Select { question, fill } | Source::Query { question, fill }, None) => {
                 let (batch, _) = self.answer(&question, None)?;
                 let types = assigned_types(
                     &self.catalog,
@@ -2046,6 +2049,7 @@ impl Snail {
                     &batch,
                     table,
                     &answered(&fill),
+                    typed,
                 )?;
                 let calls = calls_made(&batch);
                 let given: Vec<(Vec<Fill>, Row)> = rows_of(&batch)?
@@ -2490,7 +2494,8 @@ impl Snail {
                 None => (vec![Row::new()], Vec::new(), 0),
                 Some(q) => {
                     let (batch, _) = self.answer(&q, None)?;
-                    let types = assigned_types(&self.catalog, &q, &batch, table, &answered(&r))?;
+                    let types =
+                        assigned_types(&self.catalog, &q, &batch, table, &answered(&r), false)?;
                     let mut answers = rows_of(&batch)?;
                     if !one {
                         answers.truncate(1);

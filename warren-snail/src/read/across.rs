@@ -1137,7 +1137,10 @@ impl Snails {
                 // The rows an INSERT … SELECT takes, and a VALUES row's subqueries, are read on the
                 // snail it writes.
                 let questions: Vec<&String> = match source {
-                    Some(statement::Source::Select { question, .. }) => vec![question],
+                    Some(
+                        statement::Source::Select { question, .. }
+                        | statement::Source::Query { question, .. },
+                    ) => vec![question],
                     Some(statement::Source::Computed(rows)) => {
                         rows.iter().filter_map(|(_, q)| q.as_ref()).collect()
                     }

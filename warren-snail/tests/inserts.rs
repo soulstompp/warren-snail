@@ -485,3 +485,210 @@ fn returning_s_sequence_calls_are_made_as_each_row_is_written() {
         assert_eq!(rows(&mut w, sql), want, "{sql}");
     }
 }
+
+#[test]
+fn an_insert_s_rows_are_any_question_postgresql_takes() {
+    let mut w = snail("any");
+    run(
+        &mut w,
+        &[
+            "CREATE SCHEMA a1",
+            "CREATE TABLE a1.t (id integer PRIMARY KEY, s text, v varchar(3), n numeric DEFAULT 7)",
+            "CREATE TABLE a1.u (id integer PRIMARY KEY, s text)",
+            "INSERT INTO a1.u VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        ],
+    );
+    for (sql, want) in [
+        (
+            "INSERT INTO a1.t (id, s) SELECT id, s FROM a1.u UNION ALL SELECT 10, 'ten'",
+            "1|a|NULL|7;2|b|NULL|7;3|c|NULL|7;10|ten|NULL|7",
+        ),
+        (
+            "INSERT INTO a1.t (id, s) SELECT id, s FROM a1.u UNION SELECT 1, 'a' UNION SELECT 4, 'd'",
+            "1|a|NULL|7;2|b|NULL|7;3|c|NULL|7;4|d|NULL|7",
+        ),
+        (
+            "INSERT INTO a1.t (id, s) SELECT id, s FROM a1.u EXCEPT SELECT 2, 'b'",
+            "1|a|NULL|7;3|c|NULL|7",
+        ),
+        (
+            "INSERT INTO a1.t (id, s) SELECT id, s FROM a1.u INTERSECT SELECT 3, 'c'",
+            "3|c|NULL|7",
+        ),
+        (
+            "INSERT INTO a1.t (id) SELECT 1 UNION ALL SELECT '2'",
+            "1|NULL|NULL|7;2|NULL|NULL|7",
+        ),
+        (
+            "INSERT INTO a1.t (id, v) SELECT 1, 'abc  ' UNION ALL SELECT 2, 'x'",
+            "1|NULL|abc|7;2|NULL|x|7",
+        ),
+        (
+            "INSERT INTO a1.t (id, s) SELECT id, s FROM a1.u UNION ALL SELECT 10, 'ten' \
+             ORDER BY 1 DESC LIMIT 2",
+            "3|c|NULL|7;10|ten|NULL|7",
+        ),
+        (
+            "INSERT INTO a1.t (id, s) WITH w AS (SELECT id + 20 AS id, s FROM a1.u) \
+             SELECT id, s FROM w WHERE id > 21",
+            "22|b|NULL|7;23|c|NULL|7",
+        ),
+        (
+            "INSERT INTO a1.t (id, s) WITH w AS (SELECT 30 AS id) SELECT id, 'w' FROM w \
+             UNION ALL SELECT 31, 'x'",
+            "30|w|NULL|7;31|x|NULL|7",
+        ),
+        (
+            "INSERT INTO a1.t (id) WITH w AS (SELECT 40 AS id) VALUES ((SELECT id FROM w))",
+            "40|NULL|NULL|7",
+        ),
+        (
+            "INSERT INTO a1.t (id, s) VALUES (1, 'a'), (2, 'b'), (3, 'c') ORDER BY 1 DESC LIMIT 2",
+            "2|b|NULL|7;3|c|NULL|7",
+        ),
+        ("INSERT INTO a1.t (id, s) VALUES (9, 'z') OFFSET 0", "9|z|NULL|7"),
+        ("INSERT INTO a1.t (id, s) (SELECT 1, 'p')", "1|p|NULL|7"),
+        (
+            "INSERT INTO a1.t (id, s) (SELECT 2, 'q') UNION ALL (VALUES (3, 'r'))",
+            "2|q|NULL|7;3|r|NULL|7",
+        ),
+        (
+            "INSERT INTO a1.t (id, s) VALUES (4, 's') UNION ALL VALUES (5, 't')",
+            "4|s|NULL|7;5|t|NULL|7",
+        ),
+        (
+            "INSERT INTO a1.t (id, s) SELECT 6, 'u' UNION ALL (SELECT 7, 'v' UNION ALL SELECT 8, 'w')",
+            "6|u|NULL|7;7|v|NULL|7;8|w|NULL|7",
+        ),
+        (
+            "INSERT INTO a1.t (id, s, n) SELECT 1, NULL, 1.5 UNION ALL SELECT 2, NULL, 2",
+            "1|NULL|NULL|1.5;2|NULL|NULL|2",
+        ),
+    ] {
+        run(&mut w, &["DELETE FROM a1.t", sql]);
+        assert_eq!(rows(&mut w, "SELECT * FROM a1.t ORDER BY id"), want, "{sql}");
+    }
+    assert_eq!(
+        rows(
+            &mut w,
+            "INSERT INTO a1.t (id, s) SELECT 60, 'x' UNION ALL SELECT 61, 'y' RETURNING id, n"
+        ),
+        "60|7;61|7"
+    );
+    for (sql, code, words) in [
+        (
+            "INSERT INTO a1.t (id) SELECT '1' UNION ALL SELECT '2'",
+            "42804",
+            "column \"id\" is of type integer but expression is of type text",
+        ),
+        (
+            "INSERT INTO a1.t (id, n) SELECT 1, NULL UNION ALL SELECT 2, NULL",
+            "42804",
+            "column \"n\" is of type numeric but expression is of type text",
+        ),
+        (
+            "INSERT INTO a1.t (id) VALUES ('7'), ('8') LIMIT 2",
+            "42804",
+            "column \"id\" is of type integer but expression is of type text",
+        ),
+        (
+            "INSERT INTO a1.t (id, v) SELECT 1, 'abcd' UNION ALL SELECT 2, 'x'",
+            "22001",
+            "value too long for type character varying(3)",
+        ),
+        (
+            "INSERT INTO a1.t (id) SELECT 1, 'x' UNION ALL SELECT 2, 'y'",
+            "42601",
+            "INSERT has more expressions than target columns",
+        ),
+        (
+            "INSERT INTO a1.t (id, s) SELECT 1 UNION ALL SELECT 2",
+            "42601",
+            "INSERT has more target columns than expressions",
+        ),
+        (
+            "INSERT INTO a1.t (id, s) SELECT 1 UNION ALL SELECT 2, 'y'",
+            "42601",
+            "each UNION query must have the same number of columns",
+        ),
+        (
+            "INSERT INTO a1.t (id, s) SELECT 1, 'a' INTERSECT SELECT 2",
+            "42601",
+            "each INTERSECT query must have the same number of columns",
+        ),
+        (
+            "INSERT INTO a1.t (id) WITH w AS (SELECT 41 AS id) VALUES (DEFAULT)",
+            "42601",
+            "DEFAULT is not allowed in this context",
+        ),
+        (
+            "INSERT INTO a1.t (id, s) VALUES (5, 'a'), (6, DEFAULT) LIMIT 2",
+            "42601",
+            "DEFAULT is not allowed in this context",
+        ),
+        (
+            "INSERT INTO a1.t (id, s) WITH w AS (DELETE FROM a1.u WHERE id = 3 RETURNING *) \
+             SELECT id + 50, s FROM w",
+            "0A000",
+            "WITH clause containing a data-modifying statement must be at the top level",
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some(code), weather::hinted(words)), "{sql}");
+    }
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM a1.u"), "3");
+}
+
+#[test]
+fn an_insert_of_a_set_operation_draws_in_18_6_s_order() {
+    let mut w = snail("set-draws");
+    run(
+        &mut w,
+        &[
+            "CREATE SCHEMA a2",
+            "CREATE SEQUENCE a2.q",
+            "CREATE TABLE a2.d (id bigint DEFAULT nextval('a2.q'), x bigint)",
+        ],
+    );
+    for (from, sql, want) in [
+        (
+            "SELECT setval('a2.q', 1, false)",
+            "INSERT INTO a2.d (x) SELECT nextval('a2.q') UNION ALL SELECT nextval('a2.q') \
+             FROM generate_series(1, 2)",
+            "2|1;4|3;6|5",
+        ),
+        (
+            "SELECT setval('a2.q', 100)",
+            "INSERT INTO a2.d (x) SELECT nextval('a2.q') UNION SELECT nextval('a2.q')",
+            "103|101;104|102",
+        ),
+        (
+            "SELECT setval('a2.q', 200)",
+            "INSERT INTO a2.d (x) SELECT nextval('a2.q') UNION ALL SELECT nextval('a2.q') \
+             ORDER BY 1 DESC",
+            "204|201;203|202",
+        ),
+        (
+            "SELECT setval('a2.q', 300)",
+            "INSERT INTO a2.d (x) VALUES (nextval('a2.q')), (nextval('a2.q')) \
+             UNION ALL SELECT nextval('a2.q')",
+            "302|301;304|303;306|305",
+        ),
+        (
+            "SELECT setval('a2.q', 500)",
+            "INSERT INTO a2.d (x) (SELECT nextval('a2.q') FROM generate_series(1, 3) LIMIT 2) \
+             UNION ALL SELECT nextval('a2.q')",
+            "502|501;504|503;506|505",
+        ),
+    ] {
+        run(&mut w, &["DELETE FROM a2.d", from, sql]);
+        assert_eq!(rows(&mut w, "SELECT id, x FROM a2.d ORDER BY x"), want, "{sql}");
+    }
+    run(&mut w, &["DELETE FROM a2.d", "SELECT setval('a2.q', 400)"]);
+    assert_eq!(
+        rows(
+            &mut w,
+            "INSERT INTO a2.d (x) SELECT 1 UNION ALL SELECT 2 RETURNING id, x, nextval('a2.q')"
+        ),
+        "401|1|402;403|2|404"
+    );
+}

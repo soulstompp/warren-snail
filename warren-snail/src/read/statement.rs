@@ -75,6 +75,13 @@ pub enum Source {
         question: String,
         fill: Vec<Fill>,
     },
+    /// A question of any other form, a set operation or VALUES with a WITH or sorted or cut, and
+    /// for each of the table's columns where its value comes from: each column typed as the
+    /// question types it, a column of NULLs among them.
+    Query {
+        question: String,
+        fill: Vec<Fill>,
+    },
     /// Rows given as VALUES, each cell a literal or the column's DEFAULT.
     Filled(Vec<Vec<Fill>>),
     /// Rows given as VALUES, a cell of one at least an expression: each row's cells, and the
@@ -1331,6 +1338,196 @@ fn made_text(q: &Query, s: &sqlparser::ast::Select) -> Vec<usize> {
     out
 }
 
+/// Whether an INSERT's VALUES are read as any other question's rows are: where a WITH, an ORDER BY,
+/// a LIMIT, an OFFSET, a FETCH or a locking clause comes with them, as PostgreSQL reads them.
+fn read_whole(q: &Query) -> bool {
+    q.with.is_some()
+        || q.order_by.is_some()
+        || q.limit_clause.is_some()
+        || q.fetch.is_some()
+        || !q.locks.is_empty()
+}
+
+/// A question in parentheses with nothing outside them, or nothing inside them but its body, as
+/// the question it holds, with the clauses written outside.
+fn bare(q: &Query) -> Option<Query> {
+    let SetExpr::Query(inner) = q.body.as_ref() else {
+        return None;
+    };
+    let b = match (read_whole(q), read_whole(inner)) {
+        (false, _) => (**inner).clone(),
+        (true, false) => Query {
+            body: inner.body.clone(),
+            ..q.clone()
+        },
+        (true, true) => return None,
+    };
+    Some(bare(&b).unwrap_or(b))
+}
+
+/// How many columns a question's rows hold: its first arm's, an arm of a set operation holding
+/// another number refused as PostgreSQL's parser refuses it.
+fn width_of(body: &SetExpr) -> Result<usize> {
+    match body {
+        SetExpr::Select(s) => {
+            if s.projection.iter().any(|p| {
+                !matches!(p, SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. })
+            }) {
+                return Err(Error::new("name each column the INSERT's question returns"));
+            }
+            Ok(s.projection.len())
+        }
+        SetExpr::Values(v) => Ok(v.rows.first().map_or(0, |r| r.content.len())),
+        SetExpr::Query(q) => width_of(&q.body),
+        SetExpr::SetOperation {
+            left, op, right, ..
+        } => {
+            let (l, r) = (width_of(left)?, width_of(right)?);
+            if l != r {
+                return Err(Error::coded(
+                    "42601",
+                    format!("each {op} query must have the same number of columns"),
+                ));
+            }
+            Ok(l)
+        }
+        other => Err(refused(&format!("an INSERT's rows of {other}"))),
+    }
+}
+
+/// A DEFAULT in a VALUES list of a question, refused as PostgreSQL refuses one outside an INSERT's
+/// own VALUES.
+fn defaults_refused(body: &SetExpr) -> Result<()> {
+    match body {
+        SetExpr::Values(v) if v.rows.iter().any(|r| r.content.iter().any(is_default)) => Err(
+            Error::coded("42601", "DEFAULT is not allowed in this context"),
+        ),
+        SetExpr::Query(q) => defaults_refused(&q.body),
+        SetExpr::SetOperation { left, right, .. } => {
+            defaults_refused(left)?;
+            defaults_refused(right)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// An INSERT's rows as any other question gives them (a set operation, VALUES with a WITH or sorted
+/// or cut), each of its columns given in turn to the columns named, typed as the question types it.
+/// Where the statement calls the sequence functions, the DEFAULTs a sequence hands out are drawn by
+/// the question after each row's own columns, and RETURNING's calls after them.
+fn any_question(
+    catalog: &Catalog,
+    table: &Table,
+    q: &Query,
+    columns: &[usize],
+    listed: bool,
+    calls: Vec<SelectItem>,
+    statement: &str,
+) -> Result<Source> {
+    let width = width_of(&q.body)?;
+    let columns = filled(columns, width, listed)?;
+    defaults_refused(&q.body)?;
+    let mut fill = vec![Fill::Default; table.columns.len()];
+    for (k, &c) in columns.iter().enumerate() {
+        fill[c] = Fill::Answer(k);
+    }
+    let mut items: Vec<SelectItem> = Vec::new();
+    if calls_sequences(catalog, statement) {
+        for (c, col) in table.columns.iter().enumerate() {
+            if !matches!(fill[c], Fill::Default) {
+                continue;
+            }
+            if let Some(item) = draw_item(catalog, col) {
+                fill[c] = Fill::Drawn(width + items.len());
+                items.push(SelectItem::UnnamedExpr(super::image::parse_expr(&item)?));
+            }
+        }
+    }
+    items.extend(calls);
+    let question = match items.is_empty() {
+        true => q.to_string(),
+        false => made_after(catalog, q, width, &items)?,
+    };
+    Ok(Source::Query { question, fill })
+}
+
+/// A question making `items` after each row of `q`'s own columns, read over `q`'s rows as a table
+/// of `width` columns is read. Where `q` calls the sequence functions itself and its rows come one
+/// at a time from a UNION ALL of SELECTs and VALUES lists, the items are made in each arm instead,
+/// so that its calls and theirs take turns row by row, as 18.6 makes them.
+fn made_after(catalog: &Catalog, q: &Query, width: usize, items: &[SelectItem]) -> Result<String> {
+    let mut inner = q.clone();
+    let spread = calls_sequences(catalog, &q.to_string()) && appended(&mut inner, items);
+    let named = width + if spread { items.len() } else { 0 };
+    let mut outer: Vec<String> = (1..=width).map(|k| format!("\"*SELECT*\".\"{k}\"")).collect();
+    for (j, item) in items.iter().enumerate() {
+        outer.push(match (spread, item) {
+            (false, _) => item.to_string(),
+            (true, SelectItem::ExprWithAlias { alias, .. }) => {
+                format!("\"*SELECT*\".\"{}\" AS {alias}", width + j + 1)
+            }
+            (true, _) => format!("\"*SELECT*\".\"{}\"", width + j + 1),
+        });
+    }
+    let names = (1..=named)
+        .map(|k| format!("\"{k}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "SELECT {} FROM ({}) AS \"*SELECT*\" ({names})",
+        outer.join(", "),
+        match spread {
+            true => &inner,
+            false => q,
+        }
+    ))
+}
+
+/// `items` appended to each row of a question whose rows come one at a time: a SELECT, sorted or
+/// cut or not, but not DISTINCT; a VALUES list or a UNION ALL of such questions, cut but not
+/// sorted; none with a WITH, an OFFSET or a FETCH. False, and the question as it may be left, where
+/// it is no such question.
+fn appended(q: &mut Query, items: &[SelectItem]) -> bool {
+    use sqlparser::ast::LimitClause;
+    let offset = match &q.limit_clause {
+        Some(LimitClause::LimitOffset { offset, .. }) => offset.is_some(),
+        Some(LimitClause::OffsetCommaLimit { .. }) => true,
+        None => false,
+    };
+    let sorted = q.order_by.is_some() && !matches!(q.body.as_ref(), SetExpr::Select(_));
+    !(q.with.is_some() || offset || sorted || q.fetch.is_some() || !q.locks.is_empty())
+        && appended_to(&mut q.body, items)
+}
+
+/// `items` appended to each row of a body, as `appended` takes it.
+fn appended_to(body: &mut SetExpr, items: &[SelectItem]) -> bool {
+    use sqlparser::ast::{SetOperator, SetQuantifier};
+    let expr = |i: &SelectItem| match i {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e.clone(),
+        _ => unreachable!("an item of an expression"),
+    };
+    match body {
+        SetExpr::Select(s) if s.distinct.is_none() => {
+            s.projection.extend(items.iter().cloned());
+            true
+        }
+        SetExpr::Values(v) => {
+            for r in &mut v.rows {
+                r.content.extend(items.iter().map(expr));
+            }
+            true
+        }
+        SetExpr::Query(q) => appended(q, items),
+        SetExpr::SetOperation {
+            left,
+            op: SetOperator::Union,
+            set_quantifier: SetQuantifier::All,
+            right,
+        } => appended_to(left, items) && appended_to(right, items),
+        _ => false,
+    }
+}
+
 fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
     let ti = match &i.table {
         TableObject::TableName(n) => table_index(catalog, n)?,
@@ -1368,8 +1565,23 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
             &defaults
         }
     };
-    if q.with.is_some() {
-        return Err(refused("a write inside WITH"));
+    let unwrapped;
+    let q = match bare(q) {
+        Some(b) => {
+            unwrapped = b;
+            &unwrapped
+        }
+        None => q,
+    };
+    if q
+        .with
+        .as_ref()
+        .is_some_and(|w| w.cte_tables.iter().any(|c| writes_query(&c.query)))
+    {
+        return Err(Error::coded(
+            "0A000",
+            "WITH clause containing a data-modifying statement must be at the top level",
+        ));
     }
     // The sequence calls its RETURNING makes, made for each row by the row's question after the
     // row's own, as 18.6 makes them once the row is written and before the next is made.
@@ -1389,7 +1601,7 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
         .collect::<Vec<_>>()
         .join(", ");
     let source = match q.body.as_ref() {
-        SetExpr::Values(v) => {
+        SetExpr::Values(v) if !read_whole(q) => {
             let width = v.rows.first().map_or(0, |r| r.content.len());
             // A list of several rows takes no set-returning function, each row read before its
             // length is.
@@ -1509,7 +1721,15 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
                 fill,
             }
         }
-        _ => return Err(Error::new("an INSERT's rows are VALUES or a SELECT")),
+        _ => any_question(
+            catalog,
+            table,
+            q,
+            &columns,
+            !i.columns.is_empty(),
+            calls,
+            &i.to_string(),
+        )?,
     };
     let st = Statement::Insert { table: ti, source };
     let Some(on) = &i.on else {
