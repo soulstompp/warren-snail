@@ -543,8 +543,22 @@ fn a_body_reading_relations_is_called_as_its_statement_through_the_caller_s_snai
         "SELECT k, fo.fwrap(k) FROM fo.src ORDER BY k",
         &["1|11", "2|21", "3|31", "4|41"],
     );
-    // A subquery's shape found over tables holding no rows calls no body.
-    asked(&mut w, "SELECT (SELECT fo.fempty()), (SELECT fo.frec(8))", &["0|8"]);
+    // A subquery's shape found over tables holding no rows calls no body; the statement on a thread
+    // its host gave a stack of its own and said so, as warren-sling and the wrapper give theirs.
+    let at = path.clone();
+    std::thread::Builder::new()
+        .stack_size(32 << 20)
+        .spawn(move || {
+            warren_snail::read::stack_given(32 << 20);
+            let mut s = Snail::open(&at).unwrap();
+            assert_eq!(
+                question(&mut s, "SELECT (SELECT fo.fempty()), (SELECT fo.frec(8))").unwrap(),
+                ["0|8"]
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
     asked(
         &mut w,
         "SELECT k, fo.fsum(k) FROM fo.src ORDER BY fo.fsum(k) DESC",
