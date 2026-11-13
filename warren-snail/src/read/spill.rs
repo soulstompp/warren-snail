@@ -383,7 +383,8 @@ impl Run {
     pub(super) fn push(&self, row: Vec<Value>) -> Result<()> {
         self.width.set(row.len());
         let mut s = self.stored.borrow_mut();
-        let w = s.rows.width_of(&row);
+        let at = s.rows.len() + s.spilled;
+        let w = s.rows.width_at(&row, at);
         s.total += w;
         let room = match &self.room {
             Some(r) => r,
@@ -438,6 +439,12 @@ impl Run {
     /// The rows written past the room.
     pub(super) fn spilled(&self) -> usize {
         self.stored.borrow().spilled
+    }
+
+    /// The bytes the rows written past the room take on the spill.
+    pub(super) fn written(&self) -> u64 {
+        let s = self.stored.borrow();
+        s.pages.iter().map(|p| u64::from(p.1)).sum::<u64>() + s.tail.len() as u64
     }
 
     /// The bytes of the rows it holds in the room.
@@ -785,18 +792,25 @@ impl Queue {
     }
 
     /// The next parts to read together: the first, and those after it while together they fit
-    /// `bytes`: their hashes' first and last, the bytes they hold, and each part.
-    pub(in crate::read) fn next(&mut self, bytes: u64) -> Option<(u64, u64, u64, Vec<Run>)> {
+    /// `bytes`, each part's rows taking what `held` says they take where they are read: their
+    /// hashes' first and last, the rows they hold, and each part.
+    pub(in crate::read) fn next(
+        &mut self,
+        bytes: u64,
+        held: &dyn Fn(&Run) -> u64,
+    ) -> Option<(u64, u64, u64, Vec<Run>)> {
         let (lo, mut hi, first) = self.0.pop_front()?;
-        let mut total = first.total();
+        let mut total = held(&first);
+        let mut rows = first.len() as u64;
         let mut runs = vec![first];
-        while self.0.front().is_some_and(|p| total + p.2.total() <= bytes) {
+        while self.0.front().is_some_and(|p| total + held(&p.2) <= bytes) {
             let (_, top, run) = self.0.pop_front().expect("a part is there");
-            total += run.total();
+            total += held(&run);
+            rows += run.len() as u64;
             hi = top;
             runs.push(run);
         }
-        Some((lo, hi, total, runs))
+        Some((lo, hi, rows, runs))
     }
 }
 

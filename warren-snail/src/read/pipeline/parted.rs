@@ -100,6 +100,11 @@ fn bytes_of(rows: &[Held]) -> u64 {
     rows.iter().map(|h| h.bytes).sum()
 }
 
+/// The bytes a part's rows take held here: each as the spill wrote it, and its place.
+fn held_as_packed(run: &crate::read::spill::Run) -> u64 {
+    run.written() + run.len() as u64 * std::mem::size_of::<Held>() as u64
+}
+
 impl Parted {
     pub(in crate::read) fn new() -> Parted {
         Parted {
@@ -204,13 +209,17 @@ impl Parted {
                 r.let_go(bytes);
             }
             let free = self.room.as_ref().map_or(u64::MAX, |r| r.free_bytes());
-            let next = self.queue.next(free.saturating_sub(bytes).max(CHUNK));
+            let n = carried.len() as u64;
+            let next = self
+                .queue
+                .next(free.saturating_sub(bytes).max(CHUNK), &held_as_packed);
             for h in carried {
                 self.place(h.hash, h.row, None)?;
             }
-            if let Some((lo, hi, total, runs)) = next {
+            if let Some((lo, hi, rows, runs)) = next {
                 self.range = (lo, hi);
-                self.expected = Some(total + bytes);
+                self.expected = None;
+                self.rows_to_come = Some(rows + n);
                 for run in runs {
                     run.each_chunk(&mut |c| {
                         for r in c {
@@ -265,11 +274,12 @@ impl Parted {
         // One key past the room by itself: its rows held whole, the rest of its part read again.
         let mut whole = carried;
         let mut last = last;
-        let Some((lo, hi, total, runs)) = self.queue.next(0) else {
+        let Some((lo, hi, rows, runs)) = self.queue.next(0, &held_as_packed) else {
             return Ok(Some(pass(whole, None, self)?));
         };
         self.range = (lo, hi);
-        self.expected = Some(total);
+        self.expected = None;
+        self.rows_to_come = Some(rows);
         for run in runs {
             run.each_chunk(&mut |c| {
                 for r in c {
@@ -302,14 +312,56 @@ impl Parted {
         let mut spilled = false;
         while let Some(mut pass) = self.pass(&mut |r| hash_of(r))? {
             spilled |= pass.below.is_some();
-            // The windows read a pass's rows whole: they fly while they are folded.
-            let rows: Vec<Vec<Value>> = std::mem::take(&mut pass.rows).rows().collect();
-            let _flying = crate::room::flying(crate::read::spill::rows_width(&rows));
-            fold(Relation {
-                names: Vec::new(),
-                rows,
-                order: order.filter(|_| !spilled),
-            })?;
+            let held = std::mem::take(&mut pass.rows);
+            // The windows read a pass's rows whole, flying while they are folded, where the room
+            // has room for them so; past that, as many whole partitions at a time as it has room
+            // for, each in the order its first row came.
+            let free = self.room.as_ref().map_or(u64::MAX, |r| r.free_bytes());
+            let most = held.len() as u64
+                * (std::mem::size_of::<Vec<Value>>() + held.width() * std::mem::size_of::<Value>())
+                    as u64
+                + held.bytes();
+            if most <= free {
+                let rows: Vec<Vec<Value>> = held.rows().collect();
+                let _flying = crate::room::flying(crate::read::spill::rows_width(&rows));
+                fold(Relation {
+                    names: Vec::new(),
+                    rows,
+                    order: order.filter(|_| !spilled),
+                })?;
+                continue;
+            }
+            let _index = crate::room::holding(held.len() as u64 * 4);
+            let mut parts: Vec<(Vec<u32>, u64)> = Vec::new();
+            let mut of_hash: std::collections::HashMap<u64, usize> = Default::default();
+            for i in 0..held.len() {
+                let row = held.row(i);
+                let p = *of_hash.entry(hash_of(&row)?).or_insert_with(|| {
+                    parts.push((Vec::new(), 0));
+                    parts.len() - 1
+                });
+                parts[p].0.push(i as u32);
+                parts[p].1 += crate::read::spill::row_width(&row);
+            }
+            let whole = parts.len() == 1;
+            let mut hand = |at: Vec<u32>, bytes: u64| -> Result<()> {
+                let rows: Vec<Vec<Value>> = at.into_iter().map(|i| held.row(i as usize)).collect();
+                let _flying = crate::room::flying(bytes);
+                fold(Relation {
+                    names: Vec::new(),
+                    rows,
+                    order: order.filter(|_| !spilled && whole),
+                })
+            };
+            let (mut group, mut bytes) = (Vec::new(), 0);
+            for (at, w) in parts {
+                if !group.is_empty() && bytes + w > free {
+                    hand(std::mem::take(&mut group), std::mem::take(&mut bytes))?;
+                }
+                group.extend(at);
+                bytes += w;
+            }
+            hand(group, bytes)?;
         }
         Ok(spilled)
     }

@@ -10079,11 +10079,13 @@ impl<'q> StepRun<'q> {
                     if let Some(past) = groups.past.take() {
                         past.into_queue(groups.range.1, &mut groups.queue)?;
                     }
-                    let Some((lo, hi, total, runs)) = groups.queue.next(0) else {
+                    let Some((lo, hi, rows, runs)) = groups.queue.next(0, &|r| r.written())
+                    else {
                         break;
                     };
                     groups.range = (lo, hi);
-                    groups.expected = Some(total);
+                    groups.expected = None;
+                    groups.rows_to_come = Some(rows);
                     for run in runs {
                         run.each_chunk(&mut |c| {
                             fold_rows(std::slice::from_mut(groups), p, c, &frame, None)
@@ -10161,11 +10163,15 @@ impl<'q> StepRun<'q> {
             going.closed = false;
             going.seen_held = crate::room::holding(0);
             let free = crate::room::current().map_or(u64::MAX, |r| r.free_bytes());
-            let Some((lo, hi, total, runs)) = going.queue.next(free) else {
+            let keyed = |r: &super::spill::Run| {
+                r.written() + r.len() as u64 * super::held::KeySet::BESIDE
+            };
+            let Some((lo, hi, rows, runs)) = going.queue.next(free, &keyed) else {
                 break;
             };
             going.range = (lo, hi);
-            going.expected = Some(total);
+            going.expected = None;
+            going.rows_to_come = Some(rows);
             for run in runs {
                 run.each_chunk(&mut |c| emit(c, going))?;
             }

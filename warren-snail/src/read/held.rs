@@ -183,13 +183,17 @@ impl Column {
 
     /// The bytes `v` adds held here, a column it turns into another counted whole.
     fn width_of(&self, v: &Value) -> u64 {
-        let at = self.len();
+        self.width_at(v, self.len())
+    }
+
+    /// The bytes `v` adds held here as row `at`, the rows between counted apart.
+    fn width_at(&self, v: &Value, at: usize) -> u64 {
         let fits = match (self, v) {
             (Column::Values(_), _) => return as_value(v),
             (Column::Nulls(_), Value::Null) => return 0,
             (Column::Nulls(n), _) => {
                 let begun = begun(v, *n);
-                return begun.bytes() + begun.width_of(v);
+                return begun.bytes() + begun.width_at(v, at);
             }
             (_, Value::Null) => true,
             (Column::Int(_), Value::Int(_))
@@ -209,7 +213,7 @@ impl Column {
             _ => false,
         };
         if !fits {
-            let held: u64 = (0..at).map(|i| as_value(&self.get(i))).sum();
+            let held: u64 = (0..self.len()).map(|i| as_value(&self.get(i))).sum();
             return held - self.bytes() + as_value(v);
         }
         bits(at)
@@ -431,11 +435,22 @@ impl Columns {
         self.len
     }
 
+    /// How many values a row holds.
+    pub(super) fn width(&self) -> usize {
+        self.columns.len()
+    }
+
     /// The bytes `row` adds held here.
     pub(super) fn width_of(&self, row: &[Value]) -> u64 {
+        self.width_at(row, self.len)
+    }
+
+    /// The bytes `row` adds held here as row `at`, the rows between counted apart: a row written
+    /// past the rows held, as it would be held.
+    pub(super) fn width_at(&self, row: &[Value], at: usize) -> u64 {
         match self.columns.is_empty() {
-            true => row.iter().map(|v| Column::Nulls(0).width_of(v)).sum(),
-            false => self.columns.iter().zip(row).map(|(c, v)| c.width_of(v)).sum(),
+            true => row.iter().map(|v| Column::Nulls(0).width_at(v, at)).sum(),
+            false => self.columns.iter().zip(row).map(|(c, v)| c.width_at(v, at)).sum(),
         }
     }
 
@@ -966,6 +981,9 @@ impl std::fmt::Debug for KeySet {
 }
 
 impl KeySet {
+    /// The bytes a key takes held beside its own: its end, and its share of the slots.
+    pub(super) const BESIDE: u64 = 8 + SLOT;
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.ends.len()
@@ -997,7 +1015,7 @@ impl KeySet {
 
     /// The bytes the key last asked about adds held.
     pub(super) fn width(&self) -> u64 {
-        self.asked.borrow().len() as u64 + 8 + SLOT
+        self.asked.borrow().len() as u64 + Self::BESIDE
     }
 
     /// Holds the key last asked about, not held: where it lies.
