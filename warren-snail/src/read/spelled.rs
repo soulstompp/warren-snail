@@ -18,9 +18,11 @@ use std::borrow::Cow;
 
 /// The statement with each rewrite made, one at a time until none is left.
 pub(crate) fn spelled(sql: &str) -> Result<Cow<'_, str>> {
-    at_at_spaced(sql)?;
-    let lower = sql.to_ascii_lowercase();
-    let mut out = Cow::Borrowed(sql);
+    let mut out = match at_at_spaced(sql)? {
+        Some(apart) => Cow::Owned(apart),
+        None => Cow::Borrowed(sql),
+    };
+    let lower = out.to_ascii_lowercase();
     if lower.contains("exclude") {
         while let Some(next) = excluded_once(&out)? {
             out = Cow::Owned(next);
@@ -1477,41 +1479,62 @@ pub(super) fn right_of_three_ats(right: &Expr) -> Option<&Expr> {
     }
 }
 
-/// `@@` and `@` written apart are two operators to PostgreSQL, and no prefix `@` gives what a `@@`
-/// reads; together they are `@@@`, and sqlparser reads the two alike. Refused here, where they can
-/// be told apart: a statement printed from what sqlparser read writes `@@@` as `@@ @x`.
-pub(super) fn at_at_spaced(sql: &str) -> Result<()> {
+/// `@@` and `@` written apart are two operators to PostgreSQL, the prefix `@` on what follows it;
+/// together they are `@@@`, and sqlparser reads the two alike. Written apart, the prefix `@` and its
+/// operand, as sqlparser reads it, are put in parentheses, so that `@@` takes them as its right
+/// side; none where no `@` stands apart. A statement printed from what sqlparser read writes `@@@`
+/// as `@@ @x`, and is left.
+pub(super) fn at_at_spaced(sql: &str) -> Result<Option<String>> {
     if !sql.contains("@@") {
-        return Ok(());
+        return Ok(None);
     }
-    let tokens = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, sql).tokenize()?;
+    let tokens =
+        Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, sql).tokenize_with_location()?;
+    let bytes = super::statement::spans(sql)?;
+    let mut apart: Vec<(usize, usize)> = Vec::new();
     for (i, _) in tokens
         .iter()
         .enumerate()
-        .filter(|(_, t)| **t == Token::AtAt)
+        .filter(|(_, t)| t.token == Token::AtAt)
     {
         let next = tokens[i + 1..]
             .iter()
-            .position(|t| !matches!(t, Token::Whitespace(_)))
+            .position(|t| !matches!(t.token, Token::Whitespace(_)))
             .map(|n| n + i + 1);
-        let apart = |&n: &usize| {
+        let spaced = |&n: &usize| {
             n > i + 1
-                && tokens[n] == Token::AtSign
-                && matches!(tokens.get(n + 1), Some(Token::Whitespace(_)))
+                && tokens[n].token == Token::AtSign
+                && matches!(tokens.get(n + 1).map(|t| &t.token), Some(Token::Whitespace(_)))
         };
-        if let Some(n) = next.filter(apart) {
-            let operand = tokens[n + 1..]
-                .iter()
-                .find(|t| !matches!(t, Token::Whitespace(_)));
-            return Err(Error::new(match operand {
-                Some(Token::SingleQuotedString(_)) => {
-                    format!("operator is not unique: @ unknown{}", crate::error::OPERATOR_NOT_UNIQUE)
-                }
-                _ => "operator does not exist: @@ with a prefix @ on its right".to_string(),
-            }));
+        let Some(n) = next.filter(spaced) else {
+            continue;
+        };
+        let mut operand = sqlparser::parser::Parser::new(&crate::grammar::POSTGRES)
+            .with_tokens_with_locations(tokens[n..].to_vec());
+        if operand.parse_prefix().is_err() {
+            continue;
+        }
+        let last = (n..n + operand.index())
+            .rev()
+            .find(|&k| !matches!(tokens[k].token, Token::Whitespace(_)));
+        if let Some(last) = last {
+            apart.push((bytes[n].1, bytes[last].2));
         }
     }
-    Ok(())
+    if apart.is_empty() {
+        return Ok(None);
+    }
+    let mut out = String::with_capacity(sql.len() + 2 * apart.len());
+    let mut from = 0;
+    for (start, end) in apart {
+        out.push_str(&sql[from..start]);
+        out.push('(');
+        out.push_str(&sql[start..end]);
+        out.push(')');
+        from = end;
+    }
+    out.push_str(&sql[from..]);
+    Ok(Some(out))
 }
 
 /// What marks a window's name as carrying its frame's EXCLUDE: the name is this character, the

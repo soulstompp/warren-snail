@@ -5630,6 +5630,49 @@ fn a_month_or_a_day_out_of_range_is_refused_with_the_datestyle_hint() {
 }
 
 #[test]
+fn at_at_and_a_prefix_at_written_apart_are_two_operators() {
+    let mut w = snail("at-at-apart");
+    let none = |l: &str, r: &str| {
+        (
+            Some("42883"),
+            format!(
+                "operator does not exist: {l} @@ {r}\nHINT:  No operator matches the given name \
+                 and argument types. You might need to add explicit type casts."
+            ),
+        )
+    };
+    for (sql, want) in [
+        ("SELECT to_tsvector('a') @@ @ '1'", none("tsvector", "double precision")),
+        ("SELECT to_tsvector('a') @@  @ 1", none("tsvector", "integer")),
+        ("SELECT to_tsvector('a') @@ @ 1.5", none("tsvector", "numeric")),
+        ("SELECT to_tsvector('a') @@ @ '-1'", none("tsvector", "double precision")),
+        ("SELECT 'a'::tsvector @@ @ '1'", none("tsvector", "double precision")),
+        ("SELECT to_tsquery('a') @@ @ '1'", none("tsquery", "double precision")),
+        ("SELECT to_tsvector('a') @@ @ @ '1'", none("tsvector", "double precision")),
+        ("SELECT to_tsvector('a') @@ @ '1'::int", none("tsvector", "integer")),
+        ("SELECT to_tsvector(k) @@ @ g FROM dn.a", none("tsvector", "integer")),
+        ("SELECT g FROM dn.a WHERE to_tsvector(k) @@ @ g", none("tsvector", "integer")),
+        (
+            "SELECT to_tsvector('a') @@ @ 'word60'",
+            (Some("22P02"), "invalid input syntax for type double precision: \"word60\"".into()),
+        ),
+        (
+            "SELECT to_tsvector('a') @@ @ k FROM dn.a",
+            (
+                Some("42883"),
+                "operator does not exist: @ text\nHINT:  No operator matches the given name and \
+                 argument type. You might need to add an explicit type cast."
+                    .into(),
+            ),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), want, "{sql}");
+    }
+    // Written together, `@@@` is the match it was.
+    answered(&mut w, &[("SELECT to_tsvector('b') @@@ to_tsquery('b')", &["t"])]);
+}
+
+#[test]
 fn an_arm_s_sorted_literal_is_text_before_its_set_operation_is_typed() {
     let mut w = snail("sorted-literal");
     let unmatched = |op: &str, a: &str, b: &str| {

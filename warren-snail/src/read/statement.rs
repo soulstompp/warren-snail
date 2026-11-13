@@ -1938,7 +1938,6 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         });
     }
     super::question::unlocked_words(sql)?;
-    super::spelled::at_at_spaced(sql)?;
     let bound = crate::grammar::bound(sql);
     let statements =
         super::image::parse_sql(&super::spelled::spelled(bound.as_deref().unwrap_or(sql))?)?;
