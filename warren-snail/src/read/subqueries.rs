@@ -264,6 +264,105 @@ struct Answers {
     _held: Option<crate::room::Holding>,
 }
 
+/// A subquery's last step read off its text once a round and, where it is an EXISTS read as the
+/// join it is, how it meets the query around it and what it met.
+struct Readied<'a> {
+    ready: relations::Ready<'a>,
+    joined: Option<relations::Joined<'a>>,
+    met: RefCell<Option<Met>>,
+}
+
+/// An EXISTS read as the join it is, made once a round: the values its subquery's rows give its
+/// ties, by their keys, held in the round's room, each with its rows where a pair is met by more.
+/// Where they pass the room before any row asks, the truth of each row of the step found ahead,
+/// both sides cut on their keys' hash, by its place among them; those of the rows being read held
+/// by their keys.
+#[derive(Default)]
+struct Met {
+    keys: HashSet<Vec<Key>>,
+    rows: HashMap<Vec<Key>, Vec<Vec<Value>>>,
+    held: Option<crate::room::Holding>,
+    /// Whether they passed the room: a row whose truth is not held is answered as a subquery's.
+    past: bool,
+    ahead: Option<(Vec<u64>, crate::room::Holding)>,
+    reading: HashMap<Vec<Key>, bool>,
+}
+
+/// An EXISTS whose rows passed the room before any row asked: the rows it held, its parts, the
+/// parts of the step's rows asking beside them, and each row's truth found so far.
+struct Ahead<'a> {
+    places: &'a [usize],
+    readied: Rc<Readied<'a>>,
+    met: Met,
+    theirs: super::spill::Parts,
+    asking: super::spill::Parts,
+    bits: Vec<u64>,
+    bits_held: crate::room::Holding,
+}
+
+/// How many times a part of an EXISTS's rows past the room is cut again before it is held whole, as
+/// a join's batch is.
+const CUTS: u32 = 8;
+
+/// How many parts an EXISTS's rows past the room are cut into where how many there are is not
+/// known.
+const PARTS_UNKNOWN: u64 = 16;
+
+impl Met {
+    /// A row of the subquery's more, by the values it gives its ties.
+    fn hold(&mut self, key: Vec<Key>, row: Vec<Value>, by_pairs: bool) {
+        match by_pairs {
+            true => self.rows.entry(key).or_default().push(row),
+            false => {
+                self.keys.insert(key);
+            }
+        }
+    }
+
+    /// Whether a row it holds meets the values a row asking gives, by the keys of its ties and by
+    /// `pair` where a pair is met by more.
+    fn meets(
+        &self,
+        key: &[Key],
+        by_pairs: bool,
+        pair: &mut dyn FnMut(&[Value]) -> Result<bool>,
+    ) -> Result<bool> {
+        if !by_pairs {
+            return Ok(self.keys.contains(key));
+        }
+        for r in self.rows.get(key).into_iter().flatten() {
+            if pair(r)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// The keys of values.
+fn keys_of(values: &[Value]) -> Vec<Key> {
+    values.iter().map(pipeline::key).collect()
+}
+
+/// What a row asking an EXISTS read as a join is told its truth by while it is read: the keys of
+/// its ties' values, and of every value it gives where a pair is met by more.
+fn reading_key(tie: &[Key], values: &[Value], by_pairs: bool) -> Vec<Key> {
+    let mut k = tie.to_vec();
+    if by_pairs {
+        k.extend(values.iter().map(pipeline::key));
+    }
+    k
+}
+
+/// The value at a place of a step's columns of one of its FROM's rows, those of the query around it
+/// after them.
+fn value_at(row: &[Value], at: usize, around: &[Value]) -> Value {
+    match row.get(at) {
+        Some(v) => v.clone(),
+        None => around.get(at - row.len()).cloned().unwrap_or(Value::Null),
+    }
+}
+
 /// A subquery of a step, as its place asks it.
 struct Plan<'q> {
     /// Its query as written, or with each aggregate of the query around it it calls read as a column
@@ -293,6 +392,9 @@ struct Plan<'q> {
     /// query around it; and the columns of that query as it reads them.
     read: OnceCell<Option<relations::Once>>,
     around_columns: OnceCell<Vec<Col>>,
+    /// Whether it may be read as the join it is: an EXISTS reading the query around it, one SELECT
+    /// handed no aggregate of that query.
+    joinable: bool,
 }
 
 /// A step's subqueries, by their places in its query.
@@ -614,6 +716,10 @@ impl<'q> Plan<'q> {
         let first = m.types.first().copied().flatten();
         let in_order =
             query_read.with.is_none() && matches!(query_read.body.as_ref(), SetExpr::Select(_));
+        let joinable = in_order
+            && matches!(asks, Asks::Exists { .. })
+            && around.is_some()
+            && lifted.is_empty();
         drop(m);
         Ok(Plan {
             query,
@@ -633,6 +739,7 @@ impl<'q> Plan<'q> {
             },
             read: OnceCell::new(),
             around_columns: OnceCell::new(),
+            joinable,
         })
     }
 }
@@ -647,7 +754,45 @@ pub(super) struct Subs<'a, 'q> {
     columns: &'a [Col],
     accrued: &'a Accrued,
     /// Each subquery's last step read off its text, once a round, by its plan.
-    ready: RefCell<HashMap<*const Plan<'q>, Option<Rc<relations::Ready<'a>>>>>,
+    ready: RefCell<HashMap<*const Plan<'q>, Option<Rc<Readied<'a>>>>>,
+}
+
+/// Each set of values rows give, gathered while they fit the room.
+struct Foreseen {
+    seen: HashSet<Vec<Key>>,
+    sets: Vec<Vec<Value>>,
+    held: crate::room::Holding,
+    over: bool,
+}
+
+impl Foreseen {
+    fn new() -> Foreseen {
+        Foreseen {
+            seen: HashSet::new(),
+            sets: Vec::new(),
+            held: crate::room::holding(0),
+            over: false,
+        }
+    }
+
+    /// The set of values a row more gives.
+    fn see(&mut self, set: Vec<Value>) {
+        if self.over || !self.seen.insert(keys_of(&set)) {
+            return;
+        }
+        match self.held.fits(2 * super::spill::row_width(&set)) {
+            true => self.sets.push(set),
+            false => self.over = true,
+        }
+    }
+
+    /// The sets kept where they all fit.
+    fn kept_in(self, kept: &Kept) {
+        if !self.over {
+            *kept.around.borrow_mut() = Some(self.sets);
+            *kept.around_held.borrow_mut() = Some(self.held);
+        }
+    }
 }
 
 impl Kept {
@@ -657,31 +802,24 @@ impl Kept {
         rows: &Rows,
         of: &mut dyn FnMut(&[Value]) -> Vec<Value>,
     ) -> Result<()> {
-        let mut seen = HashSet::new();
-        let mut sets = Vec::new();
-        let mut held = crate::room::holding(0);
-        let mut over = false;
+        let mut foreseen = Foreseen::new();
         rows.each_chunk(&mut |c| {
             for r in &c {
-                if over {
+                if foreseen.over {
                     break;
                 }
-                let set = of(r);
-                if seen.insert(set.iter().map(pipeline::key).collect::<Vec<Key>>()) {
-                    if !held.fits(2 * super::spill::row_width(&set)) {
-                        over = true;
-                        break;
-                    }
-                    sets.push(set);
-                }
+                foreseen.see(of(r));
             }
             Ok(())
         })?;
-        if !over {
-            *self.around.borrow_mut() = Some(sets);
-            *self.around_held.borrow_mut() = Some(held);
-        }
+        foreseen.kept_in(self);
         Ok(())
+    }
+
+    /// Lets go the sets of values foreseen, once its tables are read.
+    fn let_go_around(&self) {
+        *self.around.borrow_mut() = None;
+        *self.around_held.borrow_mut() = None;
     }
 }
 
@@ -706,15 +844,144 @@ impl<'a, 'q> Subs<'a, 'q> {
     }
 
     /// Before any row asks: each set of values `rows` give what each subquery reading the query
-    /// around it names.
-    pub(super) fn foresee(&self, rows: &Rows) -> Result<()> {
-        for plan in self.plans.plans.values() {
-            // One handed an aggregate of the step's reads values no row gives before it groups.
-            let (Some(places), true) = (&plan.around, plan.lifted.is_empty()) else {
+    /// around it names, `around` the values of that query after each row's; then each EXISTS read
+    /// as the join it is made, and where its rows pass the room, the truth of each of `rows` found.
+    pub(super) fn foresee(&self, rows: &Rows, around: &[Value]) -> Result<()> {
+        let plans: &'a Plans<'q> = self.plans;
+        // One handed an aggregate of the step's reads values no row gives before it groups.
+        let mut foreseen: Vec<(&Kept, &[usize], Foreseen)> = plans
+            .plans
+            .values()
+            .filter(|p| p.lifted.is_empty())
+            .filter_map(|p| Some((&p.kept, p.around.as_deref()?, Foreseen::new())))
+            .collect();
+        if !foreseen.is_empty() {
+            rows.each_chunk(&mut |c| {
+                for r in &c {
+                    for (_, places, f) in foreseen.iter_mut().filter(|f| !f.2.over) {
+                        f.see(places.iter().map(|&i| value_at(r, i, around)).collect());
+                    }
+                }
+                Ok(())
+            })?;
+            for (kept, _, f) in foreseen {
+                f.kept_in(kept);
+            }
+        }
+        if rows.len() == 0 {
+            return Ok(());
+        }
+        // Each EXISTS read as the join it is: its rows read; those past the room cut on their
+        // keys' hash, and the step's rows no row held meets cut beside them, in one pass of all.
+        let mut ahead = Vec::new();
+        for plan in plans.plans.values() {
+            let Some(readied) = self.joining(plan)? else {
                 continue;
             };
-            plan.kept
-                .foresee(rows, &mut |r| places.iter().map(|&i| r[i].clone()).collect())?;
+            if readied.met.borrow().is_some() {
+                continue;
+            }
+            match self.theirs(plan, &readied, true)? {
+                (met, None) => *readied.met.borrow_mut() = Some(met),
+                (met, Some(parts)) => ahead.push(Ahead {
+                    places: plan.around.as_deref().expect("a subquery reading around it"),
+                    asking: parts.like(),
+                    theirs: parts,
+                    bits: vec![0u64; rows.len().div_ceil(64)],
+                    bits_held: crate::room::holding(rows.len().div_ceil(64) as u64 * 8),
+                    readied,
+                    met,
+                }),
+            }
+        }
+        if ahead.is_empty() {
+            return Ok(());
+        }
+        let mut seq = 0usize;
+        rows.each_chunk(&mut |c| {
+            for r in c {
+                for a in ahead.iter_mut() {
+                    self.asks(a, seq, &r, around)?;
+                }
+                seq += 1;
+            }
+            Ok(())
+        })?;
+        for mut a in ahead {
+            a.met.keys = HashSet::new();
+            a.met.rows = HashMap::new();
+            a.met.held = None;
+            let theirs = a.theirs.into_parts(u64::MAX)?;
+            let ours = a.asking.into_parts(u64::MAX)?;
+            for ((lo, hi, t), (_, _, o)) in theirs.into_iter().zip(ours) {
+                self.meet_part(&a.readied, t, o, (lo, hi), 0, &mut a.bits)?;
+            }
+            a.met.ahead = Some((a.bits, a.bits_held));
+            *a.readied.met.borrow_mut() = Some(a.met);
+        }
+        Ok(())
+    }
+
+    /// A row of the step, its `seq`th, asking an EXISTS whose rows passed the room: true where a
+    /// row it holds meets it; else written by its key's hash beside its place, to meet the rows of
+    /// the part of that hash.
+    fn asks(&self, a: &mut Ahead<'a>, seq: usize, r: &[Value], around: &[Value]) -> Result<()> {
+        let joined = a.readied.joined.as_ref().expect("read as a join");
+        let ready = &a.readied.ready;
+        let values: Vec<Value> = a.places.iter().map(|&i| value_at(r, i, around)).collect();
+        let Some(tie) = ready.joined_values(joined, self.asked, &values)? else {
+            return Ok(());
+        };
+        let key = keys_of(&tie);
+        let found = a.met.meets(&key, joined.by_pairs(), &mut |h| {
+            ready.pair_holds(joined, self.asked, h, &values)
+        })?;
+        if found {
+            a.bits[seq / 64] |= 1 << (seq % 64);
+            return Ok(());
+        }
+        let mut out = vec![Value::Int(seq as i64)];
+        out.extend(tie);
+        if joined.by_pairs() {
+            out.extend(values);
+        }
+        a.asking.push(pipeline::parted::key_hash(&key, 0), out)
+    }
+
+    /// While the step reads the chunk of `rows` from its `at`th row: the truth found ahead of each,
+    /// by its keys, for each EXISTS read as the join it is whose rows passed the room.
+    pub(super) fn read_ahead(
+        &self,
+        rows: &[Vec<Value>],
+        at: usize,
+        around: &[Value],
+    ) -> Result<()> {
+        for plan in self.plans.plans.values() {
+            let found = self.ready.borrow().get(&(plan as *const Plan)).cloned();
+            let Some(Some(readied)) = found else {
+                continue;
+            };
+            let Some(joined) = &readied.joined else {
+                continue;
+            };
+            let mut met = readied.met.borrow_mut();
+            let Some(m) = met.as_mut() else {
+                continue;
+            };
+            let Some((bits, _)) = &m.ahead else {
+                continue;
+            };
+            let places = plan.around.as_ref().expect("a subquery reading around it");
+            let mut reading = HashMap::with_capacity(rows.len());
+            for (j, r) in rows.iter().enumerate() {
+                let values: Vec<Value> = places.iter().map(|&i| value_at(r, i, around)).collect();
+                if let Some(tie) = readied.ready.joined_values(joined, self.asked, &values)? {
+                    let seq = at + j;
+                    let truth = bits.get(seq / 64).is_some_and(|w| w >> (seq % 64) & 1 == 1);
+                    reading.insert(reading_key(&keys_of(&tie), &values, joined.by_pairs()), truth);
+                }
+            }
+            m.reading = reading;
         }
         Ok(())
     }
@@ -810,19 +1077,30 @@ impl<'a, 'q> Subs<'a, 'q> {
             clause: None,
             unseen: Vec::new(),
         };
+        // A FROM read once a round is read from the file; one made for each set of values from what
+        // its first making read.
         let cached = Cached {
             reads: self.asked.reads,
             kept: &plan.kept,
         };
+        if let Some(readied) = self.ready(plan)? {
+            let reads: &dyn Reads = match readied.ready.reads_once() {
+                true => self.asked.reads,
+                false => &cached,
+            };
+            let asked = Asked {
+                reads,
+                answer_kept: true,
+                ..self.asked
+            };
+            let m = readied.ready.run(asked, Some(&outer), self.accrued, None)?;
+            return Returned::of(&plan.asks, m);
+        }
         let asked = Asked {
             reads: &cached,
             answer_kept: true,
             ..self.asked
         };
-        if let Some(ready) = self.ready(plan, asked, &outer)? {
-            let m = ready.run(asked, Some(&outer), self.accrued, None)?;
-            return Returned::of(&plan.asks, m);
-        }
         let (m, _) = relations::made_by(
             asked,
             &plan.query,
@@ -847,35 +1125,248 @@ impl<'a, 'q> Subs<'a, 'q> {
         })
     }
 
+    /// The query around a subquery as it reads it, before any row gives it values.
+    fn outer_unvalued(&self, plan: &'a Plan<'q>) -> Outer<'a> {
+        let columns = self.around_columns(plan);
+        Outer {
+            columns: std::borrow::Cow::Borrowed(columns),
+            values: vec![Value::Null; columns.len()],
+            kept: &plan.kept,
+            clause: None,
+            unseen: Vec::new(),
+        }
+    }
+
     /// A subquery's last step read off its text, once a round; none where its statement is not
     /// read so.
-    fn ready(
-        &self,
-        plan: &'a Plan<'q>,
-        asked: Asked,
-        outer: &Outer,
-    ) -> Result<Option<Rc<relations::Ready<'a>>>> {
+    fn ready(&self, plan: &'a Plan<'q>) -> Result<Option<Rc<Readied<'a>>>> {
         let at = plan as *const Plan<'q>;
         if let Some(r) = self.ready.borrow().get(&at) {
             return Ok(r.clone());
         }
+        let outer = self.outer_unvalued(plan);
+        let asked = Asked {
+            answer_kept: true,
+            ..self.asked
+        };
         if plan.read.get().is_none() {
             let once = relations::Once::of(
                 asked,
                 &plan.query,
                 self.made,
                 self.casings,
-                outer,
+                &outer,
                 self.accrued,
             )?;
             let _ = plan.read.set(once);
         }
-        let ready = match plan.read.get() {
-            Some(Some(once)) => Some(Rc::new(once.ready(asked, outer, self.accrued)?)),
+        let readied = match plan.read.get() {
+            Some(Some(once)) => {
+                let ready = once.ready(asked, &outer, self.accrued)?;
+                let joined = match plan.joinable {
+                    true => ready.joined(self.asked.release),
+                    false => None,
+                };
+                Some(Rc::new(Readied {
+                    ready,
+                    joined,
+                    met: RefCell::new(None),
+                }))
+            }
             _ => None,
         };
-        self.ready.borrow_mut().insert(at, ready.clone());
-        Ok(ready)
+        self.ready.borrow_mut().insert(at, readied.clone());
+        Ok(readied)
+    }
+
+    /// An EXISTS's subquery read off its text, where it is read as the join it is.
+    fn joining(&self, plan: &'a Plan<'q>) -> Result<Option<Rc<Readied<'a>>>> {
+        if !plan.joinable {
+            return Ok(None);
+        }
+        Ok(self.ready(plan)?.filter(|r| r.joined.is_some()))
+    }
+
+    /// Where an EXISTS is read as the join it is: whether a row of its subquery meets the row
+    /// asking; none where it is not read so, or where its rows passed the room and this row's truth
+    /// is not held.
+    fn exists(&self, plan: &'a Plan<'q>, row: &[Value]) -> Result<Option<bool>> {
+        let Some(readied) = self.joining(plan)? else {
+            return Ok(None);
+        };
+        let joined = readied.joined.as_ref().expect("read as a join");
+        let places = plan.around.as_ref().expect("a subquery reading around it");
+        let values: Vec<Value> = places.iter().map(|&i| row[i].clone()).collect();
+        let Some(tie) = readied.ready.joined_values(joined, self.asked, &values)? else {
+            return Ok(Some(false));
+        };
+        let key = keys_of(&tie);
+        if readied.met.borrow().is_none() {
+            let (met, _) = self.theirs(plan, &readied, false)?;
+            *readied.met.borrow_mut() = Some(met);
+        }
+        let met = readied.met.borrow();
+        let met = met.as_ref().expect("met");
+        if met.ahead.is_some() {
+            let k = reading_key(&key, &values, joined.by_pairs());
+            return Ok(met.reading.get(&k).copied());
+        }
+        if met.past {
+            return Ok(None);
+        }
+        let ready = &readied.ready;
+        met.meets(&key, joined.by_pairs(), &mut |r| {
+            ready.pair_holds(joined, self.asked, r, &values)
+        })
+        .map(Some)
+    }
+
+    /// An EXISTS's subquery's rows, read as the join it is: held where the room holds them. Where
+    /// they pass it and the step's rows are read ahead (`ahead`), the rest cut on their keys' hash,
+    /// each written once, to be read back once with the part of the step's rows of those hashes.
+    fn theirs(
+        &self,
+        plan: &'a Plan<'q>,
+        readied: &Readied<'a>,
+        ahead: bool,
+    ) -> Result<(Met, Option<super::spill::Parts>)> {
+        let joined = readied.joined.as_ref().expect("read as a join");
+        let ready = &readied.ready;
+        let by_pairs = joined.by_pairs();
+        let outer = self.outer_unvalued(plan);
+        let asked = Asked {
+            answer_kept: true,
+            ..self.asked
+        };
+        let mut met = Met::default();
+        let mut held = crate::room::holding(0);
+        let mut parts: Option<super::spill::Parts> = None;
+        let (mut n, mut bytes, mut held_bytes) = (0u64, 0u64, 0u64);
+        let most = std::cell::Cell::new(None);
+        ready.joined_rows(joined, asked, &outer, self.accrued, &most, &mut |tie, row| {
+            let w = super::spill::row_width(&tie) + super::spill::row_width(&row);
+            n += 1;
+            bytes += w;
+            let key = keys_of(&tie);
+            if parts.is_none() {
+                if met.past {
+                    return Ok(());
+                }
+                if held.fits(w) {
+                    held_bytes += w;
+                    met.hold(key, row, by_pairs);
+                    return Ok(());
+                }
+                met.past = true;
+                if !ahead {
+                    return Ok(());
+                }
+                // The rows to come cut into parts each of which fits half the room the rows held
+                // leave once let go, as a join's batches are.
+                let room = crate::room::current();
+                let free = room.as_ref().map_or(u64::MAX, |r| r.free_bytes()) + held_bytes;
+                let most_parts = room
+                    .as_ref()
+                    .map_or(1, |r| r.sizes().bytes / (2 * crate::cut::PAGE as u64))
+                    .max(8);
+                let count = match most.get() {
+                    Some(m) => {
+                        let to_come = m.saturating_sub(n - 1).saturating_mul(bytes / n);
+                        to_come / free.max(super::spill::CHUNK).div_ceil(2) + 1
+                    }
+                    None => PARTS_UNKNOWN,
+                };
+                parts = Some(super::spill::Parts::of_count(
+                    0,
+                    u64::MAX,
+                    count.min(most_parts),
+                ));
+            }
+            let mut out = tie;
+            out.extend(row);
+            parts
+                .as_ref()
+                .expect("parts")
+                .push(pipeline::parted::key_hash(&key, 0), out)
+        })?;
+        plan.kept.let_go_around();
+        met.held = Some(held);
+        Ok((met, parts))
+    }
+
+    /// One part of an EXISTS's rows met with the part of the step's rows that asks of the same
+    /// hashes: its rows held and the step's read back, each one's truth found; where its rows pass
+    /// the room, both parts cut again on their hashes.
+    fn meet_part(
+        &self,
+        readied: &Readied<'a>,
+        theirs: super::spill::Run,
+        ours: super::spill::Run,
+        (lo, hi): (u64, u64),
+        cut: u32,
+        bits: &mut [u64],
+    ) -> Result<()> {
+        if ours.len() == 0 || theirs.len() == 0 {
+            return Ok(());
+        }
+        let joined = readied.joined.as_ref().expect("read as a join");
+        let ready = &readied.ready;
+        let (k, by_pairs) = (joined.ties(), joined.by_pairs());
+        let free = crate::room::current()
+            .map_or(u64::MAX, |r| r.free_bytes())
+            .max(super::spill::CHUNK);
+        if theirs.total() > free && cut < CUTS && hi > lo {
+            let n = theirs.total() / free.div_ceil(2) + 1;
+            let again = super::spill::Parts::of_count(lo, hi, n);
+            let asking = again.like();
+            theirs.each_chunk(&mut |c| {
+                for r in c {
+                    again.push(pipeline::parted::key_hash(&keys_of(&r[..k]), 0), r)?;
+                }
+                Ok(())
+            })?;
+            ours.each_chunk(&mut |c| {
+                for r in c {
+                    asking.push(pipeline::parted::key_hash(&keys_of(&r[1..1 + k]), 0), r)?;
+                }
+                Ok(())
+            })?;
+            drop((theirs, ours));
+            let theirs = again.into_parts(hi)?;
+            let ours = asking.into_parts(hi)?;
+            for ((lo, hi, t), (_, _, o)) in theirs.into_iter().zip(ours) {
+                self.meet_part(readied, t, o, (lo, hi), cut + 1, bits)?;
+            }
+            return Ok(());
+        }
+        let mut met = Met {
+            held: Some(crate::room::holding(theirs.total())),
+            ..Met::default()
+        };
+        theirs.each_chunk(&mut |c| {
+            for mut r in c {
+                let row = r.split_off(k);
+                met.hold(keys_of(&r), row, by_pairs);
+            }
+            Ok(())
+        })?;
+        drop(theirs);
+        ours.each_chunk(&mut |c| {
+            for r in c {
+                let Value::Int(seq) = r[0] else {
+                    continue;
+                };
+                let seq = seq as usize;
+                let values = &r[1 + k..];
+                let found = met.meets(&keys_of(&r[1..1 + k]), by_pairs, &mut |h| {
+                    ready.pair_holds(joined, self.asked, h, values)
+                })?;
+                if found {
+                    bits[seq / 64] |= 1 << (seq % 64);
+                }
+            }
+            Ok(())
+        })
     }
 
     /// An answer kept for the rows that ask for its values again, where the room has room for it;
@@ -989,6 +1480,11 @@ impl pipeline::Subqueries for Subs<'_, '_> {
             .plans
             .get(&(e as *const Expr))
             .ok_or_else(|| Error::new(format!("{e} is not read here")))?;
+        if let Asks::Exists { negated } = &plan.asks {
+            if let Some(found) = self.exists(plan, row)? {
+                return Ok(Value::Bool(found != *negated));
+            }
+        }
         let returned = self.returned(plan, row, computed)?;
         let rows = &returned.rows;
         match &plan.asks {

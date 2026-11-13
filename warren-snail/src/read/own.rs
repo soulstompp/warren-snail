@@ -1599,6 +1599,21 @@ fn carried(release: u8) -> Arc<Carried> {
         .clone()
 }
 
+/// Whether a call of a name may be volatile: the file's function it finds is, or, where it finds
+/// none, one of the release's catalog of the name is.
+pub(crate) fn may_be_volatile(name: &str, release: u8) -> bool {
+    match found(name) {
+        Some(g) => g.volatility == 'v',
+        None => {
+            let last = name.rsplit('.').next().unwrap_or(name);
+            carried(release)
+                .by_name
+                .get(last)
+                .is_some_and(|all| all.iter().any(|p| p.volatility == 2))
+        }
+    }
+}
+
 /// Whether every function of a name the release's catalog holds returns a set.
 pub(crate) fn returns_set(name: &str, release: u8) -> bool {
     carried(release)

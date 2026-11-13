@@ -6,10 +6,12 @@
 //! ON, USING or NATURAL, a function's rows made for each row of the relations before it.
 
 mod apart;
+mod exists;
 mod kept;
 mod met;
 mod recursive;
 
+pub(super) use exists::Joined;
 pub(super) use kept::{Keep, Kept};
 pub(super) use recursive::unread_clauses;
 
@@ -6214,6 +6216,11 @@ impl<'s> Ready<'s> {
         })
     }
 
+    /// Whether, as a subquery's, its FROM is read once a round, whatever the rows asking.
+    pub(super) fn reads_once(&self) -> bool {
+        self.keepable
+    }
+
     /// The step run: its FROM read, then each row read as the pipeline reads it; a subquery's for
     /// the values `outer` gives the query around it.
     pub(super) fn run(
@@ -6440,8 +6447,14 @@ impl<'s> Ready<'s> {
                         place.seal()?;
                         let place = super::spill::Rows::one(place);
                         rows_known.set(Some(place.len() as u64));
-                        subs.foresee(&place)?;
-                        place.each_chunk(&mut |c| feed(c, order))?;
+                        let around: &[Value] = outer.map_or(&[], |o| &o.values);
+                        subs.foresee(&place, around)?;
+                        let mut at = 0;
+                        place.each_chunk(&mut |c| {
+                            subs.read_ahead(&c, at, around)?;
+                            at += c.len();
+                            feed(c, order)
+                        })?;
                     }
                 }
             }

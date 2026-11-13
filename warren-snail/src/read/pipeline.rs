@@ -6942,6 +6942,17 @@ impl<'q> Prepared<'q> {
         &self.calls.windows
     }
 
+    /// Whether each row its FROM gives and its WHERE keeps is a row it returns: it folds nothing,
+    /// makes no set and cuts no row.
+    pub(super) fn returns_each_kept(&self) -> bool {
+        !self.grouped
+            && self.having.is_none()
+            && self.calls.windows.is_empty()
+            && self.calls.sets.is_empty()
+            && self.below_exprs.is_empty()
+            && self.limit.is_none()
+    }
+
     /// The columns its expressions read of its FROM's: its select list's, its WHERE's, its HAVING's,
     /// its ORDER BY's own, its windows' partitions and orders, and those its FROM reads its
     /// relations by.

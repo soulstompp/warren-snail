@@ -660,6 +660,45 @@ impl Parts {
         self.runs[i as usize].push(row)
     }
 
+    /// Parts of the hashes from `lo` to `hi`, `n` of them.
+    pub(in crate::read) fn of_count(lo: u64, hi: u64, n: u64) -> Parts {
+        let n = n.max(1);
+        Parts {
+            lo,
+            step: ((hi - lo) / n).max(1),
+            runs: (0..n).map(|_| Run::past()).collect(),
+            _filling: crate::room::flying(if n > 1 { n * PAGE as u64 } else { 0 }),
+        }
+    }
+
+    /// Parts of none of its rows, cut on the hashes as these are.
+    pub(in crate::read) fn like(&self) -> Parts {
+        let n = self.runs.len() as u64;
+        Parts {
+            lo: self.lo,
+            step: self.step,
+            runs: (0..n).map(|_| Run::past()).collect(),
+            _filling: crate::room::flying(if n > 1 { n * PAGE as u64 } else { 0 }),
+        }
+    }
+
+    /// Each part written, with the hashes it begins and ends at, in the order of their hashes, the
+    /// empty among them: the last goes up to `hi`.
+    pub(in crate::read) fn into_parts(self, hi: u64) -> Result<Vec<(u64, u64, Run)>> {
+        let n = self.runs.len() as u64;
+        let mut parts = Vec::with_capacity(self.runs.len());
+        for (i, run) in self.runs.into_iter().enumerate() {
+            run.seal()?;
+            let lo = self.lo + i as u64 * self.step;
+            let top = match i as u64 + 1 == n {
+                true => hi,
+                false => lo + self.step - 1,
+            };
+            parts.push((lo, top, run));
+        }
+        Ok(parts)
+    }
+
     /// Its parts written, on the front of `queue` in the order of their hashes: the last goes up to
     /// `hi`.
     pub(in crate::read) fn into_queue(self, hi: u64, queue: &mut Queue) -> Result<()> {
