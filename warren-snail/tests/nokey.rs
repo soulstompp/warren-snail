@@ -401,6 +401,114 @@ fn current_of_one_of_two(form: &str, ddl: &str, m: &str) {
     );
 }
 
+/// A row in a block the transaction staged has a ctid of its own, past every block the root names:
+/// read in a select list, met by WHERE ctid = …, and so by CURRENT OF a cursor declared after it.
+#[test]
+fn a_ctid_of_a_block_the_transaction_staged_is_read() {
+    for (form, m) in [
+        ("clustered", "CREATE INDEX m_a ON s.m (a); ALTER TABLE s.m CLUSTER ON m_a;"),
+        ("keyless", ""),
+    ] {
+        a_staged_block_s_ctid(form, m);
+    }
+    for (form, ddl) in FORMS {
+        a_staged_ctid(form, ddl);
+    }
+}
+
+fn a_staged_block_s_ctid(form: &str, m: &str) {
+    let path = declared(
+        &format!("staged-block-ctid-{form}"),
+        &format!("CREATE SCHEMA s; CREATE TABLE s.m (a integer NOT NULL, b text); {m}"),
+        &[],
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    changed(&mut w, "BEGIN");
+    changed(&mut w, "INSERT INTO s.m VALUES (1, 'x'), (2, 'y'), (2, 'y'), (3, 'z')");
+    assert_eq!(
+        rows(&mut w, "SELECT ctid::text IS NOT NULL AS c FROM s.m WHERE a = 2"),
+        ["t", "t"]
+    );
+    assert_eq!(changed(&mut w, "UPDATE s.m SET b = 'q' WHERE a = 2"), 2);
+    assert_eq!(
+        rows(&mut w, "SELECT ctid::text IS NOT NULL AS c FROM s.m WHERE a = 2"),
+        ["t", "t"]
+    );
+    assert_eq!(rows(&mut w, "SELECT count(DISTINCT ctid) FROM s.m"), ["4"]);
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT a, b FROM s.m WHERE ctid = (SELECT ctid FROM s.m WHERE a = 2 LIMIT 1)"
+        ),
+        ["2|q"]
+    );
+    changed(&mut w, "DECLARE e CURSOR FOR SELECT a, b FROM s.m WHERE a = 1");
+    assert_eq!(rows(&mut w, "FETCH 1 FROM e"), ["1|x"]);
+    assert_eq!(changed(&mut w, "UPDATE s.m SET b = 'w' WHERE CURRENT OF e"), 1);
+    changed(&mut w, "DECLARE f CURSOR FOR SELECT a, b FROM s.m WHERE a = 2");
+    assert_eq!(rows(&mut w, "FETCH 1 FROM f"), ["2|q"]);
+    assert_eq!(changed(&mut w, "DELETE FROM s.m WHERE CURRENT OF f"), 1);
+    let all = "SELECT a, b FROM s.m ORDER BY a, b";
+    assert_eq!(rows(&mut w, all), ["1|w", "2|q", "3|z"]);
+    changed(&mut w, "COMMIT");
+    assert_eq!(rows(&mut w, all), ["1|w", "2|q", "3|z"]);
+}
+
+fn a_staged_ctid(form: &str, ddl: &str) {
+    let path = declared(
+        &format!("staged-ctid-{form}"),
+        ddl,
+        &[
+            "INSERT INTO s.k SELECT g / 1000, 'r' FROM generate_series(1, 5000) g",
+            "INSERT INTO s.k VALUES (2, 'y'), (2, 'y')",
+        ],
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    changed(&mut w, "BEGIN");
+    assert_eq!(
+        changed(&mut w, "UPDATE s.k SET b = 'q' WHERE a = 2 AND b = 'y'"),
+        2
+    );
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT ctid::text IS NOT NULL AS c FROM s.k WHERE a = 2 AND b = 'q'"
+        ),
+        ["t", "t"]
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT count(DISTINCT ctid), count(*) FROM s.k"),
+        ["5002|5002"]
+    );
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT a, b FROM s.k WHERE ctid = (SELECT ctid FROM s.k WHERE a = 2 AND b = 'q' LIMIT 1)"
+        ),
+        ["2|q"]
+    );
+    changed(
+        &mut w,
+        "DECLARE e CURSOR FOR SELECT a, b FROM s.k WHERE a = 2 AND b = 'q'",
+    );
+    assert_eq!(rows(&mut w, "FETCH 1 FROM e"), ["2|q"]);
+    assert_eq!(
+        changed(&mut w, "UPDATE s.k SET b = 'w' WHERE CURRENT OF e"),
+        1
+    );
+    changed(
+        &mut w,
+        "DECLARE f CURSOR FOR SELECT a, b FROM s.k WHERE a = 2 AND b = 'q'",
+    );
+    assert_eq!(rows(&mut w, "FETCH 1 FROM f"), ["2|q"]);
+    assert_eq!(changed(&mut w, "DELETE FROM s.k WHERE CURRENT OF f"), 1);
+    let grouped = "SELECT a, b, count(*) FROM s.k WHERE a = 2 GROUP BY a, b ORDER BY a, b";
+    assert_eq!(rows(&mut w, grouped), ["2|r|1000", "2|w|1"]);
+    changed(&mut w, "COMMIT");
+    assert_eq!(rows(&mut w, grouped), ["2|r|1000", "2|w|1"]);
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM s.k"), ["5001"]);
+}
+
 /// A cursor whose select list holds a `*` keeps each row's key, or each row's values where its
 /// table has none, past its own columns, as one naming them does.
 #[test]

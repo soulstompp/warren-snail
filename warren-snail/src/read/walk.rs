@@ -1362,6 +1362,8 @@ impl Snail {
     /// A system column's values over the rows `from` to `to` of a block: the OID the file gave the
     /// table; or each row's ctid, the first page its block's page map names, a page the block alone
     /// owns as PostgreSQL's tid names a page of the heap, and the row's place in the block from 1.
+    /// A page the transaction staged is numbered past every page the root names, in the order it
+    /// was staged.
     fn system_values(
         &self,
         table: &Table,
@@ -1383,6 +1385,10 @@ impl Snail {
             .map(|e| e.start)
             .min()
             .ok_or_else(|| Error::new(format!("ctid of {}: a block of no pages", table.name)))?;
+        let first = match first.checked_sub(crate::file::STAGED) {
+            Some(staged) => self.root.pages + staged,
+            None => first,
+        };
         let block = u32::try_from(first).map_err(|_| {
             Error::new(format!(
                 "ctid of {}: its block's first page {first} lies past a tid's 2^32 blocks",
