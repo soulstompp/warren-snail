@@ -10353,8 +10353,8 @@ pub(super) fn says_distinct(s: &sqlparser::ast::Select) -> bool {
 /// NATURAL, or a RIGHT or FULL JOIN after the first join; it groups by a name its select list gives
 /// or orders by what it does not return; or it calls a function, an aggregate of a column's values
 /// counted, or over each value once, filtered or ordered, or an operator on numbers or on a document,
-/// the question path does not read, or reads a CASE, a subscript, a COLLATE or a parameter, or
-/// returns a cast or a truth; or calls an aggregate or a window function in WHERE, which the
+/// the question path does not read, or reads a CASE, a subscript, a COLLATE, a cast of what is no
+/// constant or a parameter, or returns a cast or a truth; or calls an aggregate or a window function in WHERE, which the
 /// pipeline refuses as PostgreSQL's parser does.
 pub fn hands_over(q: &Query) -> bool {
     let SetExpr::Select(s) = q.body.as_ref() else {
@@ -10608,8 +10608,10 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
         Expr::UnaryOp { op, expr: x } => {
             !matches!(op, UnaryOperator::Not) || calls_beyond_the_question(x)
         }
+        // A cast: the question path holds a level for a constant's, and for a month's as the key
+        // spells it; any other is read on each row.
+        Expr::Cast { expr: x, .. } => !is_written_constant(x) || calls_beyond_the_question(x),
         Expr::Nested(x)
-        | Expr::Cast { expr: x, .. }
         | Expr::IsNull(x)
         | Expr::IsNotNull(x)
         | Expr::IsTrue(x)
