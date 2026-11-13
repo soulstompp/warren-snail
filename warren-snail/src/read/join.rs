@@ -537,13 +537,11 @@ pub(super) fn ask_join_within(
                     })
                     .collect::<Option<Vec<KeyValue>>>()
             });
-            KeySet::new(
-                meets.iter().map(|m| m.a.column).collect(),
-                values.collect::<Vec<_>>(),
-            )
+            KeySet::new(meets.iter().map(|m| m.a.column).collect(), values)
         });
         t.columns[side] = columns.clone();
         let mut keys = keys;
+        let _keys_held = keys.as_ref().map(|k| crate::room::holding(k.bytes()));
         let mut _held_keys = None;
         if keys.is_none() {
             let alone = Want {

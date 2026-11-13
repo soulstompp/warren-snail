@@ -94,14 +94,59 @@ pub struct KeySet {
 }
 
 impl KeySet {
+    /// The keys laid flat as they come, then sorted in place, each once.
     pub fn new(columns: Vec<usize>, keys: impl IntoIterator<Item = Vec<KeyValue>>) -> KeySet {
-        let mut sorted: Vec<Vec<KeyValue>> = keys.into_iter().collect();
-        sorted.sort_unstable();
-        sorted.dedup();
+        let w = columns.len().max(1);
+        let keys = keys.into_iter();
+        let mut flat = Vec::with_capacity(keys.size_hint().1.unwrap_or(0) * w);
+        keys.for_each(|k| flat.extend(k));
+        let n = flat.len() / w;
+        let at = |i: usize| i * w..(i + 1) * w;
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by(|&a, &b| flat[at(a)].cmp(&flat[at(b)]));
+        // Each key moved to its place in turn, along the cycles the order makes.
+        let swap = |flat: &mut Vec<KeyValue>, a: usize, b: usize| {
+            (0..w).for_each(|t| flat.swap(a * w + t, b * w + t))
+        };
+        for i in 0..n {
+            let mut k = i;
+            while order[k] != usize::MAX {
+                let from = std::mem::replace(&mut order[k], usize::MAX);
+                if from == i {
+                    break;
+                }
+                swap(&mut flat, k, from);
+                k = from;
+            }
+        }
+        drop(order);
+        let mut kept = 0;
+        for k in 0..n {
+            if kept == 0 || flat[at(k)] != flat[at(kept - 1)] {
+                swap(&mut flat, kept, k);
+                kept += 1;
+            }
+        }
+        flat.truncate(kept * w);
+        flat.shrink_to_fit();
         KeySet {
-            keys: sorted.concat(),
+            keys: flat,
             columns,
         }
+    }
+
+    /// The bytes its keys hold.
+    pub fn bytes(&self) -> u64 {
+        (self.keys.capacity() * std::mem::size_of::<KeyValue>()) as u64
+            + self
+                .keys
+                .iter()
+                .map(|k| match k {
+                    KeyValue::Text(t) => t.len() as u64,
+                    KeyValue::Bytes(b) => b.len() as u64,
+                    _ => 0,
+                })
+                .sum::<u64>()
     }
 
     fn len(&self) -> usize {
