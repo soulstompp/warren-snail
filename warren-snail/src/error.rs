@@ -218,6 +218,14 @@ const SAID: &[(Words, &str)] = &[
         "42P10",
     ),
     (
+        Words::Is("in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"),
+        "42P10",
+    ),
+    (Words::Is("DISTINCT is not implemented for window functions"), "0A000"),
+    (Words::Is("aggregate ORDER BY is not implemented for window functions"), "0A000"),
+    (Words::Is("cannot use multiple ORDER BY clauses with WITHIN GROUP"), "42601"),
+    (Words::Is("cannot use DISTINCT with WITHIN GROUP"), "42601"),
+    (
         Words::Is("SELECT DISTINCT ON expressions must match initial ORDER BY expressions"),
         "42P10",
     ),

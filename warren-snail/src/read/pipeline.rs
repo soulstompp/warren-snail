@@ -528,8 +528,8 @@ pub(super) fn sort_item(o: &sqlparser::ast::OrderByExpr, ty: Option<ColumnType>)
 }
 
 /// An aggregate's DISTINCT arguments and its ORDER BY, read as PostgreSQL's parser reads them as
-/// it reads the call, before any row: each ORDER BY item sorted, then each argument found
-/// DISTINCT and sorted.
+/// it reads the call, before any row: each ORDER BY item sorted, under DISTINCT found among the
+/// arguments, then each argument found DISTINCT and sorted.
 fn folded_keys(call: &Expr, typing: &mut super::typed::Typing) -> Result<()> {
     let Expr::Function(f) = call else {
         return Ok(());
@@ -557,8 +557,25 @@ fn folded_keys(call: &Expr, typing: &mut super::typed::Typing) -> Result<()> {
             }));
         }
     }
-    for o in by {
+    for o in &by {
         sort_item(o, typing.type_of(&o.expr)?)?;
+    }
+    if !distinct.is_empty() && !by.is_empty() {
+        for e in &distinct {
+            typing.type_of(e)?;
+        }
+        let name = function_name(f);
+        let ty = match typing.types.get(&(call as *const Expr)) {
+            Some(t) => Some(*t),
+            None => typing.type_of(call)?,
+        };
+        for o in &by {
+            if !distinct.iter().any(|a| is_argument(&name, ty, a, &o.expr, typing)) {
+                return Err(Error::new(
+                    "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list",
+                ));
+            }
+        }
     }
     for e in distinct {
         let ty = typing.type_of(e)?;
@@ -572,6 +589,60 @@ fn folded_keys(call: &Expr, typing: &mut super::typed::Typing) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether an aggregate's ORDER BY item is its argument `arg`, as PostgreSQL's parser finds it once
+/// it has read both. A quoted literal or NULL is one by its text and the type it is read as: where
+/// it is cast, that type; bare in the ORDER BY, none; bare among the arguments, the type the
+/// aggregate `name` of type `ty` takes it as, none where it takes any type.
+fn is_argument(
+    name: &str,
+    ty: Option<ColumnType>,
+    arg: &Expr,
+    item: &Expr,
+    typing: &super::typed::Typing,
+) -> bool {
+    let taken = match name {
+        "count" => None,
+        n if super::json::AGGREGATES.contains(&n) && n.contains("_object_") => None,
+        n if n == "corr" || n.starts_with("covar_") || n.starts_with("regr_") => {
+            Some(ColumnType::Float8)
+        }
+        "bool_and" | "bool_or" | "every" => Some(ColumnType::Boolean),
+        _ => ty,
+    };
+    match (untyped_text(item, &typing.types), untyped_text(arg, &typing.types)) {
+        (Some((s, cast)), Some((t, arg_cast))) => {
+            s == t && cast.flatten() == arg_cast.unwrap_or(taken)
+        }
+        (None, None) => alike(arg, item, typing.columns, Some(&typing.types)),
+        _ => false,
+    }
+}
+
+/// A quoted literal or NULL, bare or under one cast: its text, none for NULL, and where it is cast
+/// the type it is cast to.
+#[allow(clippy::type_complexity)]
+fn untyped_text<'e>(
+    e: &'e Expr,
+    types: &super::typed::Types,
+) -> Option<(Option<&'e str>, Option<Option<ColumnType>>)> {
+    match e {
+        Expr::Nested(x) => untyped_text(x, types),
+        Expr::Cast { expr, .. } => match untyped_text(expr, types)? {
+            (s, None) => Some((s, Some(types.get(&(e as *const Expr)).copied()))),
+            _ => None,
+        },
+        Expr::Value(v) => match &v.value {
+            SqlValue::SingleQuotedString(s) | SqlValue::EscapedStringLiteral(s) => {
+                Some((Some(s), None))
+            }
+            SqlValue::DollarQuotedString(d) => Some((Some(&d.value), None)),
+            SqlValue::Null => Some((None, None)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// A value as a key that groups, refused where PostgreSQL has no equality to group it by.
@@ -6533,11 +6604,14 @@ enum Acc {
     },
     /// An aggregate whose rows come in the order its ORDER BY gives: each row's arguments, then
     /// the values it is ordered by, folded in that order at the end; the arguments' collations.
+    /// Under DISTINCT the arguments break the ORDER BY's ties, ascending, and each row of them is
+    /// folded once.
     Ordered {
         by: Vec<super::aggregates::Direction>,
         args: usize,
         rows: Vec<Vec<Value>>,
         under: Vec<Option<Casing>>,
+        distinct: bool,
         of: Box<Acc>,
     },
 }
@@ -6586,11 +6660,6 @@ impl Acc {
             }
             _ => false,
         };
-        if distinct && !by.is_empty() {
-            return Err(Error::new(format!(
-                "{call}: an ORDER BY beside DISTINCT among an aggregate's arguments is not read"
-            )));
-        }
         let a = args(f)?;
         if !f.within_group.is_empty() {
             let by = f
@@ -6659,7 +6728,7 @@ impl Acc {
                 }
             }
         }
-        let acc = if distinct {
+        let acc = if distinct && by.is_empty() {
             Acc::Distinct {
                 seen: Default::default(),
                 values: Vec::new(),
@@ -6683,6 +6752,7 @@ impl Acc {
                 args: a.len(),
                 rows: Vec::new(),
                 under: Vec::new(),
+                distinct,
                 of: Box::new(acc),
             }
         } else {
@@ -7086,24 +7156,51 @@ impl Acc {
                 args,
                 rows,
                 under,
+                distinct,
                 of,
             } => {
                 let mut rows = rows.clone();
                 let mut failed = None;
+                let ties: Vec<super::aggregates::Direction> = (0..*args)
+                    .filter(|_| *distinct)
+                    .map(|i| super::aggregates::Direction {
+                        desc: false,
+                        nulls_first: false,
+                        under: under.get(i).copied().flatten(),
+                        bytes: false,
+                    })
+                    .collect();
                 rows.sort_by(|a, b| {
-                    super::aggregates::compare_rows(&a[*args..], &b[*args..], by).unwrap_or_else(
-                        |e| {
+                    super::aggregates::compare_rows(&a[*args..], &b[*args..], by)
+                        .and_then(|o| match o {
+                            Ordering::Equal => {
+                                super::aggregates::compare_rows(&a[..*args], &b[..*args], &ties)
+                            }
+                            o => Ok(o),
+                        })
+                        .unwrap_or_else(|e| {
                             failed.get_or_insert(e);
                             Ordering::Equal
-                        },
-                    )
+                        })
                 });
                 if let Some(e) = failed {
                     return Err(e);
                 }
                 let mut acc = (**of).clone();
+                let mut last: Option<Vec<Key>> = None;
                 for mut r in rows {
                     r.truncate(*args);
+                    if *distinct {
+                        let k: Vec<Key> = r
+                            .iter()
+                            .enumerate()
+                            .map(|(i, v)| key_under(v, under.get(i).copied().flatten()))
+                            .collect();
+                        if last.as_ref() == Some(&k) {
+                            continue;
+                        }
+                        last = Some(k);
+                    }
                     acc.add_row(r, under)?;
                 }
                 acc.value()?

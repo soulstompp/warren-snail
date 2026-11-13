@@ -569,6 +569,21 @@ impl Walk<'_> {
                 self.query(subquery)
             }
             Expr::Function(f) => {
+                // WITHIN GROUP's ORDER BY and an aggregate's own share one place in PostgreSQL's
+                // grammar, which refuses the two together, and DISTINCT beside WITHIN GROUP.
+                if let (FunctionArguments::List(l), false) = (&f.args, f.within_group.is_empty()) {
+                    if l.clauses
+                        .iter()
+                        .any(|c| matches!(c, FunctionArgumentClause::OrderBy(_)))
+                    {
+                        return Err(Error::new(
+                            "cannot use multiple ORDER BY clauses with WITHIN GROUP",
+                        ));
+                    }
+                    if l.duplicate_treatment == Some(sqlparser::ast::DuplicateTreatment::Distinct) {
+                        return Err(Error::new("cannot use DISTINCT with WITHIN GROUP"));
+                    }
+                }
                 match &mut f.args {
                     FunctionArguments::Subquery(q) => self.query(q)?,
                     FunctionArguments::List(l) => {
