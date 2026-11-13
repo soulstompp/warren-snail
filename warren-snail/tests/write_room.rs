@@ -207,6 +207,31 @@ fn a_key_two_rows_share_is_refused_past_the_room_as_within_it() {
     assert_eq!(refusal(1 << 14), whole);
 }
 
+#[test]
+fn the_first_row_a_check_refuses_is_refused_as_postgresql_s_copy_refuses_it() {
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b text NOT NULL, \
+               CHECK (a <> 9100), PRIMARY KEY (a));";
+    let catalog = Catalog::parse(ddl).unwrap();
+    let rows: Vec<Vec<Option<String>>> = (0..10_000i64)
+        .map(|i| {
+            vec![
+                Some(i.to_string()),
+                (i != 8_500).then(|| format!("row {i}")),
+            ]
+        })
+        .collect();
+    let tables = [("s.t".to_string(), spelled(&catalog, "s.t", &rows))];
+    for room in [WHOLE, 1 << 14] {
+        let path = tmp(&format!("room-checked-{room}.snail"));
+        let e = write_within(&path, &catalog, &tables, &[], span(), room).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "null value in column \"b\" of relation \"t\" violates not-null constraint: Failing \
+             row contains (8500, null)."
+        );
+    }
+}
+
 #[cfg(feature = "standalone")]
 #[test]
 fn files_out_of_a_snail_come_back_past_the_room_by_their_pages_as_whole() {
