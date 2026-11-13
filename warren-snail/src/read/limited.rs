@@ -210,6 +210,15 @@ fn what_moves(q: &Query, release: u8) -> Option<Moves> {
     let SetExpr::Select(s) = q.body.as_ref() else {
         return None;
     };
+    // A select list that may draw is made for every row the cut reads, its OFFSET's among them: the
+    // cut stays its own, and stops the subquery as it reads its rows.
+    let cuts = cuts
+        && !s.projection.iter().any(|i| match i {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                outputs::calls_volatile(e, release)
+            }
+            _ => false,
+        });
     if folds(s) || !cuts && s.selection.is_none() {
         return None;
     }

@@ -208,6 +208,9 @@ pub(super) struct Made {
     /// Each column's refusal where a statement asks it, a catalog table's column only a server
     /// fills: empty where none is refused.
     refused: Vec<Option<String>>,
+    /// Whether its rows are made as the one step that reads them reads them (`Streams`): it holds
+    /// its columns alone.
+    streamed: bool,
 }
 
 impl Made {
@@ -244,6 +247,7 @@ impl Made {
             types,
             carried,
             kept: None,
+            streamed: false,
         }
     }
 
@@ -257,6 +261,9 @@ impl Made {
 
     /// Its rows as a place.
     pub(super) fn rows_of(&self) -> Result<Rows> {
+        if self.streamed {
+            return Err(Error::new("a step made as its reader reads it is read once, as it comes"));
+        }
         match &self.kept {
             Some(run) => Ok(run.clone()),
             None => Rows::of(self.rel.rows.clone()),
@@ -2918,6 +2925,10 @@ type Ons<'a> = HashMap<*const Node, &'a dyn pipeline::Subqueries>;
 
 /// A step's FROM read into its rows, as the round reads the tables in it.
 struct Reading<'a> {
+    /// Where the steps it reads that are made as it reads them are found.
+    streams: Option<&'a dyn Streaming>,
+    /// Set once the step reads no row more.
+    halt: Option<&'a Rc<std::cell::Cell<bool>>>,
     reads: &'a dyn Reads,
     from: &'a From,
     /// What the step writes: a column it cannot mean is not read.
@@ -3050,6 +3061,13 @@ impl Reading<'_> {
             What::Table { table, qualifier, .. } => {
                 self.alone(node, *table, qualifier, preserved, each)
             }
+            What::Made { name, .. } if self.made[name].streamed => {
+                let streams = self
+                    .streams
+                    .ok_or_else(|| Error::new(format!("the step {name} is not waiting")))?;
+                let stop = self.halt.cloned().unwrap_or_default();
+                streams.stream(name, &stop, each)
+            }
             What::Made { name, .. } => {
                 let rows = self.made[name].rows_of()?;
                 if self.whole_from.is_some_and(|n| std::ptr::eq(n, node)) {
@@ -3079,7 +3097,9 @@ impl Reading<'_> {
             return Ok(r.clone());
         }
         if let What::Made { name, .. } = &node.what {
-            return self.made[name].rows_of();
+            if !self.made[name].streamed {
+                return self.made[name].rows_of();
+            }
         }
         let run = Run::new();
         let mut order = None;
@@ -4527,6 +4547,19 @@ fn values_step(
     accrued: &Accrued,
     casings: &Casings,
 ) -> Result<Made> {
+    values_into(step, asked, made, accrued, casings, None)
+}
+
+/// The same; given `out`, each row handed there as it is made, none once its `stop` is set, and
+/// none kept.
+fn values_into(
+    step: &Step,
+    asked: Asked,
+    made: &Steps,
+    accrued: &Accrued,
+    casings: &Casings,
+    mut out: Option<(Each, &Rc<std::cell::Cell<bool>>)>,
+) -> Result<Made> {
     let (params, release, reads) = (asked.params, asked.release, asked.reads);
     let SetExpr::Values(v) = step.query.body.as_ref() else {
         unreachable!("a VALUES step")
@@ -4581,6 +4614,9 @@ fn values_step(
     let none = pipeline::computed_none();
     let mut made = Vec::with_capacity(rows.len());
     for r in &rows {
+        if out.as_ref().is_some_and(|(_, stop)| stop.get()) {
+            break;
+        }
         let mut row = Vec::with_capacity(n);
         for (e, &ty) in r.iter().zip(&types) {
             let x = pipeline::eval(e, &[], &frame, &none)?;
@@ -4589,7 +4625,10 @@ fn values_step(
                 false => coerce(x, ty, pipeline::quoted(e))?,
             });
         }
-        made.push(row);
+        match out.as_mut() {
+            Some((each, _)) => each(vec![row], None)?,
+            None => made.push(row),
+        }
     }
     let names = (1..=n).map(|i| format!("column{i}")).collect();
     Ok(Made::of(
@@ -5119,27 +5158,30 @@ fn image(
 }
 
 fn met(arm: &Arm, made: &Steps, casings: &Casings) -> Result<Met> {
+    met_of(arm, made, casings, true)
+}
+
+/// A set operation's columns, met as `met` meets them, its rows none: its arms' shapes alone.
+fn met_shape(arm: &Arm, made: &Steps, casings: &Casings) -> Result<Met> {
+    met_of(arm, made, casings, false)
+}
+
+fn met_of(arm: &Arm, made: &Steps, casings: &Casings, with_rows: bool) -> Result<Met> {
     let (op, all, left, right) = match arm {
         Arm::Leaf { name, untyped } => {
             let m = made
                 .get(name)
                 .ok_or_else(|| Error::new("a set operation's arm was not made"))?;
-            let n = m.rel.names.len();
-            let mut types = m.types.clone();
+            let (types, untyped) = leaf_types(m, untyped);
             return Ok(Met {
                 names: m.rel.names.clone(),
-                untyped: (0..n)
-                    .map(|c| match untyped.get(c).cloned().unwrap_or(Untyped::No) {
-                        Untyped::Text => {
-                            types[c] = types[c].or(Some(ColumnType::Text(None)));
-                            Untyped::No
-                        }
-                        u => u,
-                    })
-                    .collect(),
+                untyped,
                 types,
                 carried: m.carried.clone(),
-                rows: m.rows_of()?,
+                rows: match with_rows {
+                    true => m.rows_of()?,
+                    false => Rows::of(Vec::new())?,
+                },
             });
         }
         Arm::Op {
@@ -5154,8 +5196,8 @@ fn met(arm: &Arm, made: &Steps, casings: &Casings) -> Result<Met> {
         SetOperator::Intersect => "INTERSECT",
         _ => "EXCEPT",
     };
-    let l = met(left, made, casings)?;
-    let r = met(right, made, casings)?;
+    let l = met_of(left, made, casings, with_rows)?;
+    let r = met_of(right, made, casings, with_rows)?;
     let n = l.types.len();
     if r.types.len() != n {
         return Err(Error::new(format!(
@@ -5196,6 +5238,15 @@ fn met(arm: &Arm, made: &Steps, casings: &Casings) -> Result<Met> {
             k => k,
         });
         types.push(ty);
+    }
+    if !with_rows {
+        return Ok(Met {
+            names: l.names,
+            types: types.into_iter().map(Some).collect(),
+            untyped: vec![Untyped::No; n],
+            carried,
+            rows: l.rows,
+        });
     }
     let lrows = arm_in_types(&l, &types)?;
     let rrows = arm_in_types(&r, &types)?;
@@ -5422,14 +5473,52 @@ pub(super) fn made_by(
             || writes(&steps[j].query)
             || (j + 1..steps.len()).any(|k| needed[k] && !theirs.contains(&k) && reads_it(k));
     }
+    // A step read by one step alone, once, as its whole FROM or an arm of a UNION ALL so read, is
+    // made as that step reads it, each row handed on as it is made, where the statement may draw
+    // or a step its rows reach cuts them: what a cut never reaches is never made, and the draws
+    // take turns as PostgreSQL's pulled rows take them. Each other step is made whole first.
+    let draws = may_draw(q, asked.release);
+    let mut stream_into: Vec<Option<usize>> = vec![None; steps.len()];
+    let mut cuts = vec![false; steps.len()];
+    for i in (0..steps.len()).rev() {
+        stream_into[i] = streamed_into(
+            i,
+            &steps,
+            &read,
+            &readers,
+            &theirs,
+            &stream_into,
+            &making.arms,
+        )
+        .filter(|&j| {
+            outer.is_none()
+                && needed[i]
+                && !theirs.contains(&i)
+                && !before.contains_key(&steps[i].name)
+                && (draws || cuts[j] && hands_on(&steps[i]))
+        });
+        let own = steps[i].set.is_none()
+            && (steps[i].query.limit_clause.is_some() || steps[i].query.fetch.is_some());
+        cuts[i] = own || stream_into[i].is_some_and(|j| cuts[j]);
+    }
+    let mut deferred: HashMap<String, Step> = HashMap::new();
     for i in 0..steps.len() {
         if theirs.contains(&i) {
             continue;
         }
-        for (n, left) in &readers {
-            if *left == 1 && read[i].contains(n) {
-                if let Some(rows) = making.made.get(n).and_then(|m| m.kept.as_ref()) {
-                    rows.last_reader();
+        if stream_into[i].is_some() {
+            let name = steps[i].name.clone();
+            deferred.insert(name, taken(&mut steps[i]));
+            continue;
+        }
+        // The steps made as this one reads them, each after those it reads, then it.
+        let group = waiting_for(i, &stream_into);
+        for &k in &group {
+            for (n, left) in &readers {
+                if *left == 1 && read[k].contains(n) {
+                    if let Some(rows) = making.made.get(n).and_then(|m| m.kept.as_ref()) {
+                        rows.last_reader();
+                    }
                 }
             }
         }
@@ -5443,12 +5532,23 @@ pub(super) fn made_by(
         let made = if steps[i].recursion.is_some() {
             let (before, rest) = steps.split_at_mut(i);
             recursive::make(&mut making, &rest[0], before).and_then(|m| making.keep(&rest[0], m))
+        } else if group.len() > 1 {
+            let order: Vec<String> = group[..group.len() - 1]
+                .iter()
+                .map(|&k| steps[k].name.clone())
+                .collect();
+            let step = &mut steps[i];
+            making.waiting(&mut deferred, &order, None, &mut |m, streams| {
+                m.make_with(step, Some(streams))
+            })
         } else {
             making.make(&mut steps[i])
         };
         making.asked = held;
         made?;
-        making.read_by(&mut readers, &steps[i].name, &read[i]);
+        for &k in &group {
+            making.read_by(&mut readers, &steps[k].name, &read[k]);
+        }
     }
     let last = making
         .made
@@ -5461,6 +5561,144 @@ pub(super) fn made_by(
         }
     }
     Ok((last, making.held))
+}
+
+/// Whether a statement calls what may be volatile, the file's functions among them.
+fn may_draw(q: &Query, release: u8) -> bool {
+    sqlparser::ast::visit_expressions(q, |e| match e {
+        Expr::Function(f)
+            if super::own::may_be_volatile(&pipeline::function_name(f), release) =>
+        {
+            std::ops::ControlFlow::Break(())
+        }
+        _ => std::ops::ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
+/// The step a step may be made as it reads: the one step that reads it, once, as its whole FROM,
+/// or as an arm of a UNION ALL itself so read. The step a SELECT or a UNION ALL, writing nothing.
+fn streamed_into(
+    i: usize,
+    steps: &[Step],
+    read: &[HashSet<String>],
+    readers: &HashMap<String, usize>,
+    theirs: &[usize],
+    stream_into: &[Option<usize>],
+    arms: &HashMap<String, String>,
+) -> Option<usize> {
+    // A SELECT, or a UNION ALL whose every arm is one, read by one step alone.
+    let alike = |s: &Step| -> bool {
+        s.recursion.is_none()
+            && !writes(&s.query)
+            && !s.name.is_empty()
+            && readers.get(&s.name) == Some(&1)
+            && !arms.contains_key(&s.name)
+            && !arms.values().any(|l| *l == s.name)
+            && match (&s.set, s.query.body.as_ref()) {
+                (Some(_), _) => false,
+                (None, SetExpr::Select(_) | SetExpr::Values(_)) => true,
+                _ => false,
+            }
+    };
+    let s = &steps[i];
+    let kind = match &s.set {
+        Some(arm) => {
+            concatenates(arm)
+                && step_words_of_arm(arm)
+                    .iter()
+                    .all(|leaf| steps.iter().find(|t| t.name == *leaf).is_some_and(&alike))
+                && s.recursion.is_none()
+                && !s.name.is_empty()
+                && readers.get(&s.name) == Some(&1)
+        }
+        None => alike(s),
+    };
+    if !kind {
+        return None;
+    }
+    let j = (i + 1..steps.len()).find(|j| !theirs.contains(j) && read[*j].contains(&s.name))?;
+    let r = &steps[j];
+    let alone = match (&r.set, r.query.body.as_ref()) {
+        (Some(arm), _) => {
+            stream_into[j].is_some() && step_words_of_arm(arm).contains(&s.name)
+        }
+        (None, SetExpr::Select(sel)) => {
+            // Read as a relation once in what the step writes, past its WITH, which lifted it.
+            let mut written = r.query.clone();
+            written.with = None;
+            let mut relations = 0;
+            let _ = sqlparser::ast::visit_relations(&written, |n| {
+                if crate::catalog::object_name(n) == s.name {
+                    relations += 1;
+                }
+                std::ops::ControlFlow::<()>::Continue(())
+            });
+            r.recursion.is_none()
+                && r.calls.is_empty()
+                && r.laterals.is_empty()
+                && matches!(sel.from.as_slice(), [only] if only.joins.is_empty()
+                    && matches!(&only.relation, TableFactor::Table { name, args: None, .. }
+                        if crate::catalog::object_name(name) == s.name))
+                && relations == 1
+        }
+        _ => false,
+    };
+    alone.then_some(j)
+}
+
+/// Whether a step hands each row on as its FROM gives it: it sorts, groups, folds, returns each row
+/// once or reads its windows in none, so a cut its rows reach stops it at the row it cuts.
+fn hands_on(s: &Step) -> bool {
+    if s.set.is_some() {
+        return true;
+    }
+    match s.query.body.as_ref() {
+        SetExpr::Select(sel) => {
+            s.query.order_by.is_none()
+                && sel.distinct.is_none()
+                && sel.having.is_none()
+                && matches!(&sel.group_by, sqlparser::ast::GroupByExpr::Expressions(g, _) if g.is_empty())
+                && sel.projection.iter().all(|i| match i {
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                        let (folds, windows, _) = pipeline::calls_in(e);
+                        !folds && !windows
+                    }
+                    _ => true,
+                })
+        }
+        SetExpr::Values(_) => true,
+        _ => false,
+    }
+}
+
+/// The steps made as step `i` reads them, each after the steps made as it reads them, then `i`.
+fn waiting_for(i: usize, stream_into: &[Option<usize>]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for c in 0..i {
+        if stream_into[c] == Some(i) {
+            out.extend(waiting_for(c, stream_into));
+        }
+    }
+    out.push(i);
+    out
+}
+
+/// A step moved out of the statement's steps, its name and its query left in its place.
+fn taken(step: &mut Step) -> Step {
+    let left = Step {
+        name: step.name.clone(),
+        query: step.query.clone(),
+        renames: Vec::new(),
+        origin: Origin::With,
+        inside: Inside::default(),
+        calls: Vec::new(),
+        set: None,
+        laterals: Vec::new(),
+        recursion: None,
+        laid: Vec::new(),
+    };
+    std::mem::replace(step, left)
 }
 
 /// What making a statement's steps reads, and what it keeps: each relation made, by its name.
@@ -5532,6 +5770,121 @@ fn kept_arms(arm: &Arm, out: &mut HashMap<String, String>) {
 impl Making<'_, '_> {
     /// One step made and kept.
     fn make(&mut self, step: &mut Step) -> Result<()> {
+        self.make_with(step, None)
+    }
+
+    /// The steps `order` names, each made as the step after them reads it: each in turn laid and read
+    /// off its text, its columns kept for the steps after it, none of its rows made; then `last`
+    /// makes the step that reads them, by what finds them.
+    fn waiting(
+        &mut self,
+        deferred: &mut HashMap<String, Step>,
+        order: &[String],
+        below: Option<&Waiting>,
+        last: &mut dyn FnMut(&mut Self, &dyn Streaming) -> Result<()>,
+    ) -> Result<()> {
+        let Some((name, rest)) = order.split_first() else {
+            let waiting = below.ok_or_else(|| Error::new("no step waits"))?;
+            let streams = Streams {
+                asked: self.asked,
+                accrued: self.accrued,
+                waiting,
+            };
+            return last(self, &streams);
+        };
+        let mut step = deferred
+            .remove(name)
+            .ok_or_else(|| Error::new(format!("the step {name} is not waiting")))?;
+        let asked = self.asked;
+        match step.set.clone() {
+            Some(arm) => {
+                let shape = met_shape(&arm, &self.made, &self.casings)?;
+                let set = SetWaits {
+                    arm,
+                    made: self.made.clone(),
+                    casings: self.casings.clone(),
+                };
+                let mut m = Made::of(
+                    Relation {
+                        names: shape.names,
+                        rows: Vec::new(),
+                        order: None,
+                    },
+                    shape.types,
+                    shape.carried,
+                );
+                m.streamed = true;
+                self.keep(&step, m)?;
+                let w = Waiting {
+                    name,
+                    what: &set,
+                    below,
+                };
+                self.waiting(deferred, rest, Some(&w), last)
+            }
+            None if matches!(step.query.body.as_ref(), SetExpr::Values(_)) => {
+                // Its columns typed, no row made.
+                let none = Rc::new(std::cell::Cell::new(true));
+                let mut m = values_into(
+                    &step,
+                    asked,
+                    &self.made,
+                    self.accrued,
+                    &self.casings,
+                    Some((&mut |_, _| Ok(()), &none)),
+                )?;
+                m.streamed = true;
+                let (made, casings) = (self.made.clone(), self.casings.clone());
+                self.keep(&step, m)?;
+                let values = ValuesWaits {
+                    step,
+                    made,
+                    casings,
+                };
+                let w = Waiting {
+                    name,
+                    what: &values,
+                    below,
+                };
+                self.waiting(deferred, rest, Some(&w), last)
+            }
+            None => {
+                let made = self.made.clone();
+                let (from, rows_read) = laid(asked, &mut step, &made, &self.casings, None)?;
+                let ready = Ready::of(
+                    asked,
+                    &step,
+                    &from,
+                    rows_read,
+                    &made,
+                    &mut self.casings,
+                    None,
+                    self.accrued,
+                    false,
+                )?;
+                let mut m = Made::of(
+                    Relation {
+                        names: ready.p.names(),
+                        rows: Vec::new(),
+                        order: None,
+                    },
+                    ready.p.returns.clone(),
+                    ready.p.carried.clone(),
+                );
+                m.streamed = true;
+                self.keep(&step, m)?;
+                let w = Waiting {
+                    name,
+                    what: &*ready,
+                    below,
+                };
+                self.waiting(deferred, rest, Some(&w), last)
+            }
+        }
+    }
+
+    /// One step made and kept, the steps `streams` holds made as it reads them.
+    fn make_with(&mut self, step: &mut Step, streams: Option<&dyn Streaming>) -> Result<()> {
         let asked = self.asked;
         let m = match (&step.set, step.query.body.as_ref()) {
             (Some(arm), _) => set_step(arm, &self.made, &self.casings)?,
@@ -5552,6 +5905,7 @@ impl Making<'_, '_> {
                     self.outer,
                     self.accrued,
                     before.as_deref(),
+                    streams,
                 )?
             }
         };
@@ -5579,7 +5933,7 @@ impl Making<'_, '_> {
         self.held += m.rel.rows.len() + m.kept.as_ref().map_or(0, Rows::len);
         // A step the steps after it read is kept in the round's room, the rows past it written; the
         // answer is the caller's.
-        if !step.name.is_empty() && m.kept.is_none() {
+        if !step.name.is_empty() && m.kept.is_none() && !m.streamed {
             m.kept = Some(Rows::of(std::mem::take(&mut m.rel.rows))?);
         }
         self.made.insert(step.name.clone(), Rc::new(m));
@@ -5688,9 +6042,13 @@ fn read_from(
         &super::strands::Wants,
         &std::cell::Cell<Option<super::strands::Led>>,
     )>,
+    streams: Option<&dyn Streaming>,
+    halt: Option<&Rc<std::cell::Cell<bool>>>,
     each: Each,
 ) -> Result<()> {
     let mut reading = Reading {
+        streams,
+        halt,
         reads: asked.reads,
         from,
         named,
@@ -5924,6 +6282,7 @@ fn on_names(from: &From, n: &Node, on: &Expr) -> Result<()> {
 
 /// One SELECT of the statement, its FROM met as one relation, then read as the pipeline reads it;
 /// a subquery's with the columns of the query around it after its FROM's.
+#[allow(clippy::too_many_arguments)]
 fn select_step(
     asked: Asked,
     step: &mut Step,
@@ -5932,12 +6291,163 @@ fn select_step(
     outer: Option<&Outer>,
     accrued: &Accrued,
     arm_before: Option<&Made>,
+    streams: Option<&dyn Streaming>,
 ) -> Result<Made> {
     let (from, rows_read) = laid(asked, step, made, casings, outer)?;
     let ready = Ready::of(
         asked, step, &from, rows_read, made, casings, outer, accrued, false,
     )?;
-    ready.run(asked, outer, accrued, arm_before)
+    ready.run_into(asked, outer, accrued, arm_before, streams, None, None)
+}
+
+/// Where the steps a statement makes as the one step that reads each reads it are found: each laid
+/// and read off its text before the step that reads it, then run as that step reads its FROM.
+pub(super) trait Streaming {
+    /// The rows of the step `name`, handed to `each` as they are made, none once `stop` is set.
+    fn stream(&self, name: &str, stop: &Rc<std::cell::Cell<bool>>, each: Each) -> Result<()>;
+}
+
+/// A step waiting to be made as its reader reads it, under its name; then the steps waiting before
+/// it.
+struct Waiting<'w> {
+    name: &'w str,
+    what: &'w dyn Waits,
+    below: Option<&'w Waiting<'w>>,
+}
+
+/// What a waiting step makes as its reader reads it: a SELECT read off its text, or a UNION ALL of
+/// its arms.
+trait Waits {
+    fn rows(&self, streams: &Streams, stop: &Rc<std::cell::Cell<bool>>, each: Each) -> Result<()>;
+}
+
+impl Waits for Ready<'_> {
+    fn rows(&self, streams: &Streams, stop: &Rc<std::cell::Cell<bool>>, each: Each) -> Result<()> {
+        let (asked, accrued) = (streams.asked, streams.accrued);
+        self.run_into(asked, None, accrued, None, Some(streams), Some(stop), Some(each))?;
+        Ok(())
+    }
+}
+
+/// A UNION ALL waiting, its arms and what was made before it.
+struct SetWaits {
+    arm: Arm,
+    made: Steps,
+    casings: Casings,
+}
+
+impl Waits for SetWaits {
+    fn rows(&self, streams: &Streams, stop: &Rc<std::cell::Cell<bool>>, each: Each) -> Result<()> {
+        streams.arm_rows(&self.arm, &self.made, &self.casings, stop, &mut |rows| each(rows, None))
+    }
+}
+
+/// A VALUES list waiting, and what was made before it.
+struct ValuesWaits {
+    step: Step,
+    made: Steps,
+    casings: Casings,
+}
+
+impl Waits for ValuesWaits {
+    fn rows(&self, streams: &Streams, stop: &Rc<std::cell::Cell<bool>>, each: Each) -> Result<()> {
+        let (asked, accrued) = (streams.asked, streams.accrued);
+        values_into(&self.step, asked, &self.made, accrued, &self.casings, Some((each, stop)))?;
+        Ok(())
+    }
+}
+
+/// The steps waiting for the step being made, and what it reads them by.
+struct Streams<'s> {
+    asked: Asked<'s>,
+    accrued: &'s Accrued,
+    waiting: &'s Waiting<'s>,
+}
+
+impl Streaming for Streams<'_> {
+    fn stream(&self, name: &str, stop: &Rc<std::cell::Cell<bool>>, each: Each) -> Result<()> {
+        let mut at = Some(self.waiting);
+        loop {
+            match at {
+                Some(w) if w.name == name => return w.what.rows(self, stop, each),
+                Some(w) => at = w.below,
+                None => return Err(Error::new(format!("the step {name} is not waiting"))),
+            }
+        }
+    }
+}
+
+impl Streams<'_> {
+    /// A UNION ALL's rows, arm after arm, each read in the types of the operation it is an arm of,
+    /// as `met` reads them; no arm read once `stop` is set.
+    fn arm_rows(
+        &self,
+        arm: &Arm,
+        made: &Steps,
+        casings: &Casings,
+        stop: &Rc<std::cell::Cell<bool>>,
+        each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<()> {
+        let (left, right) = match arm {
+            Arm::Leaf { name, .. } => {
+                let m = made
+                    .get(name)
+                    .ok_or_else(|| Error::new("a set operation's arm was not made"))?;
+                return match m.streamed {
+                    true => self.stream(name, stop, &mut |rows, _| each(rows)),
+                    false => m.rows_of()?.each_chunk(&mut |rows| match stop.get() {
+                        true => Ok(()),
+                        false => each(rows),
+                    }),
+                };
+            }
+            Arm::Op { left, right, .. } => (left, right),
+        };
+        let types: Vec<ColumnType> = met_shape(arm, made, casings)?
+            .types
+            .into_iter()
+            .flatten()
+            .collect();
+        for side in [left, right] {
+            if stop.get() {
+                break;
+            }
+            let shape = met_shape(side, made, casings)?;
+            self.arm_rows(side, made, casings, stop, &mut |mut rows| {
+                for r in &mut rows {
+                    in_types(r, &shape.types, &shape.untyped, &types)?;
+                }
+                each(rows)
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether a set operation is UNION ALLs alone.
+fn concatenates(arm: &Arm) -> bool {
+    match arm {
+        Arm::Leaf { .. } => true,
+        Arm::Op {
+            op, all, left, right,
+        } => *op == SetOperator::Union && *all && concatenates(left) && concatenates(right),
+    }
+}
+
+/// A leaf's columns' types as a set operation meets them, and what each column is where an untyped
+/// literal makes it: a literal its arm sorts by is text.
+fn leaf_types(m: &Made, untyped: &[Untyped]) -> (Vec<Option<ColumnType>>, Vec<Untyped>) {
+    let mut types = m.types.clone();
+    let untyped = (0..m.rel.names.len())
+        .map(|c| match untyped.get(c).cloned().unwrap_or(Untyped::No) {
+            Untyped::Text => {
+                types[c] = types[c].or(Some(ColumnType::Text(None)));
+                Untyped::No
+            }
+            u => u,
+        })
+        .collect();
+    (types, untyped)
 }
 
 /// A subquery's statement read once a round: each step before its last made, none of them reading
@@ -6570,6 +7080,22 @@ impl<'s> Ready<'s> {
         accrued: &Accrued,
         arm_before: Option<&Made>,
     ) -> Result<Made> {
+        self.run_into(asked, outer, accrued, arm_before, None, None, None)
+    }
+
+    /// The same, the steps `streams` holds made as its FROM reads them; given `out`, each row it
+    /// makes handed there as it is made, before the next, none once `stop` is set, and none kept.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_into(
+        &self,
+        asked: Asked,
+        outer: Option<&Outer>,
+        accrued: &Accrued,
+        arm_before: Option<&Made>,
+        streams: Option<&dyn Streaming>,
+        stop: Option<&Rc<std::cell::Cell<bool>>>,
+        out: Option<Each>,
+    ) -> Result<Made> {
         let _domains = typed::domains_held(self.domains.clone());
         let (params, release, made) = (asked.params, asked.release, self.made);
         let (step, from, plans, casings) = (self.step, self.from, &self.plans, &self.casings);
@@ -6587,10 +7113,16 @@ impl<'s> Ready<'s> {
         let types = self.p.returns.clone();
         let carried = self.p.carried.clone();
         // A step the steps after it read keeps its rows in the round's room as it makes them, those
-        // past it written; the answer is the caller's.
-        let run_out = (!step.name.is_empty() || asked.answer_kept).then(super::spill::Run::new);
+        // past it written; the answer is the caller's. One its reader reads as it comes keeps none.
+        let streaming = out.is_some();
+        let mut out = out;
+        let run_out = (!streaming && (!step.name.is_empty() || asked.answer_kept))
+            .then(super::spill::Run::new);
         let mut gathered: Vec<Vec<Value>> = Vec::new();
         let mut put = |rows: Vec<Vec<Value>>| -> Result<()> {
+            if let Some(o) = out.as_mut() {
+                return o(rows, None);
+            }
             match &run_out {
                 Some(run) => rows.into_iter().try_for_each(|r| run.push(r)),
                 None => {
@@ -6617,6 +7149,11 @@ impl<'s> Ready<'s> {
             .collect();
         let mut run = pipeline::StepRun::new(self.p.clone());
         run.hands_on = true;
+        run.one_at_a_time = streaming;
+        run.stop = stop.cloned();
+        // Set once it makes no row more, its own cut ended or its reader reading none: its FROM
+        // then hands it no row more.
+        let halt = Rc::new(std::cell::Cell::new(false));
         run.reads = Some(asked.reads);
         if !plans.is_empty() {
             run.subqueries = Some(&subs);
@@ -6654,6 +7191,9 @@ impl<'s> Ready<'s> {
         }
         let rows_known: std::cell::Cell<Option<u64>> = std::cell::Cell::new(None);
         let mut feed = |mut rows: Vec<Vec<Value>>, order: Option<usize>| -> Result<()> {
+            if halt.get() && fed.get() {
+                return Ok(());
+            }
             if !fed.get() {
                 if let Some(led) = in_order.get() {
                     run.along(led);
@@ -6673,9 +7213,16 @@ impl<'s> Ready<'s> {
                 rows,
                 order,
             };
-            if let Some(out) = run.feed(rel, columns.clone(), params, release, casings)? {
+            let each: Option<&mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>> = match streaming {
+                true => Some(&mut put),
+                false => None,
+            };
+            if let Some(out) = run.feed(rel, columns.clone(), params, release, casings, each)? {
                 order_out = out.order;
                 put(out.rows)?;
+            }
+            if run.ended() {
+                halt.set(true);
             }
             Ok(())
         };
@@ -6715,6 +7262,8 @@ impl<'s> Ready<'s> {
                                 &ons,
                                 keeps.clone(),
                                 &rows_known,
+                                None,
+                                None,
                                 None,
                                 each,
                             )
@@ -6774,6 +7323,8 @@ impl<'s> Ready<'s> {
                         keeps,
                         &rows_known,
                         along_wanted,
+                        streams,
+                        Some(&halt),
                         &mut feed,
                     )?,
                     false => {
@@ -6794,6 +7345,8 @@ impl<'s> Ready<'s> {
                             keeps,
                             &rows_known,
                             along_wanted,
+                            streams,
+                            None,
                             &mut |c, at| {
                                 order = at;
                                 c.into_iter().try_for_each(|r| place.push(r))

@@ -7418,6 +7418,11 @@ impl<'q> Prepared<'q> {
         &self.calls.windows
     }
 
+    /// The names of the columns it returns.
+    pub(super) fn names(&self) -> Vec<String> {
+        self.items.iter().map(|(_, n)| n.clone()).collect()
+    }
+
     /// Whether each row its FROM gives and its WHERE keeps is a row it returns: it folds nothing,
     /// makes no set and cuts no row.
     pub(super) fn returns_each_kept(&self) -> bool {
@@ -9786,6 +9791,10 @@ pub(super) struct StepRun<'q> {
     along_groups: bool,
     /// Whether whoever reads it takes its rows as they are made, rather than all at the end.
     pub(super) hands_on: bool,
+    /// Whether it hands each row on before it makes the next, its reader reading it as it comes.
+    pub(super) one_at_a_time: bool,
+    /// Set by its reader once it reads no row more: no row is made past it.
+    pub(super) stop: Option<std::rc::Rc<std::cell::Cell<bool>>>,
     /// The columns the step's FROM reads, as the last chunk gave them.
     columns: Columns,
     /// What answers its subqueries, where it has any.
@@ -9831,6 +9840,8 @@ impl<'q> StepRun<'q> {
             partitions_out: Vec::new(),
             along_groups: false,
             hands_on: false,
+            one_at_a_time: false,
+            stop: None,
             columns: Vec::new(),
             subqueries: None,
             reads: None,
@@ -9881,8 +9892,20 @@ impl<'q> StepRun<'q> {
         self.p.items.iter().map(|(_, n)| n.clone()).collect()
     }
 
+    /// Whether its reader reads no row more.
+    fn stopped(&self) -> bool {
+        self.stop.as_ref().is_some_and(|s| s.get())
+    }
+
+    /// Whether it makes no row more: its LIMIT keeps none past those it has, its rows coming in
+    /// their order, or its reader reads none.
+    pub(super) fn ended(&self) -> bool {
+        self.stopped() || self.going.cut.as_ref().is_some_and(sorted::Cut::ended) && !self.going.sorts
+    }
+
     /// Reads one chunk of the rows its FROM gives: the rows the step returns for it, unless the step
-    /// groups or sorts, which hold them until `finish`.
+    /// groups or sorts, which hold them until `finish`. Given `each`, the rows it returns go there as
+    /// each is made, and none is returned.
     pub(super) fn feed(
         &mut self,
         mut rel: Relation,
@@ -9890,6 +9913,7 @@ impl<'q> StepRun<'q> {
         params: &[String],
         release: u8,
         casings: &Casings,
+        mut each: Option<&mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>>,
     ) -> Result<Option<Relation>> {
         let frame = Frame {
             columns,
@@ -9906,8 +9930,9 @@ impl<'q> StepRun<'q> {
         // A WHERE that draws is read a row at a time, each row it keeps made before the next is
         // read, as PostgreSQL's scan reads its condition and then makes the row; where nothing
         // sorts between, each row is handed on as it is made, and none is read past the last the
-        // LIMIT keeps. So is any WHERE under a LIMIT where nothing sorts between.
-        let cut = self.p.limit.is_some()
+        // LIMIT keeps. So is any WHERE under a LIMIT where nothing sorts between, and any WHERE of a
+        // step whose reader reads each row as it comes.
+        let cut = (self.p.limit.is_some() || self.one_at_a_time)
             && !self.p.distinct
             && self.p.distinct_on.is_none()
             && !self.going.sorts
@@ -10014,7 +10039,7 @@ impl<'q> StepRun<'q> {
         }
         let mut rows = Vec::with_capacity(rel.rows.len());
         for (row, w) in rel.rows.iter().zip(per_row) {
-            if handed && self.going.ended(&self.p, &frame)? {
+            if handed && (self.stopped() || self.going.ended(&self.p, &frame)?) {
                 break;
             }
             if let Some(sel) = by_row {
@@ -10028,9 +10053,15 @@ impl<'q> StepRun<'q> {
                 _q: std::marker::PhantomData,
             };
             let made = self.p.project(row, &frame, computed)?;
-            match handed {
-                true => rows.extend(self.going.take(&self.p, &frame, made)?),
-                false => rows.extend(made),
+            match (handed, each.as_mut()) {
+                (true, Some(each)) => {
+                    let taken = self.going.take(&self.p, &frame, made)?;
+                    if !taken.is_empty() {
+                        each(truncated(taken, self.p.items.len()))?;
+                    }
+                }
+                (true, None) => rows.extend(self.going.take(&self.p, &frame, made)?),
+                (false, _) => rows.extend(made),
             }
         }
         // The order holds where an item is the column that held it, and no set repeats a row.
@@ -10202,11 +10233,19 @@ impl<'q> StepRun<'q> {
                 && !p.distinct
                 && p.distinct_on.is_none()
                 && unordered;
+            // Where its reader reads each row as it comes, each is handed on as it is made, none
+            // once the reader reads no more.
+            let (one_at_a_time, stop) = (
+                self.one_at_a_time && !going.sorts && !p.distinct,
+                self.stop.clone(),
+            );
             held.finish(&|r| parted::partition_hash(by, r, &frame), &mut |rel| {
                 let per_row = windows::values(&p.calls.windows, &rel, &frame, None)?;
                 let mut rows = Vec::with_capacity(rel.rows.len());
                 for (row, w) in rel.rows.iter().zip(per_row) {
-                    if cut && going.ended(p, frame_ref)? {
+                    if cut && going.ended(p, frame_ref)?
+                        || one_at_a_time && stop.as_ref().is_some_and(|s| s.get())
+                    {
                         break;
                     }
                     let computed = Computed {
@@ -10215,7 +10254,7 @@ impl<'q> StepRun<'q> {
                         _q: std::marker::PhantomData,
                     };
                     let made = p.project(row, &frame, computed)?;
-                    match cut {
+                    match cut || one_at_a_time {
                         true => emit(made, going)?,
                         false => rows.extend(made),
                     }
@@ -10269,11 +10308,27 @@ impl<'q> StepRun<'q> {
             };
             // DISTINCT ON keeps its rows before the cut reads them.
             let mut first = p.distinct_on.map(sorted::First::of);
+            let (one_at_a_time, stop) = (self.one_at_a_time, self.stop.clone());
             sorter.finish(&mut |rows, keys| {
                 let (rows, keys) = match &mut first {
                     Some(f) => f.take(rows, keys),
                     None => (rows, keys),
                 };
+                // Where its reader reads each row as it comes, each is made past the sort and handed
+                // on before the next, none once the reader reads no more.
+                if one_at_a_time {
+                    for (i, row) in rows.into_iter().enumerate() {
+                        if stop.as_ref().is_some_and(|s| s.get()) {
+                            break;
+                        }
+                        let key = keys.get(i).cloned().unwrap_or_default();
+                        let made = p.after_sort(vec![row], &[key], cut.as_mut(), frame_ref)?;
+                        if !made.is_empty() {
+                            each(truncated(made, width))?;
+                        }
+                    }
+                    return Ok(());
+                }
                 let rows = p.after_sort(rows, &keys, cut.as_mut(), frame_ref)?;
                 if !rows.is_empty() {
                     each(truncated(rows, width))?;
@@ -10330,7 +10385,7 @@ fn select(
         from(p.from, steps, table)?
     };
     let mut run = StepRun::new(p);
-    match run.feed(rel, columns, params, release, casings)? {
+    match run.feed(rel, columns, params, release, casings, None)? {
         Some(out) => Ok(out),
         None => run.finish(params, release, casings),
     }
@@ -10442,7 +10497,7 @@ fn select_each(
             rows,
             order: None,
         };
-        if let Some(out) = run.feed(rel, columns.clone(), params, release, casings)? {
+        if let Some(out) = run.feed(rel, columns.clone(), params, release, casings, None)? {
             order = out.order;
             put(out.rows)?;
         }
@@ -10890,7 +10945,7 @@ impl<'q> Stream<'q> {
             }
             let run = self.runs[i].as_mut().unwrap();
             let (rel, columns) = from(run.p.from, &self.view, &table)?;
-            if let Some(out) = run.feed(rel, columns, &self.params, self.release, &self.casings)? {
+            if let Some(out) = run.feed(rel, columns, &self.params, self.release, &self.casings, None)? {
                 if let Some(k) = self.kept.get_mut(name) {
                     gather(k, &out);
                 }
