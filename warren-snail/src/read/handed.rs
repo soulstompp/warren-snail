@@ -416,6 +416,20 @@ pub(crate) fn release_held() -> u8 {
     RELEASE.with(|r| r.get())
 }
 
+/// Holds a catalog's release alone, the one before it put back when dropped: what a statement's
+/// literals are read under before its round holds the rest.
+pub(crate) struct Released(u8);
+
+pub(crate) fn releasing(catalog: &crate::catalog::Catalog) -> Released {
+    Released(RELEASE.with(|r| r.replace(catalog.release)))
+}
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        RELEASE.with(|r| r.set(self.0));
+    }
+}
+
 /// A table's row type, by the table's name or the last part of it, where the pipeline under way
 /// reads a snail holding one table of the name.
 pub(crate) fn table_row(name: &str) -> Option<ColumnType> {

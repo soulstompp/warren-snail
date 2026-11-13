@@ -5573,6 +5573,32 @@ fn a_table_alias_s_column_names_rename_its_columns() {
 }
 
 #[test]
+fn a_malformed_literal_is_refused_with_its_code_and_detail() {
+    let mut w = snail("malformed");
+    let detail = |what: &str, s: &str, why: &str| {
+        (Some("22P02"), format!("malformed {what} literal: \"{s}\"\nDETAIL:  {why}"))
+    };
+    let start = "Array value must start with \"{\" or dimension information.";
+    for (sql, want) in [
+        ("SELECT '{1,2}'::int[] || 'x' FROM dn.a WHERE id = 1", detail("array", "x", start)),
+        ("SELECT 'x' || '{1,2}'::int[] FROM dn.a WHERE id = 1", detail("array", "x", start)),
+        ("SELECT '{1,2}'::int[] || 'x'", detail("array", "x", start)),
+        (
+            "SELECT '{1,2}'::int[] || '{{1}' FROM dn.a WHERE id = 1",
+            detail("array", "{{1}", "Unexpected end of input."),
+        ),
+        ("SELECT '[1,2'::int4range", detail("range", "[1,2", "Unexpected end of input.")),
+        ("SELECT '(1'::dn.a", detail("record", "(1", "Unexpected end of input.")),
+        (
+            "SELECT '{[1,2'::int4multirange",
+            detail("multirange", "{[1,2", "Unexpected end of input."),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), want, "{sql}");
+    }
+}
+
+#[test]
 fn an_arm_s_sorted_literal_is_text_before_its_set_operation_is_typed() {
     let mut w = snail("sorted-literal");
     let unmatched = |op: &str, a: &str, b: &str| {

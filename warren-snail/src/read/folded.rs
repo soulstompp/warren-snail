@@ -79,6 +79,8 @@ fn read(
     if !computes_a_constant(st) && !super::own::calls_in(catalog, st) && !types_a_literal(st) {
         return Ok(());
     }
+    // A row type a literal is read into is the one of the file's release.
+    let _release = super::handed::releasing(catalog);
     let cat = Cat::of(catalog);
     // A literal is read by its type's input, and a cast found, as the statement is analyzed: a
     // failure there is the statement's, as 18.6's parser gives it, before anything is folded. But

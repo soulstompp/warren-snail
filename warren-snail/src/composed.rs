@@ -1069,8 +1069,9 @@ pub fn datum_of(ty: ColumnType, item: &Item) -> Datum {
     }
 }
 
+/// PostgreSQL's refusal of a literal its type's input cannot read, with its DETAIL.
 fn malformed(kind: &str, s: &str, why: &str) -> Error {
-    Error::new(format!("malformed {kind} literal: \"{s}\" ({why})"))
+    Error::new(format!("malformed {kind} literal: \"{s}\"\nDETAIL:  {why}"))
 }
 
 /// A composed value read from its text, as its type's input function reads it.
