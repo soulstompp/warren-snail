@@ -6597,9 +6597,11 @@ enum Acc {
     /// their order at the end, as PostgreSQL sorts a DISTINCT aggregate's input, each argument
     /// compared under its collation.
     Distinct {
-        seen: std::collections::HashSet<Vec<Key>>,
-        values: Vec<Vec<Value>>,
+        seen: super::held::KeySet,
+        values: super::held::Columns,
         under: Vec<Option<Casing>>,
+        /// The bytes its values and their keys hold.
+        held: u64,
         of: Box<Acc>,
     },
     /// An aggregate whose rows come in the order its ORDER BY gives: each row's arguments, then
@@ -6731,8 +6733,9 @@ impl Acc {
         let acc = if distinct && by.is_empty() {
             Acc::Distinct {
                 seen: Default::default(),
-                values: Vec::new(),
+                values: Default::default(),
                 under: Vec::new(),
+                held: 0,
                 of: Box::new(acc),
             }
         } else if !by.is_empty() {
@@ -6786,6 +6789,14 @@ impl Acc {
 
     /// Folds in one row's arguments, none for count(*), each compared under the collation `under`
     /// gives it.
+    /// The bytes a DISTINCT aggregate's values hold, as it holds them.
+    fn distinct_held(&self) -> Option<u64> {
+        match self {
+            Acc::Distinct { held, .. } => Some(*held),
+            _ => None,
+        }
+    }
+
     /// Whether it keeps the rows it is given until its group ends.
     fn keeps_rows(&self) -> bool {
         match self {
@@ -6818,6 +6829,7 @@ impl Acc {
                 seen,
                 values: kept,
                 under: kept_under,
+                held,
                 of,
             } => {
                 if values.iter().any(Value::is_null)
@@ -6827,13 +6839,15 @@ impl Acc {
                 }
                 kept_under.clear();
                 kept_under.extend_from_slice(under);
-                let k = values
+                let k: Vec<Key> = values
                     .iter()
                     .enumerate()
                     .map(|(i, v)| key_under(v, under.get(i).copied().flatten()))
                     .collect();
-                if seen.insert(k) {
-                    kept.push(values);
+                if seen.ask(&k).is_none() {
+                    *held += seen.width();
+                    seen.hold();
+                    *held += kept.hold(values);
                 }
                 Ok(())
             }
@@ -7208,7 +7222,7 @@ impl Acc {
             Acc::Distinct {
                 values, under, of, ..
             } => {
-                let mut values = values.clone();
+                let mut values: Vec<Vec<Value>> = values.rows().collect();
                 let mut failed = None;
                 values.sort_by(|a, b| {
                     for (i, (x, y)) in a.iter().zip(b).enumerate() {
@@ -9250,7 +9264,8 @@ fn fold_partition(
 struct Groups {
     set: Vec<usize>,
     at: super::held::KeySet,
-    list: Vec<(Vec<Value>, Vec<Acc>)>,
+    firsts: super::held::Columns,
+    accs: Vec<Vec<Acc>>,
     held: crate::room::Holding,
     past: Option<super::spill::Parts>,
     queue: super::spill::Queue,
@@ -9381,7 +9396,8 @@ impl Groups {
         Groups {
             set,
             at: Default::default(),
-            list: Vec::new(),
+            firsts: Default::default(),
+            accs: Vec::new(),
             held: crate::room::holding(0),
             past: None,
             queue: Default::default(),
@@ -9420,7 +9436,7 @@ impl Groups {
         let met: Vec<Value> = self.set.iter().map(|&i| values[i].clone()).collect();
         self.met.meet(&met)?;
         if let Some(end) = along {
-            if !self.list.is_empty() && !self.at.contains(&k) {
+            if !self.accs.is_empty() && !self.at.contains(&k) {
                 self.project(p, frame, &mut |row, calls| end(p.group_rows(&row, calls, frame)?))?;
             }
         }
@@ -9428,36 +9444,34 @@ impl Groups {
             return Ok(Some(i));
         }
         let mut first = row.to_vec();
-        let mut w = super::spill::row_width(&first) + reading.group_bytes + self.at.width();
         if p.sets.is_some() {
-            w += values.iter().map(super::spill::width).sum::<u64>();
+            first.extend_from_slice(values);
         }
-        if !self.list.is_empty() && (self.closed || !self.held.fits(w)) {
+        let w = self.firsts.width_of(&first) + reading.group_bytes + self.at.width();
+        if !self.accs.is_empty() && (self.closed || !self.held.fits(w)) {
             self.closed = true;
             if self.expected.is_none() {
                 self.expected = self.rows_to_come.map(|n| n * w);
             }
             let (lo, hi, expected) = (self.range.0, self.range.1, self.expected);
+            first.truncate(row.len());
             self.past
                 .get_or_insert_with(|| super::spill::Parts::new(lo, hi, expected))
                 .push(parted::key_hash(&k, 0), first)?;
             return Ok(None);
         }
-        if self.list.is_empty() {
+        if self.accs.is_empty() {
             self.held.more(w);
         }
-        if p.sets.is_some() {
-            first.extend_from_slice(values);
-        }
-        self.list.push((first, Self::fresh(p)?));
+        self.firsts.push(first);
+        self.accs.push(Self::fresh(p)?);
         self.at.hold();
-        Ok(Some(self.list.len() - 1))
+        Ok(Some(self.accs.len() - 1))
     }
 
     /// What a row gives the aggregates (`Given`) folded into its group.
     fn add(&mut self, i: usize, reading: &Reading, given: Given) -> Result<()> {
-        for (((acc, f), (u, refused)), given) in self.list[i]
-            .1
+        for (((acc, f), (u, refused)), given) in self.accs[i]
             .iter_mut()
             .zip(&reading.folded)
             .zip(&reading.folded_under)
@@ -9472,10 +9486,14 @@ impl Groups {
             if let Some(e) = refused.as_ref().filter(|_| acc.compares(&values)) {
                 return Err(Error::new(e.clone()));
             }
-            if acc.keeps_rows() {
+            let before = acc.distinct_held();
+            if acc.keeps_rows() && before.is_none() {
                 self.kept.more(super::spill::row_width(&values));
             }
             acc.add_row(values, u)?;
+            if let (Some(b), Some(a)) = (before, acc.distinct_held()) {
+                self.kept.more(a - b);
+            }
         }
         Ok(())
     }
@@ -9505,7 +9523,9 @@ impl Groups {
                 .fold(0i64, |b, a| (b << 1) | i64::from(!self.set.contains(a)));
             lacks.insert(g as *const Expr, Value::Int(bits));
         }
-        for (first, accs) in std::mem::take(&mut self.list) {
+        let firsts = std::mem::take(&mut self.firsts);
+        for (i, accs) in std::mem::take(&mut self.accs).into_iter().enumerate() {
+            let first = firsts.row(i);
             let (mut row, values) = match &p.sets {
                 Some(_) => {
                     let mut row = first;
@@ -10038,12 +10058,13 @@ impl<'q> StepRun<'q> {
             // Where windows read the groups, every group's row is held for them.
             let mut windowed = Vec::new();
             for groups in &mut self.groups {
-                if groups.list.is_empty() && groups.set.is_empty() {
+                if groups.accs.is_empty() && groups.set.is_empty() {
                     let mut row = empty.clone();
                     if p.sets.is_some() {
                         row.extend((0..p.grouping.len()).map(|_| Value::Null));
                     }
-                    groups.list.push((row, Groups::fresh(p)?));
+                    groups.firsts.push(row);
+                    groups.accs.push(Groups::fresh(p)?);
                 }
                 loop {
                     groups.project(p, &frame, &mut |row, calls| {
@@ -10796,7 +10817,7 @@ impl<'q> Stream<'q> {
                 .iter()
                 .flatten()
                 .map(|r| {
-                    r.groups.iter().map(|g| g.list.len()).sum::<usize>()
+                    r.groups.iter().map(|g| g.accs.len()).sum::<usize>()
                         + r.going.sorter.as_ref().map_or(0, |s| s.held())
                         + r.partitions_out.len()
                         + r.running.values().map(HashMap::len).sum::<usize>()

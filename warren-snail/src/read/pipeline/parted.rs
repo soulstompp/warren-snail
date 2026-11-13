@@ -6,7 +6,8 @@
 //! partitions whole, and for a subquery's table met by its keys.
 
 use super::{eval, grouped_key, key_under, Frame, Key, Relation, Value};
-use crate::read::spill::{row_width, Parts, Queue, CHUNK};
+use crate::read::held::Columns;
+use crate::read::spill::{Packed, Packer, Parts, Queue, CHUNK};
 use crate::room::{current, Room};
 use crate::Result;
 use sqlparser::ast::Expr;
@@ -14,19 +15,32 @@ use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-/// A row held: its key's hash, the place it came in, the row, and the bytes it holds.
+/// A row held: its key's hash, the place it came in, the row as one string of bytes, and the bytes
+/// it holds.
 struct Held {
     hash: u64,
     seq: u64,
-    row: Vec<Value>,
+    row: Packed,
     bytes: u64,
 }
 
-/// The rows of one pass, each with its key's hash, in the order they came: every row of a key whose
-/// hash lies below `below`, or of every key left where it is none. They hold their room until it
-/// is dropped.
+impl Held {
+    fn of(hash: u64, seq: u64, row: Packed) -> Held {
+        let bytes = std::mem::size_of::<Held>() as u64 + row.len() as u64;
+        Held {
+            hash,
+            seq,
+            row,
+            bytes,
+        }
+    }
+}
+
+/// The rows of one pass, held column-wise, in the order they came: every row of a key whose hash
+/// lies below `below`, or of every key left where it is none. They hold their room until it is
+/// dropped.
 pub(in crate::read) struct Pass {
-    pub(in crate::read) rows: Vec<(u64, Vec<Value>)>,
+    pub(in crate::read) rows: Columns,
     pub(in crate::read) below: Option<u64>,
     bytes: u64,
     room: Option<Rc<Room>>,
@@ -57,6 +71,7 @@ pub(in crate::read) struct Parted {
     queue: Queue,
     carried: Vec<Held>,
     seq: u64,
+    packer: Packer,
     pub(super) order: Option<usize>,
 }
 
@@ -100,6 +115,7 @@ impl Parted {
             queue: Queue::default(),
             carried: Vec::new(),
             seq: 0,
+            packer: Packer::default(),
             order: None,
         }
     }
@@ -108,8 +124,14 @@ impl Parted {
     /// less than a chunk; else written, or the row of the greatest hash held written to make room
     /// for it where its own is less.
     pub(in crate::read) fn push(&mut self, hash: u64, row: Vec<Value>) -> Result<()> {
-        let bytes = row_width(&row);
-        let seq = self.seq;
+        let packed = self.packer.pack(&row);
+        self.place(hash, packed, Some(row))
+    }
+
+    /// A row more as one string of bytes, `whole` the row where it is at hand.
+    fn place(&mut self, hash: u64, packed: Packed, whole: Option<Vec<Value>>) -> Result<()> {
+        let h = Held::of(hash, self.seq, packed);
+        let bytes = h.bytes;
         self.seq += 1;
         if let Some(room) = self.room.clone() {
             loop {
@@ -126,23 +148,24 @@ impl Parted {
                 match self.heap.peek() {
                     Some(&(top, _)) if hash < top => {
                         let (_, at) = self.heap.pop().expect("a row is held");
-                        let h = self.held[at].take().expect("a row is held");
+                        let out = self.held[at].take().expect("a row is held");
                         self.free.push(at);
-                        self.held_bytes -= h.bytes;
-                        room.let_go(h.bytes);
-                        self.write(h.hash, h.row)?;
+                        self.held_bytes -= out.bytes;
+                        room.let_go(out.bytes);
+                        let row = self.packer.unpack(&out.row)?;
+                        self.write(out.hash, row)?;
                     }
-                    _ => return self.write(hash, row),
+                    _ => {
+                        let row = match whole {
+                            Some(row) => row,
+                            None => self.packer.unpack(&h.row)?,
+                        };
+                        return self.write(hash, row);
+                    }
                 }
             }
         }
         self.held_bytes += bytes;
-        let h = Held {
-            hash,
-            seq,
-            row,
-            bytes,
-        };
         let at = match self.free.pop() {
             Some(at) => {
                 self.held[at] = Some(h);
@@ -183,7 +206,7 @@ impl Parted {
             let free = self.room.as_ref().map_or(u64::MAX, |r| r.free_bytes());
             let next = self.queue.next(free.saturating_sub(bytes).max(CHUNK));
             for h in carried {
-                self.push(h.hash, h.row)?;
+                self.place(h.hash, h.row, None)?;
             }
             if let Some((lo, hi, total, runs)) = next {
                 self.range = (lo, hi);
@@ -204,11 +227,24 @@ impl Parted {
         self.free.clear();
         self.held_bytes = 0;
         rows.sort_by_key(|h| h.seq);
-        let pass = |rows: Vec<Held>, below: Option<u64>, room: &Option<Rc<Room>>| Pass {
-            bytes: bytes_of(&rows),
-            rows: rows.into_iter().map(|h| (h.hash, h.row)).collect(),
-            below,
-            room: room.clone(),
+        // A pass's rows held column-wise, each row's string of bytes let go as it is read.
+        let pass = |rows: Vec<Held>, below: Option<u64>, this: &Parted| -> Result<Pass> {
+            let packed = bytes_of(&rows);
+            let mut held = Columns::default();
+            let mut bytes = 0;
+            for h in rows {
+                bytes += held.hold(this.packer.unpack(&h.row)?);
+            }
+            if let Some(r) = &this.room {
+                r.let_go(packed);
+                r.hold_anyway(bytes);
+            }
+            Ok(Pass {
+                rows: held,
+                below,
+                bytes,
+                room: this.room.clone(),
+            })
         };
         let Some(written) = self.writing.take() else {
             if rows.is_empty() && self.queue.is_empty() {
@@ -216,7 +252,7 @@ impl Parted {
             }
             // Nothing written with them: the next part's first hash bounds them.
             let below = self.queue.front().map(|(lo, _)| lo);
-            return Ok(Some(pass(rows, below, &self.room)));
+            return Ok(Some(pass(rows, below, self)?));
         };
         written.into_queue(self.range.1, &mut self.queue)?;
         let last = rows.iter().map(|h| h.hash).max();
@@ -224,13 +260,13 @@ impl Parted {
             rows.into_iter().partition(|h| Some(h.hash) != last);
         if !done.is_empty() {
             self.carried = carried;
-            return Ok(Some(pass(done, last, &self.room)));
+            return Ok(Some(pass(done, last, self)?));
         }
         // One key past the room by itself: its rows held whole, the rest of its part read again.
         let mut whole = carried;
         let mut last = last;
         let Some((lo, hi, total, runs)) = self.queue.next(0) else {
-            return Ok(Some(pass(whole, None, &self.room)));
+            return Ok(Some(pass(whole, None, self)?));
         };
         self.range = (lo, hi);
         self.expected = Some(total);
@@ -239,16 +275,11 @@ impl Parted {
                 for r in c {
                     let hash = hash_of(&r)?;
                     if *last.get_or_insert(hash) == hash {
-                        let bytes = row_width(&r);
+                        let h = Held::of(hash, 0, self.packer.pack(&r));
                         if let Some(room) = &self.room {
-                            room.hold_anyway(bytes);
+                            room.hold_anyway(h.bytes);
                         }
-                        whole.push(Held {
-                            hash,
-                            seq: 0,
-                            row: r,
-                            bytes,
-                        });
+                        whole.push(h);
                     } else {
                         self.push(hash, r)?;
                     }
@@ -257,7 +288,7 @@ impl Parted {
             })?;
         }
         let below = last.map(|h| h.saturating_add(1));
-        Ok(Some(pass(whole, below, &self.room)))
+        Ok(Some(pass(whole, below, self)?))
     }
 
     /// Hands `fold` the rows a partition at a time or more, each partition whole: every row, in the
@@ -271,10 +302,12 @@ impl Parted {
         let mut spilled = false;
         while let Some(mut pass) = self.pass(&mut |r| hash_of(r))? {
             spilled |= pass.below.is_some();
-            let rows = std::mem::take(&mut pass.rows);
+            // The windows read a pass's rows whole: they fly while they are folded.
+            let rows: Vec<Vec<Value>> = std::mem::take(&mut pass.rows).rows().collect();
+            let _flying = crate::room::flying(crate::read::spill::rows_width(&rows));
             fold(Relation {
                 names: Vec::new(),
-                rows: rows.into_iter().map(|(_, r)| r).collect(),
+                rows,
                 order: order.filter(|_| !spilled),
             })?;
         }

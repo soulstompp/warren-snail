@@ -6,7 +6,7 @@
 
 use super::{compare, computed_none, tie, Casing, Casings, Frame, Limit, Prepared, Value};
 use crate::cut::PAGE;
-use crate::read::spill::{row_file_width, row_width, Back, Run, CHUNK};
+use crate::read::spill::{row_file_width, row_width, Back, Packed, Packer, Run, CHUNK};
 use crate::room::{current, Room};
 use crate::{Error, Result};
 use sqlparser::ast::OrderByKind;
@@ -69,16 +69,30 @@ impl Spec {
 struct Held {
     key: Vec<Value>,
     seq: u64,
-    row: Vec<Value>,
+    row: Row,
     bytes: u64,
     spec: Rc<Spec>,
 }
 
-/// The bytes a row held to be sorted holds: the row, its key and their place.
-fn held_width(row: &Vec<Value>, key: &Vec<Value>) -> u64 {
-    (std::mem::size_of::<Held>() - 2 * std::mem::size_of::<Vec<Value>>()) as u64
-        + row_width(row)
-        + row_width(key)
+/// A row to be sorted: one string of bytes while it is held, whole as it comes and goes.
+enum Row {
+    Whole(Vec<Value>),
+    Packed(Packed),
+}
+
+/// The row made whole.
+fn whole(packer: &Packer, row: Row) -> Result<Vec<Value>> {
+    match row {
+        Row::Whole(r) => Ok(r),
+        Row::Packed(p) => packer.unpack(&p),
+    }
+}
+
+/// The bytes a row held to be sorted holds: the row packed, its key and their place.
+fn held_width(row: &[Value], key: &Vec<Value>) -> u64 {
+    std::mem::size_of::<Held>() as u64 + row_width(key)
+        - std::mem::size_of::<Vec<Value>>() as u64
+        + row_file_width(row)
 }
 
 impl PartialEq for Held {
@@ -176,6 +190,7 @@ pub(super) struct Sorter {
     held: Vec<Held>,
     /// Those held as a heap, the greatest first, once one was written.
     heap: Option<BinaryHeap<Held>>,
+    packer: Packer,
     bytes: u64,
     past: Option<Past>,
     /// Whether the rows are cut into runs, and those written.
@@ -211,6 +226,7 @@ impl Sorter {
             under: sort_under(p, casings)?,
             held: Vec::new(),
             heap: None,
+            packer: Packer::default(),
             bytes: 0,
             past: None,
             in_runs: false,
@@ -244,7 +260,7 @@ impl Sorter {
         let rows = self.sorted_held()?;
         let run = Run::past();
         for h in rows {
-            run.push(h.row)?;
+            run.push(whole(&self.packer, h.row)?)?;
         }
         run.seal()?;
         self.runs.push(run);
@@ -271,7 +287,7 @@ impl Sorter {
         let mut item = Held {
             key,
             seq,
-            row,
+            row: Row::Whole(row),
             bytes,
             spec: self.spec.clone(),
         };
@@ -293,7 +309,7 @@ impl Sorter {
                     }
                     room.let_go(bytes);
                     let past = self.past.as_mut().expect("rows were set aside");
-                    return past.came.push(item.row);
+                    return past.came.push(whole(&self.packer, item.row)?);
                 }
                 if !after && self.bytes + bytes <= CHUNK {
                     room.hold_anyway(bytes);
@@ -321,13 +337,16 @@ impl Sorter {
                         let mut out = heap.pop().expect("a row is held");
                         self.bytes -= out.bytes;
                         room.let_go(out.bytes);
+                        let row = std::mem::replace(&mut out.row, Row::Whole(Vec::new()));
+                        let row = whole(&self.packer, row)?;
                         let past = self.past.get_or_insert_with(Past::new);
-                        past.let_go.push(std::mem::take(&mut out.row))?;
+                        past.let_go.push(row)?;
                         past.least = Some(out);
                     }
                     _ => {
+                        let row = std::mem::replace(&mut item.row, Row::Whole(Vec::new()));
                         let past = self.past.get_or_insert_with(Past::new);
-                        past.came.push(std::mem::take(&mut item.row))?;
+                        past.came.push(whole(&self.packer, row)?)?;
                         if !after {
                             past.least = Some(item);
                         }
@@ -337,6 +356,9 @@ impl Sorter {
             }
         }
         self.bytes += bytes;
+        if let Row::Whole(row) = &item.row {
+            item.row = Row::Packed(self.packer.pack(row));
+        }
         match &mut self.heap {
             Some(heap) => heap.push(item),
             None => self.held.push(item),
@@ -354,14 +376,28 @@ impl Sorter {
                 return self.merge(each);
             }
             let rows = self.sorted_held()?;
-            let bytes = std::mem::take(&mut self.bytes);
-            let mut keys = Vec::with_capacity(rows.len());
-            let mut out = Vec::with_capacity(rows.len());
+            let mut bytes = std::mem::take(&mut self.bytes);
+            // Handed on a chunk at a time, each chunk's room let go once it is handed.
+            let (mut keys, mut out, mut file, mut handed) = (Vec::new(), Vec::new(), 0, 0);
+            let none = rows.is_empty();
             for h in rows {
+                let row = whole(&self.packer, h.row)?;
+                file += row_file_width(&row);
+                handed += h.bytes;
                 keys.push(h.key);
-                out.push(h.row);
+                out.push(row);
+                if file >= CHUNK {
+                    each(std::mem::take(&mut out), std::mem::take(&mut keys))?;
+                    if let Some(r) = &self.room {
+                        r.let_go(handed);
+                    }
+                    bytes -= handed;
+                    (file, handed) = (0, 0);
+                }
             }
-            each(out, keys)?;
+            if !out.is_empty() || none {
+                each(out, keys)?;
+            }
             if let Some(r) = &self.room {
                 r.let_go(bytes);
             }
@@ -398,7 +434,7 @@ impl Sorter {
                         bytes: held_width(&row, &key),
                         key,
                         seq,
-                        row,
+                        row: Row::Packed(self.packer.pack(&row)),
                         spec: self.spec.clone(),
                     });
                     Ok(())
@@ -485,7 +521,7 @@ impl Sorter {
                         bytes: held_width(&row, &key),
                         key,
                         seq: rank(i),
-                        row,
+                        row: Row::Whole(row),
                         spec: self.spec.clone(),
                     })
                 }
@@ -501,10 +537,11 @@ impl Sorter {
         }
         let (mut rows, mut keys, mut bytes, mut held) = (Vec::new(), Vec::new(), 0u64, 0u64);
         while let Some(std::cmp::Reverse((h, i))) = heap.pop() {
-            bytes += row_file_width(&h.row);
+            let row = whole(&self.packer, h.row)?;
+            bytes += row_file_width(&row);
             held += h.bytes;
             keys.push(h.key);
-            rows.push(h.row);
+            rows.push(row);
             if bytes >= CHUNK {
                 bytes = 0;
                 let _flying = crate::room::flying(std::mem::take(&mut held));

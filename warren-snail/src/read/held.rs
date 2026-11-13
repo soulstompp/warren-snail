@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 /// Which rows are NULL: a bit a row, a word each 64 rows.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Nulls(Vec<u64>);
 
 impl Nulls {
@@ -31,6 +31,7 @@ impl Nulls {
 }
 
 /// Values of one width, a NULL's place holding the kind's default.
+#[derive(Clone)]
 struct Fixed<T> {
     values: Vec<T>,
     nulls: Nulls,
@@ -74,6 +75,7 @@ enum Bins {
 }
 
 /// One column's values.
+#[derive(Clone)]
 enum Column {
     /// As many NULLs as rows, and no value yet.
     Nulls(usize),
@@ -418,7 +420,7 @@ impl RowsAt for Columns {
 }
 
 /// Rows held column-wise, in the order they came.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct Columns {
     columns: Vec<Column>,
     len: usize,
@@ -438,9 +440,25 @@ impl Columns {
     }
 
     /// The bytes every row held takes.
-    #[cfg(test)]
-    fn bytes(&self) -> u64 {
+    pub(super) fn bytes(&self) -> u64 {
         self.columns.iter().map(Column::bytes).sum()
+    }
+
+    /// Holds `row`: the bytes it adds.
+    pub(super) fn hold(&mut self, row: Vec<Value>) -> u64 {
+        let w = self.width_of(&row);
+        self.push(row);
+        w
+    }
+
+    /// Column `column` of row `at`.
+    pub(super) fn value(&self, at: usize, column: usize) -> Value {
+        self.columns.get(column).map_or(Value::Null, |c| c.get(at))
+    }
+
+    /// Every row, made whole, in the order they came.
+    pub(super) fn rows(&self) -> impl Iterator<Item = Vec<Value>> + '_ {
+        (0..self.len).map(|i| self.row(i))
     }
 
     pub(super) fn push(&mut self, row: Vec<Value>) {
@@ -457,6 +475,20 @@ impl Columns {
     /// Row `at`, made whole.
     pub(super) fn row(&self, at: usize) -> Vec<Value> {
         self.columns.iter().map(|c| c.get(at)).collect()
+    }
+}
+
+impl std::fmt::Debug for Columns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.rows()).finish()
+    }
+}
+
+impl FromIterator<Vec<Value>> for Columns {
+    fn from_iter<I: IntoIterator<Item = Vec<Value>>>(rows: I) -> Columns {
+        let mut c = Columns::default();
+        rows.into_iter().for_each(|r| c.push(r));
+        c
     }
 }
 
@@ -780,7 +812,7 @@ impl Cells {
 
 /// Row numbers found by their hash: open addressing, each slot a row's number and its hash's high
 /// half, at most three slots of four taken.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct Slots {
     slots: Vec<(u32, u32)>,
     len: usize,
@@ -917,7 +949,7 @@ const SLOT: u64 = 11;
 
 /// Keys held, each as one string of bytes, its values' one after another, so that equal keys are
 /// equal bytes; found by their hash.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct KeySet {
     bytes: Vec<u8>,
     ends: Vec<u64>,
@@ -925,6 +957,12 @@ pub(super) struct KeySet {
     types: RefCell<Vec<ColumnType>>,
     asked: RefCell<Vec<u8>>,
     hash: std::cell::Cell<u64>,
+}
+
+impl std::fmt::Debug for KeySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KeySet({} keys)", self.ends.len())
+    }
 }
 
 impl KeySet {

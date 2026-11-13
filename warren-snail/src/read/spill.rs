@@ -202,6 +202,32 @@ pub(super) fn rows_width(rows: &[Vec<Value>]) -> u64 {
     rows.iter().map(row_width).sum()
 }
 
+/// Rows held one string of bytes a row, each as the spill writes it, the types they name kept once.
+#[derive(Default)]
+pub(super) struct Packer(Named);
+
+/// A row as a `Packer` holds it.
+pub(super) type Packed = Box<[u8]>;
+
+impl Packer {
+    pub(super) fn pack(&mut self, row: &[Value]) -> Packed {
+        let mut out = Vec::with_capacity(row_file_width(row) as usize);
+        for v in row {
+            encode(v, &mut self.0, &mut out);
+        }
+        out.into_boxed_slice()
+    }
+
+    pub(super) fn unpack(&self, packed: &[u8]) -> Result<Vec<Value>> {
+        let mut b = Bytes { b: packed, at: 0 };
+        let mut row = Vec::new();
+        while b.at < packed.len() {
+            row.push(decode(&mut b, &self.0)?);
+        }
+        Ok(row)
+    }
+}
+
 struct Bytes<'a> {
     b: &'a [u8],
     at: usize,
@@ -945,6 +971,24 @@ impl Rows {
             Ok(())
         })?;
         Ok(out)
+    }
+
+    /// Its rows taken whole, where they are one place's and the room holds them all, their room let
+    /// go: they and the bytes they hold.
+    pub(super) fn into_held(mut self) -> std::result::Result<(Columns, u64), Rows> {
+        if self.0.len() != 1 || !self.held_whole() || Rc::strong_count(&self.0[0]) != 1 {
+            return Err(self);
+        }
+        let run = self.0.pop().expect("one run");
+        let (rows, bytes) = {
+            let mut s = run.stored.borrow_mut();
+            (std::mem::take(&mut s.rows), std::mem::take(&mut s.bytes))
+        };
+        if let Some(r) = &run.room {
+            r.let_go(bytes);
+        }
+        let bytes = rows.bytes();
+        Ok((rows, bytes))
     }
 
     /// Calls `f` with the rows held, each run's in turn, where every row is held.

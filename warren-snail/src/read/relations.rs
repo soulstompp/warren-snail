@@ -20,6 +20,7 @@ use super::pipeline::{self, Casings, Columns, Relation, Value, MERGED};
 use super::spill::{Chunk, Rows, Run, CHUNK};
 use super::question::{self, Question};
 use super::typed::{self, TypedColumn};
+use super::held::{self, KeyRows};
 use super::walk::KeySet;
 use super::Round;
 use crate::catalog::{Catalog, ColumnType, Table};
@@ -380,8 +381,8 @@ pub(super) struct Parted {
 
 enum PartedRows {
     Whole {
-        rows: Vec<Vec<Value>>,
-        index: Option<HashMap<Vec<pipeline::Key>, Vec<usize>>>,
+        rows: held::Columns,
+        index: Option<KeyRows>,
         _held: Option<pipeline::parted::Pass>,
         _counted: crate::room::Holding,
     },
@@ -392,7 +393,8 @@ enum PartedRows {
 struct Passes {
     hashed: pipeline::parted::Parted,
     pass: Option<pipeline::parted::Pass>,
-    index: HashMap<Vec<pipeline::Key>, Vec<usize>>,
+    index: KeyRows,
+    _index_held: crate::room::Holding,
     begun: bool,
 }
 
@@ -468,14 +470,15 @@ impl Tie<'_, '_> {
         let mut around = o.kept.around.borrow_mut();
         if let Some(sets) = around.as_mut() {
             let mut hashed = Vec::with_capacity(sets.len());
-            for set in sets.drain(..) {
+            for (i, set) in sets.rows().enumerate() {
                 let h = self
                     .of_values(&set, &frame)?
                     .map_or(0, |k| pipeline::parted::key_hash(&k, 0));
-                hashed.push((h, set));
+                hashed.push((h, i));
             }
             hashed.sort_by_key(|(h, _)| *h);
-            sets.extend(hashed.into_iter().map(|(_, s)| s));
+            let ordered: held::Columns = hashed.into_iter().map(|(_, i)| sets.row(i)).collect();
+            *sets = ordered;
         }
         Ok(())
     }
@@ -491,11 +494,11 @@ impl Parted {
     ) -> Result<Parted> {
         let mut order = None;
         let frame = tie.frame();
-        let index_of = |rows: &[&Vec<Value>]| -> Result<_> {
-            let mut index: HashMap<Vec<pipeline::Key>, Vec<usize>> = HashMap::new();
-            for (i, r) in rows.iter().enumerate() {
-                if let Some(k) = tie.of_row(r, &frame)? {
-                    index.entry(k).or_default().push(i);
+        let index_of = |rows: &held::Columns, held: &mut crate::room::Holding| -> Result<KeyRows> {
+            let mut index = KeyRows::default();
+            for (i, r) in rows.rows().enumerate() {
+                if let Some(k) = tie.of_row(&r, &frame)? {
+                    held.more(index.push(&k, i as u32));
                 }
             }
             Ok(index)
@@ -513,35 +516,33 @@ impl Parted {
             let pass = hashed.pass(&mut |r| tie.hash_of_row(r, &frame))?;
             let held = match pass {
                 Some(mut p) if p.below.is_none() => {
-                    let rows: Vec<Vec<Value>> =
-                        std::mem::take(&mut p.rows).into_iter().map(|(_, r)| r).collect();
-                    let refs: Vec<&Vec<Value>> = rows.iter().collect();
-                    let index = Some(index_of(&refs)?);
+                    let rows = std::mem::take(&mut p.rows);
+                    let mut _counted = crate::room::holding(0);
+                    let index = index_of(&rows, &mut _counted)?;
                     PartedRows::Whole {
                         rows,
-                        index,
+                        index: Some(index),
                         _held: Some(p),
-                        _counted: crate::room::holding(0),
+                        _counted,
                     }
                 }
                 None => PartedRows::Whole {
-                    rows: Vec::new(),
-                    index: Some(HashMap::new()),
+                    rows: held::Columns::default(),
+                    index: Some(KeyRows::default()),
                     _held: None,
                     _counted: crate::room::holding(0),
                 },
                 pass => {
+                    let mut _index_held = crate::room::holding(0);
                     let index = match &pass {
-                        Some(p) => {
-                            let refs: Vec<&Vec<Value>> = p.rows.iter().map(|(_, r)| r).collect();
-                            index_of(&refs)?
-                        }
-                        None => HashMap::new(),
+                        Some(p) => index_of(&p.rows, &mut _index_held)?,
+                        None => KeyRows::default(),
                     };
                     PartedRows::Passes(std::cell::RefCell::new(Passes {
                         hashed,
                         pass,
                         index,
+                        _index_held,
                         begun: true,
                     }))
                 }
@@ -561,13 +562,19 @@ impl Parted {
                 held: PartedRows::Scanned(rows),
             });
         }
-        let all = rows.all()?;
-        drop(rows);
+        let (all, bytes) = match rows.into_held() {
+            Ok(held) => held,
+            Err(rows) => {
+                let all: held::Columns = rows.all()?.into_iter().collect();
+                let bytes = all.bytes();
+                (all, bytes)
+            }
+        };
+        let mut _counted = crate::room::holding(bytes);
         let index = match tie.tied.is_empty() {
             true => None,
-            false => Some(index_of(&all.iter().collect::<Vec<_>>())?),
+            false => Some(index_of(&all, &mut _counted)?),
         };
-        let _counted = crate::room::holding(super::spill::rows_width(&all));
         Ok(Parted {
             order,
             held: PartedRows::Whole {
@@ -598,13 +605,12 @@ impl Parted {
         match &self.held {
             PartedRows::Whole { rows, index, .. } => match (index, asked) {
                 (Some(index), Some(k)) => {
-                    let found = k.and_then(|k| index.get(&k));
-                    let rows = found.map_or(Vec::new(), |at| {
-                        at.iter().map(|&i| rows[i].clone()).collect()
+                    let found = k.map_or(Vec::new(), |k| {
+                        index.rows(&k).map(|i| rows.row(i as usize)).collect()
                     });
-                    feed(rows, self.order)
+                    feed(found, self.order)
                 }
-                _ => feed(rows.clone(), self.order),
+                _ => feed(rows.rows().collect(), self.order),
             },
             PartedRows::Passes(p) => {
                 let Some(k) = asked.flatten() else {
@@ -620,18 +626,19 @@ impl Parted {
                 {
                     p.pass = None;
                     p.pass = p.hashed.pass(&mut |r| tie.hash_of_row(r, &frame))?;
-                    p.index.clear();
+                    p.index = KeyRows::default();
+                    p._index_held = crate::room::holding(0);
                     if let Some(x) = &p.pass {
-                        for (i, (_, r)) in x.rows.iter().enumerate() {
-                            if let Some(k) = tie.of_row(r, &frame)? {
-                                p.index.entry(k).or_default().push(i);
+                        for (i, r) in x.rows.rows().enumerate() {
+                            if let Some(k) = tie.of_row(&r, &frame)? {
+                                p._index_held.more(p.index.push(&k, i as u32));
                             }
                         }
                     }
                 }
-                let rows = match (&p.pass, p.index.get(&k)) {
-                    (Some(x), Some(at)) => at.iter().map(|&i| x.rows[i].1.clone()).collect(),
-                    _ => Vec::new(),
+                let rows = match &p.pass {
+                    Some(x) => p.index.rows(&k).map(|i| x.rows.row(i as usize)).collect(),
+                    None => Vec::new(),
                 };
                 feed(rows, self.order)
             }
@@ -6611,7 +6618,7 @@ fn tied_keeps(
         below: None,
     };
     let none = pipeline::computed_none();
-    let set_rows = Rows::of(sets)?;
+    let set_rows = Rows::of(sets.rows().collect())?;
     Ok(Keep::of_rows(places, &set_rows, false, &mut |set| {
         let mut row = vec![Value::Null; from.outer_at];
         row.extend(set.iter().cloned());

@@ -29,7 +29,7 @@ pub(super) struct Kept {
     pub(super) rows: RefCell<HashMap<String, Rc<relations::Parted>>>,
     /// Each set of values the rows that may ask for it give what it names, where they are known
     /// before the first asks: its tables are kept to their keys.
-    pub(super) around: RefCell<Option<Vec<Vec<Value>>>>,
+    pub(super) around: RefCell<Option<super::held::Columns>>,
     around_held: RefCell<Option<crate::room::Holding>>,
     /// Each question's rows, kept in the round's room as they are read.
     places: RefCell<HashMap<String, Rows>>,
@@ -794,7 +794,7 @@ pub(super) struct Subs<'a, 'q> {
 /// Each set of values rows give, gathered while they fit the room.
 struct Foreseen {
     seen: KeySet,
-    sets: Vec<Vec<Value>>,
+    sets: super::held::Columns,
     held: crate::room::Holding,
     over: bool,
 }
@@ -803,7 +803,7 @@ impl Foreseen {
     fn new() -> Foreseen {
         Foreseen {
             seen: KeySet::default(),
-            sets: Vec::new(),
+            sets: Default::default(),
             held: crate::room::holding(0),
             over: false,
         }
@@ -817,7 +817,7 @@ impl Foreseen {
         if self.seen.ask(&keys_of(&set)).is_some() {
             return;
         }
-        let w = super::spill::row_width(&set) + self.seen.width();
+        let w = self.sets.width_of(&set) + self.seen.width();
         self.seen.hold();
         match self.held.fits(w) {
             true => self.sets.push(set),
@@ -1088,7 +1088,7 @@ impl<'a, 'q> Subs<'a, 'q> {
         if plan.kept.answers_now.replace(false) {
             // Its table lies past the room: every answer is made now, in the order of its rows.
             let sets = plan.kept.around.borrow().clone().unwrap_or_default();
-            for set in sets {
+            for set in sets.rows() {
                 let k = values_key(&set);
                 match self.answer_for(plan, set) {
                     Ok(r) => self.keep_answer(plan, k, r, true)?,

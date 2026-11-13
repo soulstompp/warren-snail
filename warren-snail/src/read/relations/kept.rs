@@ -10,7 +10,7 @@ use crate::read::spill::Rows;
 use crate::read::walk::KeySet;
 use crate::Result;
 use sqlparser::ast::{BinaryOperator, Expr};
-use crate::read::held::KeySet as Keys;
+use crate::read::held::{Columns, KeySet as Keys};
 use std::rc::Rc;
 
 /// What rows made before a table hold of the columns it meets them on: the table's places in the
@@ -19,19 +19,22 @@ use std::rc::Rc;
 #[derive(Clone)]
 pub(in crate::read) struct Keep {
     pub(in crate::read) places: Vec<usize>,
-    pub(in crate::read) values: Rc<Vec<Vec<Value>>>,
+    pub(in crate::read) values: Rc<Columns>,
     pub(in crate::read) nulls_meet: bool,
     /// What the keys hold in the round's room.
     _held: Rc<crate::room::Holding>,
 }
 
 impl Keep {
-    /// These values of the columns at `places`, kept as they are given.
+    /// These values of the columns at `places`, kept as they are given, their keys held twice as
+    /// the walk finds rows by them.
     pub(in crate::read) fn of_values(places: Vec<usize>, values: Vec<Vec<Value>>) -> Keep {
-        let held: u64 = values
-            .iter()
-            .map(|v| 3 * crate::read::spill::row_width(v))
-            .sum();
+        let mut keys = Keys::default();
+        for v in &values {
+            keys.insert(&v.iter().map(pipeline::key).collect::<Vec<_>>());
+        }
+        let values: Columns = values.into_iter().collect();
+        let held = values.bytes() + 2 * keys.bytes();
         Keep {
             places,
             values: Rc::new(values),
@@ -41,7 +44,7 @@ impl Keep {
     }
 
     /// What `made` holds, each row `of` read on it, each set of values once: none where they do not
-    /// fit the round's room, a key set being held three ways as the walk finds rows by it.
+    /// fit the round's room, its keys held twice as the walk finds rows by them.
     pub(in crate::read) fn of_rows(
         places: Vec<usize>,
         made: &Rows,
@@ -49,7 +52,7 @@ impl Keep {
         of: &mut dyn FnMut(&[Value]) -> Result<Vec<Value>>,
     ) -> Result<Option<Keep>> {
         let mut seen = Keys::default();
-        let mut values = Vec::new();
+        let mut values = Columns::default();
         let mut held = crate::room::holding(0);
         let mut over = false;
         made.each_chunk(&mut |c| {
@@ -60,7 +63,7 @@ impl Keep {
                 let v = of(r)?;
                 let k: Vec<Key> = v.iter().map(pipeline::key).collect();
                 if seen.ask(&k).is_none() {
-                    let w = 2 * crate::read::spill::row_width(&v) + seen.width();
+                    let w = values.width_of(&v) + 2 * seen.width();
                     seen.hold();
                     if !held.fits(w) {
                         over = true;
@@ -181,9 +184,9 @@ impl Kept {
                 if crate::catalog::is_system(cols[i]) {
                     return false;
                 }
-                keep.values.iter().all(|r| match r[i].is_null() {
-                    true => !keep.nulls_meet,
-                    false => kept_value(&r[i], &table.columns[cols[i]]).is_some(),
+                (0..keep.values.len()).all(|at| match keep.values.value(at, i) {
+                    Value::Null => !keep.nulls_meet,
+                    v => kept_value(&v, &table.columns[cols[i]]).is_some(),
                 })
             })
             .collect();
@@ -206,7 +209,7 @@ impl Kept {
         let set = (!best.is_empty()).then(|| {
             KeySet::new(
                 best.iter().map(|&i| cols[i]).collect(),
-                keep.values.iter().filter_map(|r| {
+                keep.values.rows().filter_map(|r| {
                     best.iter()
                         .map(|&i| match r[i].is_null() {
                             true => None,
@@ -219,7 +222,7 @@ impl Kept {
         let mut keys = Keys::default();
         for r in keep
             .values
-            .iter()
+            .rows()
             .filter(|r| keep.nulls_meet || !r.iter().any(|v| v.is_null()))
         {
             keys.insert(&r.iter().map(pipeline::key).collect::<Vec<_>>());
