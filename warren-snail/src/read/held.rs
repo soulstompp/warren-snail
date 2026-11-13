@@ -837,14 +837,6 @@ impl Slots {
     pub(super) fn bytes(&self) -> u64 {
         (self.slots.capacity() * std::mem::size_of::<(u32, u32)>()) as u64
     }
-
-    /// The bytes a row more adds to its slots: none until they grow.
-    fn width_of_one(&self) -> u64 {
-        match (self.len + 1) * 4 > self.slots.len() * 3 {
-            true => (((self.slots.len() * 2).max(16) - self.slots.len()) * 8) as u64,
-            false => 0,
-        }
-    }
 }
 
 /// A value of a key as a key set holds it: its kind, then its payload, its length first where it
@@ -920,6 +912,9 @@ fn encode(k: &Key, types: &mut Vec<ColumnType>, out: &mut Vec<u8>) {
     }
 }
 
+/// A key's share of the slots that find it: 8 bytes a slot, four slots for every three keys.
+const SLOT: u64 = 11;
+
 /// Keys held, each as one string of bytes, its values' one after another, so that equal keys are
 /// equal bytes; found by their hash.
 #[derive(Default)]
@@ -964,7 +959,7 @@ impl KeySet {
 
     /// The bytes the key last asked about adds held.
     pub(super) fn width(&self) -> u64 {
-        self.asked.borrow().len() as u64 + 8 + self.slots.width_of_one()
+        self.asked.borrow().len() as u64 + 8 + SLOT
     }
 
     /// Holds the key last asked about, not held: where it lies.
@@ -1002,7 +997,7 @@ impl KeySet {
 
     /// The bytes every key held takes.
     pub(super) fn bytes(&self) -> u64 {
-        (self.bytes.len() + self.ends.len() * 8) as u64 + self.slots.bytes()
+        (self.bytes.len() + self.ends.len() * 8) as u64 + self.ends.len() as u64 * SLOT
     }
 }
 
