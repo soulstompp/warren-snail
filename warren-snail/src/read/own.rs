@@ -1076,6 +1076,69 @@ fn named_in<'c>(
     })
 }
 
+/// The function of the file's an expression calls whose statement reads `table` from a VOLATILE
+/// function: one VOLATILE itself, or called by one, whose body names the table. Such a statement,
+/// in a CHECK or a DEFAULT, reads the rows its write made before the row it is called for.
+pub(crate) fn reads_written(
+    catalog: &crate::catalog::Catalog,
+    e: &Expr,
+    table: &str,
+) -> Option<String> {
+    if catalog.functions.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    let _ = sqlparser::ast::visit_expressions(e, |x| {
+        let Expr::Function(f) = x else {
+            return ControlFlow::Continue(());
+        };
+        match named_in(catalog, &crate::catalog::object_name(&f.name)) {
+            Some(g) if reads_table(catalog, g, table, false, &mut Vec::new()) => {
+                found = Some(g.name.clone());
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        }
+    });
+    found
+}
+
+/// Whether a function's body, or a body of the file's functions it calls, names `table` under a
+/// VOLATILE function: `volatile` where a call around it is one.
+fn reads_table(
+    catalog: &crate::catalog::Catalog,
+    g: &Function,
+    table: &str,
+    volatile: bool,
+    seen: &mut Vec<(String, bool)>,
+) -> bool {
+    let volatile = volatile || g.volatility == 'v';
+    if seen.contains(&(g.name.clone(), volatile)) {
+        return false;
+    }
+    seen.push((g.name.clone(), volatile));
+    let full = crate::oids::full(table);
+    let names = volatile
+        && sqlparser::ast::visit_relations(&g.body, |n| {
+            match crate::oids::full(&crate::catalog::object_name(n)) == full {
+                true => ControlFlow::Break(()),
+                false => ControlFlow::Continue(()),
+            }
+        })
+        .is_break();
+    names
+        || std::iter::once(&g.body).chain(&g.defaults).any(|x| {
+            sqlparser::ast::visit_expressions(x, |e| match e {
+                Expr::Function(f) => match named_in(catalog, &crate::catalog::object_name(&f.name)) {
+                    Some(h) if reads_table(catalog, h, table, volatile, seen) => ControlFlow::Break(()),
+                    _ => ControlFlow::Continue(()),
+                },
+                _ => ControlFlow::Continue(()),
+            })
+            .is_break()
+        })
+}
+
 /// A call's value on a row; none where the call names no function of the file's.
 pub(super) fn call(
     f: &sqlparser::ast::Function,

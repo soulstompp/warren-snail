@@ -652,6 +652,118 @@ fn a_call_in_a_check_a_default_a_generated_column_a_view_and_a_domain() {
         .starts_with("value for domain c6.posint violates check constraint \"posint_check\""));
 }
 
+const READ_IN_PLACES: &str = "CREATE SCHEMA fo; \
+     CREATE TABLE fo.src (k integer PRIMARY KEY, v integer); \
+     CREATE FUNCTION fo.fex(integer) RETURNS boolean LANGUAGE sql AS 'SELECT EXISTS (SELECT 1 FROM fo.src WHERE k = $1)'; \
+     CREATE FUNCTION fo.fv(integer) RETURNS integer LANGUAGE sql AS 'SELECT v FROM fo.src WHERE k = $1'; \
+     CREATE TABLE fo.c (id integer PRIMARY KEY, r integer CHECK (fo.fex(r))); \
+     CREATE TABLE fo.d (id integer PRIMARY KEY, w integer DEFAULT fo.fv(3)); \
+     CREATE DOMAIN fo.known AS integer CHECK (fo.fex(VALUE)); \
+     CREATE TABLE fo.h (id integer PRIMARY KEY, r fo.known);";
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_body_reading_relations_is_called_in_a_check_a_default_and_a_domain() {
+    // As 18.6 answered and refused each, in this order, over the same DDL (2026-11-13).
+    let mut w = Snail::open_writing(&written("read-in-places", READ_IN_PLACES)).unwrap();
+    rows(&mut w, "INSERT INTO fo.src VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
+    let check = |w: &mut Snail, sql: &str, failing: &str| {
+        assert_eq!(
+            refused(w, sql),
+            format!(
+                "new row for relation \"c\" violates check constraint \"c_r_check\": Failing row \
+                 contains {failing}."
+            ),
+            "{sql}"
+        );
+    };
+    rows(&mut w, "INSERT INTO fo.c VALUES (1, 2)");
+    check(&mut w, "INSERT INTO fo.c VALUES (2, 9)", "(2, 9)");
+    check(&mut w, "INSERT INTO fo.c VALUES (3, NULL)", "(3, null)");
+    rows(&mut w, "UPDATE fo.c SET r = 4 WHERE id = 1");
+    check(&mut w, "UPDATE fo.c SET r = 5 WHERE id = 1", "(1, 5)");
+    rows(&mut w, "INSERT INTO fo.c SELECT k + 10, k FROM fo.src WHERE k > 2");
+    asked(&mut w, "SELECT * FROM fo.c ORDER BY id", &["1|4", "13|3", "14|4"]);
+    // In a transaction, the rows it wrote before.
+    rows(&mut w, "BEGIN");
+    rows(&mut w, "INSERT INTO fo.src VALUES (9, 90)");
+    rows(&mut w, "INSERT INTO fo.c VALUES (5, 9)");
+    rows(&mut w, "INSERT INTO fo.d (id) VALUES (5)");
+    rows(&mut w, "UPDATE fo.src SET v = 33 WHERE k = 3");
+    rows(&mut w, "INSERT INTO fo.d (id) VALUES (6)");
+    rows(&mut w, "COMMIT");
+    asked(&mut w, "SELECT * FROM fo.c ORDER BY id", &["1|4", "5|9", "13|3", "14|4"]);
+    rows(&mut w, "INSERT INTO fo.d (id) VALUES (1)");
+    rows(&mut w, "INSERT INTO fo.d VALUES (2, DEFAULT)");
+    rows(&mut w, "INSERT INTO fo.d (id) SELECT k + 10 FROM fo.src WHERE k < 3");
+    rows(&mut w, "UPDATE fo.src SET v = 31 WHERE k = 3");
+    rows(&mut w, "UPDATE fo.d SET w = DEFAULT WHERE id = 2");
+    asked(
+        &mut w,
+        "SELECT * FROM fo.d ORDER BY id",
+        &["1|33", "2|31", "5|30", "6|33", "11|33", "12|33"],
+    );
+    rows(&mut w, "INSERT INTO fo.h VALUES (1, 3)");
+    assert_eq!(
+        refused(&mut w, "INSERT INTO fo.h VALUES (2, 7)"),
+        "value for domain fo.known violates check constraint \"known_check\""
+    );
+    asked(&mut w, "SELECT * FROM fo.h ORDER BY id", &["1|3"]);
+}
+
+const READ_WRITTEN: &str = "CREATE SCHEMA fs; \
+     CREATE TABLE fs.e (id integer PRIMARY KEY, n bigint DEFAULT 0); \
+     CREATE TABLE fs.s (id integer PRIMARY KEY, n bigint DEFAULT 0); \
+     CREATE TABLE fs.w (id integer PRIMARY KEY, n bigint DEFAULT 0); \
+     CREATE TABLE fs.g (id integer PRIMARY KEY, x integer); \
+     CREATE FUNCTION fs.fcount() RETURNS bigint LANGUAGE sql AS 'SELECT count(*) FROM fs.e'; \
+     CREATE FUNCTION fs.scount() RETURNS bigint LANGUAGE sql STABLE AS 'SELECT count(*) FROM fs.s'; \
+     CREATE FUNCTION fs.wcount() RETURNS bigint LANGUAGE sql AS 'SELECT count(*) FROM fs.w'; \
+     CREATE FUNCTION fs.wwrap() RETURNS bigint LANGUAGE sql STABLE AS 'SELECT fs.wcount()'; \
+     CREATE FUNCTION fs.gmax() RETURNS integer LANGUAGE sql AS 'SELECT coalesce(max(id), 0) FROM fs.g'; \
+     ALTER TABLE fs.e ALTER COLUMN n SET DEFAULT fs.fcount(); \
+     ALTER TABLE fs.s ALTER COLUMN n SET DEFAULT fs.scount(); \
+     ALTER TABLE fs.w ALTER COLUMN n SET DEFAULT fs.wwrap(); \
+     ALTER TABLE fs.g ADD CONSTRAINT g_x CHECK (x > fs.gmax() - 100);";
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_volatile_body_reading_the_table_its_write_writes_is_called_for_one_row() {
+    // As 18.6 answered each statement the snail takes, over the same DDL (2026-11-13). A STABLE
+    // body reads the statement's snapshot, and is called for any number of rows.
+    let mut w = Snail::open_writing(&written("read-written", READ_WRITTEN)).unwrap();
+    rows(&mut w, "INSERT INTO fs.e (id) VALUES (1)");
+    rows(&mut w, "INSERT INTO fs.e (id) VALUES (2)");
+    asked(&mut w, "SELECT * FROM fs.e ORDER BY id", &["1|0", "2|1"]);
+    rows(&mut w, "INSERT INTO fs.s (id) VALUES (1)");
+    rows(&mut w, "INSERT INTO fs.s (id) VALUES (2), (3)");
+    rows(&mut w, "INSERT INTO fs.s (id) SELECT g FROM generate_series(4, 5) g");
+    asked(&mut w, "SELECT * FROM fs.s ORDER BY id", &["1|0", "2|1", "3|1", "4|3", "5|3"]);
+    rows(&mut w, "INSERT INTO fs.g VALUES (1, 0)");
+    rows(&mut w, "INSERT INTO fs.g VALUES (200, 0)");
+    rows(&mut w, "UPDATE fs.g SET x = 150 WHERE id = 1");
+    asked(&mut w, "SELECT * FROM fs.g ORDER BY id", &["1|150", "200|0"]);
+    // 18.6 gives each row the rows the statement wrote before it: fs.e's (3, 2), (4, 3), fs.w's
+    // (1, 0), (2, 1), (3, 2), through a STABLE body calling a VOLATILE one.
+    let why = |g: &str, t: &str| {
+        format!(
+            "{g} reads {t}, which the statement writes: a VOLATILE function's statement in a \
+             CHECK, a domain or a DEFAULT sees the rows written before its own, and is called only \
+             where the statement writes one row"
+        )
+    };
+    assert_eq!(refused(&mut w, "INSERT INTO fs.e (id) VALUES (3), (4)"), why("fs.fcount", "fs.e"));
+    assert_eq!(
+        refused(&mut w, "INSERT INTO fs.w (id) VALUES (1), (2), (3)"),
+        why("fs.wwrap", "fs.w")
+    );
+    assert_eq!(
+        refused(&mut w, "INSERT INTO fs.g VALUES (2, 0), (3, 0)"),
+        why("fs.gmax", "fs.g")
+    );
+    assert_eq!(refused(&mut w, "UPDATE fs.g SET x = 1"), why("fs.gmax", "fs.g"));
+}
+
 #[cfg(feature = "standalone")]
 #[test]
 fn a_function_a_session_creates_is_called_in_the_next_statement() {

@@ -1975,6 +1975,7 @@ impl Snail {
             .filter(|(_, f)| matches!(f, Fill::Default))
             .map(|(c, _)| *c)
             .collect();
+        self.reads_its_writes(&t, old.len(), defaults.iter().map(|&c| (c, old.len())))?;
         let mut drawn = self.draws(&t, defaults.iter().map(|&c| (c, old.len())))?;
         let mut changes = Vec::with_capacity(old.len());
         for (o, i) in old {
@@ -1998,8 +1999,8 @@ impl Snail {
                 };
             }
             fill::generate(&t, &mut n)?;
-            fill::check_domains(&self.catalog.domains, &t, &n)?;
-            fill::check(&t, &n)?;
+            fill::check_domains_reading(&self.catalog.domains, &t, &n, Some(self))?;
+            fill::check_reading(&t, &n, Some(self))?;
             fill::without_overlaps(&t, &n)?;
             changes.push(Change::Replace(o, n));
         }
@@ -2158,8 +2159,8 @@ impl Snail {
                         };
                     }
                     fill::generate(&t, &mut n)?;
-                    fill::check_domains(&self.catalog.domains, &t, &n)?;
-                    fill::check(&t, &n)?;
+                    fill::check_domains_reading(&self.catalog.domains, &t, &n, Some(self))?;
+                    fill::check_reading(&t, &n, Some(self))?;
                     fill::without_overlaps(&t, &n)?;
                     replaced.push(h.clone());
                     written.push(n.clone());
@@ -2442,6 +2443,7 @@ impl Snail {
     ) -> Result<Vec<Row>> {
         let t = self.catalog.tables[table].clone();
         given_refused(&t, rows.iter().map(|(r, _)| r))?;
+        self.reads_its_writes(&t, rows.len(), defaults_taken(&t, rows.iter().map(|(r, _)| r)))?;
         let mut drawn = self.draws(&t, defaults_taken(&t, rows.iter().map(|(r, _)| r)))?;
         let mut out = Vec::with_capacity(rows.len());
         for (r, a) in rows {
@@ -2480,6 +2482,7 @@ impl Snail {
                 }
             }
         }
+        self.reads_its_writes(&t, rows.len(), defaults_taken(&t, rows.iter().map(|(r, _)| r)))?;
         let mut drawn = self.draws(&t, defaults_taken(&t, rows.iter().map(|(r, _)| r)))?;
         let mut out = Vec::with_capacity(rows.len());
         for (r, q) in rows {
@@ -2508,6 +2511,48 @@ impl Snail {
         Ok(out)
     }
 
+    /// Refuses a write of several rows into `t` whose CHECK, domain, or DEFAULT of a column in
+    /// `defaults` (each column and the rows taking it) calls a function whose statement reads `t`
+    /// from a VOLATILE function: 18.6's sees the rows the write made before each, which the snail
+    /// writes once every row is made.
+    fn reads_its_writes(
+        &self,
+        t: &Table,
+        rows: usize,
+        defaults: impl Iterator<Item = (usize, usize)>,
+    ) -> Result<()> {
+        if rows < 2 || self.catalog.functions.is_empty() {
+            return Ok(());
+        }
+        let taking: Vec<usize> = defaults.filter(|&(_, n)| n > 0).map(|(c, _)| c).collect();
+        let mut exprs: Vec<&sqlparser::ast::Expr> =
+            t.checks.iter().filter(|k| k.enforced).map(|k| &k.expr).collect();
+        for (c, col) in t.columns.iter().enumerate() {
+            let takes = taking.contains(&c);
+            if takes {
+                exprs.extend(col.default.as_ref());
+            }
+            let mut named = col.domain.as_deref();
+            while let Some(d) = named.and_then(|n| self.catalog.domains.iter().find(|d| d.name == n)) {
+                exprs.extend(d.checks.iter().map(|k| &k.check));
+                exprs.extend(d.default.as_ref().filter(|_| takes && col.default.is_none()));
+                named = Some(&d.base);
+            }
+        }
+        match exprs
+            .into_iter()
+            .find_map(|e| super::own::reads_written(&self.catalog, e, &t.name))
+        {
+            Some(g) => Err(Error::new(format!(
+                "{g} reads {}, which the statement writes: a VOLATILE function's statement in a \
+                 CHECK, a domain or a DEFAULT sees the rows written before its own, and is called \
+                 only where the statement writes one row",
+                t.name
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// One row an INSERT gives, each cell filled: a value; the column of `answer`, of `types`, its
     /// question gave it, or the DEFAULT the question drew; else its DEFAULT, with the values drawn
     /// for the statement (`drawn`). Its stored generated columns are computed, and its domains,
@@ -2532,8 +2577,8 @@ impl Snail {
             });
         }
         fill::generate(t, &mut row)?;
-        fill::check_domains(&self.catalog.domains, t, &row)?;
-        fill::check(t, &row)?;
+        fill::check_domains_reading(&self.catalog.domains, t, &row, Some(self))?;
+        fill::check_reading(t, &row, Some(self))?;
         fill::without_overlaps(t, &row)?;
         Ok(row)
     }
@@ -2610,13 +2655,15 @@ impl Snail {
         if statement::is_literal(e) || crate::composed::constructs(col.ty, e) {
             return statement::datum(e, t, c);
         }
+        // A call of the file's function whose body reads relations asks the snail written.
         fill::assign_value(
-            super::pipeline::eval_on(
+            super::pipeline::eval_on_reading(
                 e,
                 &[],
                 &[],
                 t.release,
                 &super::pipeline::Casings::under(t),
+                Some(self),
             )?,
             col.ty,
             &col.name,

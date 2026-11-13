@@ -688,6 +688,16 @@ pub fn with_virtual(table: &Table, row: &Row) -> Result<Row> {
 /// enforced CHECKs, as PostgreSQL's ExecConstraints checks them. A CHECK whose condition is NULL
 /// passes, as in PostgreSQL. Its virtual columns are computed for the CHECKs that read them.
 pub fn check(table: &Table, row: &Row) -> Result<()> {
+    check_reading(table, row, None)
+}
+
+/// Refuses a row as `check` does, a call of the file's function whose body reads relations asking
+/// `reads`, the snail the statement writes.
+pub(super) fn check_reading(
+    table: &Table,
+    row: &Row,
+    reads: Option<&dyn super::relations::Reads>,
+) -> Result<()> {
     not_null(table, row)?;
     if table.checks.iter().all(|k| !k.enforced) {
         return Ok(());
@@ -696,12 +706,13 @@ pub fn check(table: &Table, row: &Row) -> Result<()> {
     let names = names(table);
     let vals = values(table, &full);
     for k in table.checks.iter().filter(|k| k.enforced) {
-        match eval_on(
+        match super::pipeline::eval_on_reading(
             &k.expr,
             &names,
             &vals,
             table.release,
             &Casings::of_table(table, &[]),
+            reads,
         )? {
             Value::Bool(false) => {
                 return Err(Error::new(format!(
@@ -857,11 +868,12 @@ fn meets_domain(
     d: &Datum,
     release: u8,
     casings: &Casings,
+    reads: Option<&dyn super::relations::Reads>,
 ) -> Result<()> {
     let Some(dom) = domains.iter().find(|x| x.name == name) else {
         return Ok(());
     };
-    meets_domain(domains, &dom.base, ty, d, release, casings)?;
+    meets_domain(domains, &dom.base, ty, d, release, casings, reads)?;
     if dom.not_null && *d == Datum::Null {
         return Err(Error::new(format!(
             "domain {} does not allow null values",
@@ -871,7 +883,7 @@ fn meets_domain(
     let names = ["value".to_string()];
     let value = [value_of(d, ty)];
     for k in &dom.checks {
-        match eval_on(&k.check, &names, &value, release, casings)? {
+        match super::pipeline::eval_on_reading(&k.check, &names, &value, release, casings, reads)? {
             Value::Bool(false) => {
                 return Err(Error::new(format!(
                     "value for domain {} violates check constraint \"{}\"",
@@ -898,6 +910,7 @@ fn meets_parts(
     item: &crate::composed::Item,
     release: u8,
     casings: &Casings,
+    reads: Option<&dyn super::relations::Reads>,
 ) -> Result<()> {
     use crate::composed::{datum_of, Composed, Item};
     let ColumnType::Composed(r) = ty else {
@@ -914,17 +927,18 @@ fn meets_parts(
                         &datum_of(*element, e),
                         release,
                         casings,
+                        reads,
                     )?;
                 }
-                meets_parts(domains, *element, e, release, casings)?;
+                meets_parts(domains, *element, e, release, casings, reads)?;
             }
         }
         (Composed::Record { fields, .. }, Item::Record(values)) => {
             for (f, v) in fields.iter().zip(values) {
                 if let Some(d) = &f.domain {
-                    meets_domain(domains, d, f.ty, &datum_of(f.ty, v), release, casings)?;
+                    meets_domain(domains, d, f.ty, &datum_of(f.ty, v), release, casings, reads)?;
                 }
-                meets_parts(domains, f.ty, v, release, casings)?;
+                meets_parts(domains, f.ty, v, release, casings, reads)?;
             }
         }
         _ => {}
@@ -936,13 +950,24 @@ fn meets_parts(
 /// an array's element or a composite's field names does not. A domain's CHECK reads its money
 /// under the file's lc_monetary.
 pub fn check_domains(domains: &[crate::catalog::Domain], table: &Table, row: &Row) -> Result<()> {
+    check_domains_reading(domains, table, row, None)
+}
+
+/// Refuses a row as `check_domains` does, a call of the file's function whose body reads relations
+/// asking `reads`, the snail the statement writes.
+pub(super) fn check_domains_reading(
+    domains: &[crate::catalog::Domain],
+    table: &Table,
+    row: &Row,
+    reads: Option<&dyn super::relations::Reads>,
+) -> Result<()> {
     let casings = Casings::under(table);
     for (col, d) in table.columns.iter().zip(row) {
         if let Some(name) = &col.domain {
-            meets_domain(domains, name, col.ty, d, table.release, &casings)?;
+            meets_domain(domains, name, col.ty, d, table.release, &casings, reads)?;
         }
         if let Datum::Compound(c) = d {
-            meets_parts(domains, col.ty, &c.item, table.release, &casings)?;
+            meets_parts(domains, col.ty, &c.item, table.release, &casings, reads)?;
         }
     }
     Ok(())

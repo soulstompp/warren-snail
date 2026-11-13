@@ -8584,6 +8584,19 @@ pub(crate) fn eval_on(
     eval_on_as(e, None, names, row, release, casings)
 }
 
+/// An expression on one row as `eval_on` reads it, a call of the file's function whose body reads
+/// relations asking `reads` where it is given.
+pub(super) fn eval_on_reading(
+    e: &Expr,
+    names: &[String],
+    row: &[Value],
+    release: u8,
+    casings: &Casings,
+    reads: Option<&dyn super::relations::Reads>,
+) -> Result<Value> {
+    eval_as_reading(e, None, names, row, release, casings, reads)
+}
+
 /// An expression on one row whose columns are named each with its own qualifier, in the types its
 /// typing gave it and each expression in it.
 pub(crate) fn eval_typed(
@@ -8656,6 +8669,18 @@ pub(crate) fn eval_on_as(
     release: u8,
     casings: &Casings,
 ) -> Result<Value> {
+    eval_as_reading(e, by, names, row, release, casings, None)
+}
+
+fn eval_as_reading(
+    e: &Expr,
+    by: Option<&str>,
+    names: &[String],
+    row: &[Value],
+    release: u8,
+    casings: &Casings,
+    reads: Option<&dyn super::relations::Reads>,
+) -> Result<Value> {
     let types = super::typed::Types::new();
     let frame = Frame {
         columns: names
@@ -8668,7 +8693,7 @@ pub(crate) fn eval_on_as(
         types: &types,
         now: crate::scalars::transaction_clock(),
         subqueries: None,
-        reads: None,
+        reads,
         below: None,
     };
     eval(e, row, &frame, &computed_none())
