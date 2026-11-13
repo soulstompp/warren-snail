@@ -561,7 +561,10 @@ pub(in crate::read) fn make(
                     if seen.contains(&k) {
                         continue;
                     }
-                    seen_held.more(crate::read::spill::row_width(&row));
+                    seen_held.more(
+                        crate::read::spill::keys_width(&k)
+                            + crate::read::spill::slot::<Vec<pipeline::Key>>(),
+                    );
                     seen.insert(k);
                 }
                 run.push(row)?;

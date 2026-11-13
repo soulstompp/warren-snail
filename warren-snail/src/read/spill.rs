@@ -1,8 +1,9 @@
 //! A place's rows in the round's room: held while the room has room, and past it written to the
 //! round's spill once, a page at a time, and read back where the place is read. A value's held width
-//! is its bytes as the spill writes it: a byte naming its kind, then the value.
+//! is the bytes it takes as it is held; on the spill it takes a byte naming its kind, then the value.
 
-use super::pipeline::Value;
+use super::held::{Columns, RowsAt};
+use super::pipeline::{Key, Value};
 use crate::catalog::ColumnType;
 use crate::cut::PAGE;
 use crate::geo::GeoKind;
@@ -146,8 +147,8 @@ fn encode(v: &Value, named: &mut Named, out: &mut Vec<u8>) {
     }
 }
 
-/// The bytes a value is held at: as the spill writes it.
-pub(super) fn width(v: &Value) -> u64 {
+/// The bytes a value takes on the spill.
+pub(super) fn file_width(v: &Value) -> u64 {
     let var = |n: usize| 1 + 4 + n as u64;
     match v {
         Value::Null => 1,
@@ -170,14 +171,59 @@ pub(super) fn width(v: &Value) -> u64 {
     }
 }
 
-/// The bytes a row is held at.
-pub(super) fn row_width(row: &[Value]) -> u64 {
-    row.iter().map(width).sum()
+/// The bytes a row takes on the spill: as a block's rows are counted.
+pub(super) fn row_file_width(row: &[Value]) -> u64 {
+    row.iter().map(file_width).sum()
+}
+
+/// The bytes a value holds beyond its own: its text's, its bytes', what it keeps whole.
+fn heap(v: &Value) -> u64 {
+    match v {
+        Value::Text(t) | Value::Str(_, t) | Value::Typed(_, t) => t.capacity() as u64,
+        Value::Bytes(b) | Value::Bits(_, b) => b.capacity() as u64,
+        Value::Numeric(_) | Value::Composed(..) | Value::Geometric(_) => file_width(v),
+        _ => 0,
+    }
+}
+
+/// The bytes a value is held at: its own and those it holds.
+pub(super) fn width(v: &Value) -> u64 {
+    std::mem::size_of::<Value>() as u64 + heap(v)
+}
+
+/// The bytes a row is held at: its vector, its values and what they hold.
+pub(super) fn row_width(row: &Vec<Value>) -> u64 {
+    (std::mem::size_of::<Vec<Value>>() + row.capacity() * std::mem::size_of::<Value>()) as u64
+        + row.iter().map(heap).sum::<u64>()
 }
 
 /// The bytes rows are held at.
 pub(super) fn rows_width(rows: &[Vec<Value>]) -> u64 {
-    rows.iter().map(|r| row_width(r)).sum()
+    rows.iter().map(row_width).sum()
+}
+
+/// The bytes a key is held at: its own and those it holds.
+pub(super) fn key_width(k: &Key) -> u64 {
+    let heap = match k {
+        Key::Text(t) | Key::Class(t) => t.capacity(),
+        Key::Bytes(b) => b.capacity(),
+        Key::Composed(b) => b.len(),
+        _ => 0,
+    };
+    (std::mem::size_of::<Key>() + heap) as u64
+}
+
+/// The bytes a row's keys are held at.
+pub(super) fn keys_width(keys: &Vec<Key>) -> u64 {
+    (std::mem::size_of::<Vec<Key>>() + (keys.capacity() - keys.len()) * std::mem::size_of::<Key>())
+        as u64
+        + keys.iter().map(key_width).sum::<u64>()
+}
+
+/// The bytes a hash table holds for each entry of `T`: its slot and its control byte, at the most
+/// its load lets it fill.
+pub(super) fn slot<T>() -> u64 {
+    ((std::mem::size_of::<T>() as u64 + 1) * 8).div_ceil(7)
 }
 
 struct Bytes<'a> {
@@ -273,10 +319,10 @@ fn decode_row(b: &mut Bytes, width: usize, named: &Named) -> Result<Vec<Value>> 
 /// The bytes of rows a place hands on at a time, past its first row: as a block's rows are.
 pub(super) const CHUNK: u64 = 4 * PAGE as u64;
 
-/// A place's rows as they lie: those the room holds, then those written.
+/// A place's rows as they lie: those the room holds, column-wise, then those written.
 #[derive(Default)]
 struct Stored {
-    rows: Vec<Vec<Value>>,
+    rows: Columns,
     bytes: u64,
     named: Named,
     /// Each page written, and the bytes of rows it holds.
@@ -334,8 +380,8 @@ impl Run {
     /// rows keep their order; written otherwise.
     pub(super) fn push(&self, row: Vec<Value>) -> Result<()> {
         self.width.set(row.len());
-        let w = row_width(&row);
         let mut s = self.stored.borrow_mut();
+        let w = s.rows.width_of(&row);
         s.total += w;
         let room = match &self.room {
             Some(r) => r,
@@ -400,22 +446,22 @@ impl Run {
     /// Hands `each` the rows it holds in the room, in order, each letting its room go as it is
     /// handed on; those written stay, to be read back.
     pub(super) fn hand_held(&self, each: &mut dyn FnMut(Vec<Value>) -> Result<()>) -> Result<()> {
-        let rows = std::mem::take(&mut self.stored.borrow_mut().rows);
-        for row in rows {
-            let w = row_width(&row);
-            self.stored.borrow_mut().bytes -= w;
-            if let Some(r) = &self.room {
-                r.let_go(w);
-            }
-            each(row)?;
+        let (rows, bytes) = {
+            let mut s = self.stored.borrow_mut();
+            (std::mem::take(&mut s.rows), std::mem::take(&mut s.bytes))
+        };
+        let handed = (0..rows.len()).try_for_each(|i| each(rows.row(i)));
+        drop(rows);
+        if let Some(r) = &self.room {
+            r.let_go(bytes);
         }
-        Ok(())
+        handed
     }
 
-    /// The rows held in the room.
+    /// How many rows it holds in the room.
     #[cfg(test)]
-    pub(super) fn held(&self) -> std::cell::Ref<'_, Vec<Vec<Value>>> {
-        std::cell::Ref::map(self.stored.borrow(), |s| &s.rows)
+    pub(super) fn held(&self) -> usize {
+        self.stored.borrow().rows.len()
     }
 
     /// Reads as the last reader of the rows reads them, so the rows it holds may be written.
@@ -438,8 +484,8 @@ impl Run {
         {
             let mut s = self.stored.borrow_mut();
             let s = &mut *s;
-            for row in &rows {
-                for v in row {
+            for i in 0..rows.len() {
+                for v in &rows.row(i) {
                     encode(v, &mut s.named, &mut s.tail);
                 }
                 s.spilled += 1;
@@ -469,7 +515,7 @@ impl Run {
         let held = self.stored.borrow().rows.len();
         let mut chunk = Chunk::new(each);
         for i in 0..held {
-            let row = self.stored.borrow().rows[i].clone();
+            let row = self.stored.borrow().rows.row(i);
             chunk.push(row)?;
         }
         let mut back = self.back();
@@ -755,7 +801,9 @@ impl Queue {
 /// Rows gathered into chunks and handed on as each fills, what one holds counted while it is handed.
 pub(super) struct Chunk<'e> {
     rows: Vec<Vec<Value>>,
+    /// The bytes its rows take on the spill, and as they are held.
     bytes: u64,
+    held: u64,
     each: &'e mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
 }
 
@@ -764,12 +812,14 @@ impl<'e> Chunk<'e> {
         Chunk {
             rows: Vec::new(),
             bytes: 0,
+            held: 0,
             each,
         }
     }
 
     pub(super) fn push(&mut self, row: Vec<Value>) -> Result<()> {
-        self.bytes += row_width(&row);
+        self.bytes += row_file_width(&row);
+        self.held += row_width(&row);
         self.rows.push(row);
         if self.bytes >= CHUNK {
             self.hand()?;
@@ -778,7 +828,7 @@ impl<'e> Chunk<'e> {
     }
 
     fn hand(&mut self) -> Result<()> {
-        let _flying = crate::room::flying(self.bytes);
+        let _flying = crate::room::flying(std::mem::take(&mut self.held));
         self.bytes = 0;
         (self.each)(std::mem::take(&mut self.rows))
     }
@@ -812,7 +862,10 @@ impl Handed {
             let Some(run) = self.runs.front() else {
                 break;
             };
-            let held = run.stored.borrow().rows.get(self.at).cloned();
+            let held = {
+                let s = run.stored.borrow();
+                (self.at < s.rows.len()).then(|| s.rows.row(self.at))
+            };
             let row = match held {
                 Some(r) => {
                     self.at += 1;
@@ -822,7 +875,7 @@ impl Handed {
             };
             match row {
                 Some(r) => {
-                    bytes += row_width(&r);
+                    bytes += row_file_width(&r);
                     out.push(r);
                 }
                 None => {
@@ -919,10 +972,33 @@ impl Rows {
     }
 
     /// Calls `f` with the rows held, each run's in turn, where every row is held.
-    pub(super) fn with_held<T>(&self, f: impl FnOnce(&[&Vec<Value>]) -> T) -> T {
-        let guards: Vec<_> = self.0.iter().map(|r| r.stored.borrow()).collect();
-        let rows: Vec<&Vec<Value>> = guards.iter().flat_map(|g| g.rows.iter()).collect();
-        f(&rows)
+    pub(super) fn with_held<T>(&self, f: impl FnOnce(&HeldRows) -> T) -> T {
+        let runs: Vec<_> = self.0.iter().map(|r| r.stored.borrow()).collect();
+        let mut starts = Vec::with_capacity(runs.len());
+        let mut len = 0;
+        for r in &runs {
+            starts.push(len);
+            len += r.rows.len();
+        }
+        f(&HeldRows { runs, starts, len })
+    }
+}
+
+/// The rows a place holds in the room, found by their place among them.
+pub(super) struct HeldRows<'a> {
+    runs: Vec<std::cell::Ref<'a, Stored>>,
+    starts: Vec<usize>,
+    len: usize,
+}
+
+impl RowsAt for HeldRows<'_> {
+    fn count(&self) -> usize {
+        self.len
+    }
+
+    fn row(&self, at: usize) -> Vec<Value> {
+        let r = self.starts.partition_point(|&s| s <= at) - 1;
+        self.runs[r].rows.row(at - self.starts[r])
     }
 }
 
@@ -931,32 +1007,26 @@ mod tests {
     use super::*;
     use crate::room::{entered, Sizes};
 
-    fn rows(n: i64) -> Vec<Vec<Value>> {
-        (0..n)
-            .map(|i| vec![Value::Int(i), Value::Text(format!("row {i}"))])
-            .collect()
+    /// Row `i`: an integer and the text "row i", its bytes held exactly.
+    fn row(i: i64) -> Vec<Value> {
+        vec![Value::Int(i), Value::Text(["row ", &i.to_string()].concat())]
     }
 
     #[test]
     fn rows_past_the_room_are_written_once_and_read_back_in_order() {
-        // A row of an integer and the text "row i", i under 10, is 9 + 10 = 19 bytes: of 100 rows,
-        // 1,000 bytes of room hold 52, the other 48 are 912 bytes, one page.
+        // A row of an integer and the text "row i", i under 10, takes 9 + 10 = 19 bytes on the
+        // spill; held column-wise, the integer's 8, the text's 5 and its end's 4, 17, the first row
+        // 16 more for each column's word of NULL bits. Of 100 rows, 1,000 bytes of room hold
+        // 33 + 56 * 17 = 985 bytes, 57 rows; the other 43 are written, 817 bytes, one page.
         let room = Room::new(Sizes::of(1000));
         let _in = entered(&room);
-        let all = rows(10);
-        let w: u64 = all.iter().map(|r| row_width(r)).sum();
-        assert_eq!(w, 190);
-        let mut many = Vec::new();
-        for i in 0..100 {
-            many.push(vec![
-                Value::Int(i % 10),
-                Value::Text(format!("row {}", i % 10)),
-            ]);
-        }
+        let all: Vec<Vec<Value>> = (0..10).map(row).collect();
+        assert_eq!(all.iter().map(|r| row_file_width(r)).sum::<u64>(), 190);
+        let many: Vec<Vec<Value>> = (0..100).map(|i| row(i % 10)).collect();
         let run = Run::of(many.clone()).unwrap();
-        assert_eq!((run.held().len(), run.spilled()), (52, 48));
+        assert_eq!((run.held(), run.spilled()), (57, 43));
         assert_eq!(room.spill_pages(), (1, 0));
-        assert_eq!(room.most(), 52 * 19);
+        assert_eq!(room.most(), 985);
         let shown = |r: &[Vec<Value>]| format!("{r:?}");
         assert_eq!(shown(&run.rows().unwrap()), shown(&many));
         assert_eq!(room.spill_pages(), (1, 1));

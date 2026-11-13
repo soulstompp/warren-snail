@@ -197,10 +197,12 @@ impl Returned {
                     match r[0].is_null() {
                         true => nulls = true,
                         false => {
-                            if !held.fits(super::spill::width(&r[0])) {
+                            let k = pipeline::key(&r[0]);
+                            let w = super::spill::key_width(&k) + super::spill::slot::<Key>();
+                            if !held.fits(w) {
                                 return false;
                             }
-                            keys.insert(pipeline::key(&r[0]));
+                            keys.insert(k);
                         }
                     }
                 }
@@ -795,10 +797,17 @@ impl Foreseen {
 
     /// The set of values a row more gives.
     fn see(&mut self, set: Vec<Value>) {
-        if self.over || !self.seen.insert(keys_of(&set)) {
+        if self.over {
             return;
         }
-        match self.held.fits(2 * super::spill::row_width(&set)) {
+        let keys = keys_of(&set);
+        let w = super::spill::row_width(&set)
+            + super::spill::keys_width(&keys)
+            + super::spill::slot::<Vec<Key>>();
+        if !self.seen.insert(keys) {
+            return;
+        }
+        match self.held.fits(w) {
             true => self.sets.push(set),
             false => self.over = true,
         }

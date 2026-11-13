@@ -7,7 +7,8 @@
 
 use super::{conjuncts, Kind, Merged, Node, Reading};
 use crate::read::pipeline::{self, parted, Key, Value};
-use crate::read::spill::{Chunk, Rows, Run, CHUNK};
+use crate::read::held::{Columns, RowsAt};
+use crate::read::spill::{self, Chunk, Rows, Run, CHUNK};
 use crate::Result;
 use sqlparser::ast::{BinaryOperator, Expr};
 use std::collections::HashMap;
@@ -107,7 +108,7 @@ impl Pairs<'_> {
 fn probe_pass(
     keys: &JoinKeys,
     pairs: &Pairs,
-    build: &[&Vec<Value>],
+    build: &dyn RowsAt,
     build_right: bool,
     probe: &Rows,
     keeps_probe: bool,
@@ -115,20 +116,27 @@ fn probe_pass(
     out: &mut Chunk,
 ) -> Result<()> {
     let mut map: HashMap<Vec<Key>, Vec<usize>> = HashMap::new();
-    for (i, r) in build.iter().enumerate() {
-        if let Some(k) = keys.side(r, build_right)? {
-            map.entry(k).or_default().push(i);
+    let mut held = crate::room::holding(build.count() as u64);
+    for i in 0..build.count() {
+        if let Some(k) = keys.side(&build.row(i), build_right)? {
+            let w = spill::keys_width(&k) + spill::slot::<(Vec<Key>, Vec<usize>)>();
+            let at = map.entry(k).or_insert_with(|| {
+                held.more(w);
+                Vec::new()
+            });
+            at.push(i);
+            held.more(std::mem::size_of::<usize>() as u64);
         }
     }
-    let mut met = vec![false; build.len()];
+    let mut met = vec![false; build.count()];
     probe.each_chunk(&mut |c| {
         for p in c {
             let mut any = false;
             if let Some(found) = keys.side(&p, !build_right)?.and_then(|k| map.get(&k)) {
                 for &i in found {
                     let pair = match build_right {
-                        true => pairs.pair(&p, build[i]),
-                        false => pairs.pair(build[i], &p),
+                        true => pairs.pair(&p, &build.row(i)),
+                        false => pairs.pair(&build.row(i), &p),
                     };
                     if (pairs.holds)(&pair)? {
                         any = true;
@@ -147,11 +155,12 @@ fn probe_pass(
         Ok(())
     })?;
     if keeps_build {
-        for (r, m) in build.iter().zip(&met) {
+        for (i, m) in met.iter().enumerate() {
             if !m {
+                let r = build.row(i);
                 out.push(match build_right {
-                    true => pairs.right_alone(r)?,
-                    false => pairs.left_alone(r)?,
+                    true => pairs.right_alone(&r)?,
+                    false => pairs.left_alone(&r)?,
                 })?;
             }
         }
@@ -187,8 +196,11 @@ fn batches(
         .max(CHUNK);
     if build.bytes() <= free || cut == CUTS {
         let _held = crate::room::holding(build.bytes());
-        let rows = build.all()?;
-        let rows: Vec<&Vec<Value>> = rows.iter().collect();
+        let mut rows = Columns::default();
+        build.each_chunk(&mut |c| {
+            c.into_iter().for_each(|r| rows.push(r));
+            Ok(())
+        })?;
         return probe_pass(
             keys,
             pairs,
@@ -282,8 +294,8 @@ fn nested_loop(
             lrows.each_chunk(&mut |c| {
                 for l in c {
                     let mut any = false;
-                    for (i, r) in rs.iter().enumerate() {
-                        let pair = pairs.pair(&l, r);
+                    for i in 0..rs.count() {
+                        let pair = pairs.pair(&l, &rs.row(i));
                         if (pairs.holds)(&pair)? {
                             any = true;
                             right_met[i] = true;
@@ -532,10 +544,18 @@ impl Reading<'_> {
         let mut out = Chunk::new(each);
         rrows.with_held(|rs| -> Result<()> {
             let mut map: HashMap<Vec<Key>, Vec<usize>> = HashMap::new();
+            let mut held = crate::room::holding(0);
             if let Some(keys) = &keys {
-                for (i, r) in rs.iter().enumerate() {
-                    if let Some(k) = keys.right(r)? {
-                        map.entry(k).or_default().push(i);
+                for i in 0..rs.count() {
+                    if let Some(k) = keys.right(&rs.row(i))? {
+                        let w = spill::keys_width(&k) + spill::slot::<(Vec<Key>, Vec<usize>)>();
+                        map.entry(k)
+                            .or_insert_with(|| {
+                                held.more(w);
+                                Vec::new()
+                            })
+                            .push(i);
+                        held.more(std::mem::size_of::<usize>() as u64);
                     }
                 }
             }
@@ -554,13 +574,13 @@ impl Reading<'_> {
                         Some(keys) => {
                             if let Some(found) = keys.left(&l)?.and_then(|k| map.get(&k)) {
                                 for &i in found {
-                                    meet(rs[i], &mut out)?;
+                                    meet(&rs.row(i), &mut out)?;
                                 }
                             }
                         }
                         None => {
-                            for r in rs {
-                                meet(r, &mut out)?;
+                            for i in 0..rs.count() {
+                                meet(&rs.row(i), &mut out)?;
                             }
                         }
                     }

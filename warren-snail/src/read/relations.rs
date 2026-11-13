@@ -561,11 +561,12 @@ impl Parted {
                 held: PartedRows::Scanned(rows),
             });
         }
+        let all = rows.all()?;
+        drop(rows);
         let index = match tie.tied.is_empty() {
             true => None,
-            false => Some(rows.with_held(|r| index_of(r))?),
+            false => Some(index_of(&all.iter().collect::<Vec<_>>())?),
         };
-        let all = rows.all()?;
         let _counted = crate::room::holding(super::spill::rows_width(&all));
         Ok(Parted {
             order,
@@ -4787,7 +4788,9 @@ fn image(
                     let i = match at.get(&k) {
                         Some(&i) => i,
                         None => {
-                            let w = super::spill::row_width(&row);
+                            let w = super::spill::row_width(&row)
+                                + super::spill::keys_width(&k)
+                                + super::spill::slot::<(Vec<pipeline::Key>, usize)>();
                             let fits = !closed
                                 && match &room {
                                     Some(r) => {

@@ -9300,7 +9300,8 @@ impl<'e> Reading<'e> {
             folded,
             grouped_under,
             folded_under,
-            group_bytes: 32 * p.calls.aggregates.len() as u64,
+            group_bytes: (std::mem::size_of::<Vec<Acc>>()
+                + std::mem::size_of::<Acc>() * p.calls.aggregates.len()) as u64,
         })
     }
 
@@ -9426,7 +9427,14 @@ impl Groups {
         if let Some(&i) = self.at.get(&k) {
             return Ok(Some(i));
         }
-        let w = super::spill::row_width(row) + reading.group_bytes;
+        let mut first = row.to_vec();
+        let mut w = super::spill::row_width(&first)
+            + reading.group_bytes
+            + super::spill::keys_width(&k)
+            + super::spill::slot::<(Vec<Key>, usize)>();
+        if p.sets.is_some() {
+            w += values.iter().map(super::spill::width).sum::<u64>();
+        }
         if !self.list.is_empty() && (self.closed || !self.held.fits(w)) {
             self.closed = true;
             if self.expected.is_none() {
@@ -9435,13 +9443,12 @@ impl Groups {
             let (lo, hi, expected) = (self.range.0, self.range.1, self.expected);
             self.past
                 .get_or_insert_with(|| super::spill::Parts::new(lo, hi, expected))
-                .push(parted::key_hash(&k, 0), row.to_vec())?;
+                .push(parted::key_hash(&k, 0), first)?;
             return Ok(None);
         }
         if self.list.is_empty() {
             self.held.more(w);
         }
-        let mut first = row.to_vec();
         if p.sets.is_some() {
             first.extend_from_slice(values);
         }
@@ -9607,12 +9614,11 @@ impl Going {
                 if self.seen.contains(&k) {
                     continue;
                 }
-                if self.closed || !self.seen_held.fits(super::spill::row_width(&r)) {
+                let w = super::spill::keys_width(&k) + super::spill::slot::<Vec<Key>>();
+                if self.closed || !self.seen_held.fits(w) {
                     self.closed = true;
                     if self.expected.is_none() {
-                        self.expected = self
-                            .rows_to_come
-                            .map(|n| n * super::spill::row_width(&r));
+                        self.expected = self.rows_to_come.map(|n| n * w);
                     }
                     let (lo, hi, expected) = (self.range.0, self.range.1, self.expected);
                     self.seen_past

@@ -6,7 +6,7 @@
 
 use super::{compare, computed_none, tie, Casing, Casings, Frame, Limit, Prepared, Value};
 use crate::cut::PAGE;
-use crate::read::spill::{row_width, Back, Run, CHUNK};
+use crate::read::spill::{row_file_width, row_width, Back, Run, CHUNK};
 use crate::room::{current, Room};
 use crate::{Error, Result};
 use sqlparser::ast::OrderByKind;
@@ -72,6 +72,13 @@ struct Held {
     row: Vec<Value>,
     bytes: u64,
     spec: Rc<Spec>,
+}
+
+/// The bytes a row held to be sorted holds: the row, its key and their place.
+fn held_width(row: &Vec<Value>, key: &Vec<Value>) -> u64 {
+    (std::mem::size_of::<Held>() - 2 * std::mem::size_of::<Vec<Value>>()) as u64
+        + row_width(row)
+        + row_width(key)
 }
 
 impl PartialEq for Held {
@@ -260,7 +267,7 @@ impl Sorter {
     /// own is less. Within two rooms, a row that sorts after one set aside is set aside too.
     fn place(&mut self, row: Vec<Value>, seq: u64, cut: bool) -> Result<()> {
         let key = sort_key(&row, &self.sorted, &self.under)?;
-        let bytes = row_width(&row);
+        let bytes = held_width(&row, &key);
         let mut item = Held {
             key,
             seq,
@@ -386,10 +393,11 @@ impl Sorter {
                     r.hold_anyway(bytes - came);
                 }
                 part.each(&mut |row, seq, _| {
+                    let key = sort_key(&row, &self.sorted, &self.under)?;
                     self.held.push(Held {
-                        key: sort_key(&row, &self.sorted, &self.under)?,
+                        bytes: held_width(&row, &key),
+                        key,
                         seq,
-                        bytes: row_width(&row),
                         row,
                         spec: self.spec.clone(),
                     });
@@ -471,13 +479,16 @@ impl Sorter {
                 }));
             }
             Ok(match backs[i].next_row()? {
-                Some(row) => Some(Held {
-                    key: sort_key(&row, &self.sorted, &self.under)?,
-                    seq: rank(i),
-                    bytes: 0,
-                    row,
-                    spec: self.spec.clone(),
-                }),
+                Some(row) => {
+                    let key = sort_key(&row, &self.sorted, &self.under)?;
+                    Some(Held {
+                        bytes: held_width(&row, &key),
+                        key,
+                        seq: rank(i),
+                        row,
+                        spec: self.spec.clone(),
+                    })
+                }
                 None => None,
             })
         };
@@ -488,13 +499,15 @@ impl Sorter {
                 heap.push(std::cmp::Reverse((h, i)));
             }
         }
-        let (mut rows, mut keys, mut bytes) = (Vec::new(), Vec::new(), 0u64);
+        let (mut rows, mut keys, mut bytes, mut held) = (Vec::new(), Vec::new(), 0u64, 0u64);
         while let Some(std::cmp::Reverse((h, i))) = heap.pop() {
-            bytes += row_width(&h.row);
+            bytes += row_file_width(&h.row);
+            held += h.bytes;
             keys.push(h.key);
             rows.push(h.row);
             if bytes >= CHUNK {
-                let _flying = crate::room::flying(std::mem::take(&mut bytes));
+                bytes = 0;
+                let _flying = crate::room::flying(std::mem::take(&mut held));
                 each(std::mem::take(&mut rows), std::mem::take(&mut keys))?;
             }
             if let Some(n) = next_of(i, &mut backs, &mut first)? {
@@ -505,7 +518,7 @@ impl Sorter {
             return Err(e);
         }
         if !rows.is_empty() {
-            let _flying = crate::room::flying(bytes);
+            let _flying = crate::room::flying(held);
             each(rows, keys)?;
         }
         Ok(())
