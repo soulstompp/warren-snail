@@ -702,7 +702,7 @@ fn with_steps(
 }
 
 /// Whether a WITH query writes: INSERT, UPDATE, DELETE or MERGE.
-fn writes(q: &Query) -> bool {
+pub(super) fn writes(q: &Query) -> bool {
     matches!(
         q.body.as_ref(),
         SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_)
@@ -5394,7 +5394,10 @@ fn read_from(
         rows_known,
         whole_from: None,
     };
+    // A SELECT of no FROM makes its one row, but where its shape alone is read, over tables
+    // holding none.
     let (first, rest) = match from.items.split_first() {
+        None if !asked.reads.holds_rows() => return Ok(()),
         None => return each(vec![Vec::new()], None),
         Some(s) => s,
     };
@@ -6137,7 +6140,10 @@ impl<'s> Ready<'s> {
         // A conjunct reading no column, its subqueries reading nothing of the query around it, is
         // read once before any row, as PostgreSQL's one-time filter is: where it does not hold, the
         // FROM gives no rows.
-        let mut shut = false;
+        // A FALSE written among them shuts it unread, as PostgreSQL's planner folds the WHERE.
+        let mut shut = wheres
+            .iter()
+            .any(|w| pipeline::written_truth(w) == Some(false));
         let gates: Vec<&Expr> = wheres
             .iter()
             .copied()
@@ -6147,7 +6153,7 @@ impl<'s> Ready<'s> {
                 read.is_empty() && plans.only_once(w)
             })
             .collect();
-        if !gates.is_empty() {
+        if !gates.is_empty() && !shut {
             let subs =
                 super::subqueries::Subs::new(&plans, asked, made, casings, &from.columns, accrued);
             let frame = pipeline::Frame {

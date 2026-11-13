@@ -647,7 +647,6 @@ impl<'q> Plan<'q> {
             }
         };
         let lifted: Vec<*const Expr> = lifted_calls.iter().map(|a| *a as *const Expr).collect();
-        let query_read: &Query = &query;
         // Read for its columns alone: a sequence it draws from is drawn only as rows ask it.
         let _probing = super::sequences::probing();
         let empty = relations::Empty(asked.reads.catalog());
@@ -656,7 +655,7 @@ impl<'q> Plan<'q> {
             ..asked
         };
         // Read with the step's columns as the query around it, all of them, or all but one.
-        let asked_around = |hidden: Option<usize>| {
+        let asked_around = |query_read: &Query, hidden: Option<usize>| {
             let kept = Kept::default();
             let mut columns: Vec<Col> = columns
                 .iter()
@@ -682,11 +681,30 @@ impl<'q> Plan<'q> {
                 &Accrued::default(),
             )
         };
+        // An EXISTS reads whether its query makes a row, its select list never made where nothing
+        // in the query counts its rows; read first as written, as PostgreSQL's parser reads it.
+        let query = match (&asks, &query) {
+            (Asks::Exists { .. }, std::borrow::Cow::Borrowed(q)) => {
+                match exists_read(q, asked.release, casings) {
+                    Some(read) => {
+                        if relations::made_by(probe, q, made, casings, None, &Accrued::default())
+                            .is_err()
+                        {
+                            asked_around(q, None)?;
+                        }
+                        std::borrow::Cow::Owned(read)
+                    }
+                    None => query,
+                }
+            }
+            _ => query,
+        };
+        let query_read: &Query = &query;
         let none = relations::made_by(probe, query_read, made, casings, None, &Accrued::default());
         let (m, around, reads_around) = match none {
             Ok((m, _)) => (m, None, Vec::new()),
             Err(_) => {
-                let (m, _) = asked_around(None)?;
+                let (m, _) = asked_around(query_read, None)?;
                 let ws = relations::words(&query_read.to_string());
                 let named: Vec<usize> = (0..columns.len())
                     .filter(|&i| ws.contains(&columns[i].name))
@@ -697,7 +715,7 @@ impl<'q> Plan<'q> {
                     true => named
                         .iter()
                         .copied()
-                        .filter(|&i| asked_around(Some(i)).is_err())
+                        .filter(|&i| asked_around(query_read, Some(i)).is_err())
                         .collect(),
                     false => Vec::new(),
                 };
@@ -1396,6 +1414,61 @@ impl<'a, 'q> Subs<'a, 'q> {
         w.at.insert(key, (at, rows.len() as u32));
         Ok(())
     }
+}
+
+/// An EXISTS's query as PostgreSQL's planner reads it before it plans it (simplify_EXISTS_query):
+/// one SELECT that folds nothing, makes no set, has no HAVING, OFFSET or locking clause, writes
+/// nothing, and whose LIMIT cuts no row, read without its select list, its GROUP BY, WINDOW,
+/// DISTINCT, ORDER BY and LIMIT; none where it is any other.
+fn exists_read(q: &Query, release: u8, casings: &Casings) -> Option<Query> {
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return None;
+    };
+    if s.having.is_some() || !q.locks.is_empty() || q.for_clause.is_some() {
+        return None;
+    }
+    if q.with
+        .as_ref()
+        .is_some_and(|w| w.cte_tables.iter().any(|c| relations::writes(&c.query)))
+    {
+        return None;
+    }
+    let GroupByExpr::Expressions(grouped, modifiers) = &s.group_by else {
+        return None;
+    };
+    if !modifiers.is_empty()
+        || grouped.iter().any(|g| {
+            matches!(g, Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_))
+        })
+    {
+        return None;
+    }
+    let items = s.projection.iter().filter_map(|i| match i {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
+        _ => None,
+    });
+    let sorted = match q.order_by.as_ref().map(|o| &o.kind) {
+        Some(OrderByKind::Expressions(os)) => os.iter().map(|o| &o.expr).collect(),
+        _ => Vec::new(),
+    };
+    if items.chain(sorted).any(pipeline::folds_or_makes_sets)
+        || !pipeline::cuts_no_row(q, release, casings)
+    {
+        return None;
+    }
+    let mut read = q.clone();
+    read.order_by = None;
+    read.limit_clause = None;
+    read.fetch = None;
+    if let SetExpr::Select(s) = read.body.as_mut() {
+        s.projection = vec![SelectItem::UnnamedExpr(Expr::Value(
+            sqlparser::ast::Value::Boolean(true).into(),
+        ))];
+        s.group_by = GroupByExpr::Expressions(Vec::new(), Vec::new());
+        s.named_window = Vec::new();
+        s.distinct = None;
+    }
+    Some(read)
 }
 
 /// A set of values, as answers are kept by.

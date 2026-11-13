@@ -2003,6 +2003,86 @@ pub(super) fn holds_set(e: &Expr) -> bool {
     }
 }
 
+/// Whether an expression folds rows or makes a set as its query's own: an aggregate, a window, a
+/// GROUPING call or a set-returning function, its subqueries' calls their own.
+pub(super) fn folds_or_makes_sets(e: &Expr) -> bool {
+    let mut calls = Calls::default();
+    find_calls(e, &mut calls);
+    !(calls.aggregates.is_empty()
+        && calls.windows.is_empty()
+        && calls.groupings.is_empty()
+        && calls.sets.is_empty())
+        || holds_set(e)
+}
+
+/// The truth an expression writes out, TRUE or FALSE, its parentheses passed over.
+pub(super) fn written_truth(e: &Expr) -> Option<bool> {
+    match e {
+        Expr::Nested(x) => written_truth(x),
+        Expr::Value(v) => match v.value {
+            SqlValue::Boolean(b) => Some(b),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether a query's LIMIT and FETCH FIRST cut none of the rows it makes, as PostgreSQL's planner
+/// reads them before it plans an EXISTS: no count, or one written of constants that comes to more
+/// than none or to NULL; never beside an OFFSET or WITH TIES.
+pub(super) fn cuts_no_row(q: &Query, release: u8, casings: &Casings) -> bool {
+    fn written(e: &Expr) -> bool {
+        match e {
+            Expr::Value(v) => matches!(v.value, SqlValue::Number(..) | SqlValue::Null),
+            Expr::UnaryOp {
+                op: sqlparser::ast::UnaryOperator::Minus | sqlparser::ast::UnaryOperator::Plus,
+                expr,
+            }
+            | Expr::Nested(expr)
+            | Expr::Cast { expr, .. } => written(expr),
+            Expr::BinaryOp { left, op, right } => {
+                matches!(
+                    op,
+                    BinaryOperator::Plus
+                        | BinaryOperator::Minus
+                        | BinaryOperator::Multiply
+                        | BinaryOperator::Divide
+                        | BinaryOperator::Modulo
+                ) && written(left)
+                    && written(right)
+            }
+            _ => false,
+        }
+    }
+    let Ok(limit) = Limit::of(q) else {
+        return false;
+    };
+    let Some(l) = limit else {
+        return true;
+    };
+    if l.offset.is_some() || l.ties {
+        return false;
+    }
+    let e = match l.count {
+        Count::All | Count::One => return true,
+        Count::Of(e) if written(e) => e,
+        Count::Of(_) => return false,
+    };
+    let Ok(types) = typed_on(e, &[], release) else {
+        return false;
+    };
+    let v = eval_typed(e, Vec::new(), &[], release, casings, &types).and_then(|v| {
+        cast(
+            v,
+            &sqlparser::ast::DataType::BigInt(None),
+            release,
+            casings.monetary(),
+            quoted(e),
+        )
+    });
+    matches!(v, Ok(Value::Null)) || matches!(v, Ok(Value::Int(n)) if n > 0)
+}
+
 /// PostgreSQL's refusal of a set-returning function where a clause or a construct takes none.
 fn not_allowed(what: &str) -> Error {
     Error::new(format!("set-returning functions are not allowed in {what}"))
@@ -5261,6 +5341,11 @@ fn eval_whole(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
             match op {
                 BinaryOperator::And | BinaryOperator::Or => {
                     let and = matches!(op, BinaryOperator::And);
+                    // A truth written on its right that settles it settles it unread, as
+                    // PostgreSQL's planner folds it before any row.
+                    if written_truth(right) == Some(!and) {
+                        return Ok(Value::Bool(!and));
+                    }
                     // Its right side read only where its left does not settle it, as the executor
                     // reads a list of conditions; a pattern written out PostgreSQL's planner reads
                     // before any row.
