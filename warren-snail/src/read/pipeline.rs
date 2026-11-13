@@ -10753,7 +10753,8 @@ fn compares_no_constant(e: &Expr) -> bool {
 
 /// Whether a question over the snail's tables reads one's whole row, which only the pipeline reads:
 /// a bare name none of their columns bears that names one of them, by its alias or its name, or a
-/// star of one where an expression or a call's argument stands.
+/// star where an expression or a call's argument stands: of one of them, its whole row; of none,
+/// refused there in PostgreSQL's words.
 pub fn reads_whole_rows(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
     let SetExpr::Select(s) = q.body.as_ref() else {
         return false;
@@ -10777,21 +10778,16 @@ pub fn reads_whole_rows(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
             names.push(alias.as_ref().map_or(last, |a| ident(&a.name)));
         }
     }
-    let starred = |n: &sqlparser::ast::ObjectName| {
-        n.0.last()
-            .and_then(|p| p.as_ident())
-            .is_some_and(|i| names.contains(&ident(i)))
-    };
     sqlparser::ast::visit_expressions(q, |e| match e {
         Expr::Identifier(i)
             if names.contains(&ident(i)) && !columns.contains(&ident(i).as_str()) =>
         {
             std::ops::ControlFlow::Break(())
         }
-        Expr::QualifiedWildcard(n, _) if starred(n) => std::ops::ControlFlow::Break(()),
+        Expr::QualifiedWildcard(..) => std::ops::ControlFlow::Break(()),
         Expr::Function(f)
             if matches!(&f.args, FunctionArguments::List(l) if l.args.iter().any(|a| matches!(a,
-                FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(n)) if starred(n)))) =>
+                FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_))))) =>
         {
             std::ops::ControlFlow::Break(())
         }

@@ -42,11 +42,15 @@ fn written_bang(sql: &str, t: &TokenWithSpan) -> bool {
 /// A statement's tokens, `*` and the comparison written against it one operator, as PostgreSQL's
 /// lexer reads them. sqlparser reads `!=` as `<>`, and `*!=` is no operator: it stays two tokens.
 /// `:=`, which PostgreSQL's grammar reads only between an argument's name and its value, is read
-/// as `=>`, the spelling sqlparser reads there.
+/// as `=>`, the spelling sqlparser reads there. A relation's star cast, or an operator follows, is
+/// read as its whole row (`star_cast`, `star_operated`).
 pub(crate) fn tokens(sql: &str) -> std::result::Result<Vec<TokenWithSpan>, TokenizerError> {
     let mut tokens = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize_with_location()?;
     if sql.contains(".*") && sql.contains("::") {
         tokens = star_cast(tokens);
+    }
+    if sql.contains('*') {
+        tokens = star_operated(tokens);
     }
     if sql.contains(":=") {
         for t in &mut tokens {
@@ -201,6 +205,92 @@ fn star_cast(tokens: Vec<TokenWithSpan>) -> Vec<TokenWithSpan> {
             continue;
         }
         out.push(t.clone());
+    }
+    out
+}
+
+/// The tokens with each relation's star an operator follows in parentheses: sqlparser reads no
+/// operator after `o.*` where a select list's item or a call's argument begins, and PostgreSQL's
+/// grammar reads such a star as the relation's whole row, as it reads one in parentheses. A star
+/// written against an operator's character is PostgreSQL's lexer's one operator, and left.
+fn star_operated(tokens: Vec<TokenWithSpan>) -> Vec<TokenWithSpan> {
+    let solid: Vec<usize> = (0..tokens.len())
+        .filter(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+        .collect();
+    let token = |k: usize| &tokens[solid[k]].token;
+    let word = |k: usize| matches!(token(k), Token::Word(_));
+    let operator = |t: &Token| match t {
+        Token::Word(w) => {
+            w.quote_style.is_none()
+                && matches!(
+                    w.keyword,
+                    Keyword::IS
+                        | Keyword::NOT
+                        | Keyword::IN
+                        | Keyword::LIKE
+                        | Keyword::ILIKE
+                        | Keyword::SIMILAR
+                        | Keyword::BETWEEN
+                        | Keyword::AND
+                        | Keyword::OR
+                        | Keyword::COLLATE
+                        | Keyword::OPERATOR
+                )
+        }
+        Token::EOF
+        | Token::Comma
+        | Token::SemiColon
+        | Token::LParen
+        | Token::RParen
+        | Token::LBracket
+        | Token::RBracket
+        | Token::Period
+        | Token::Number(..)
+        | Token::Char(_)
+        | Token::Placeholder(_)
+        | Token::SingleQuotedString(_)
+        | Token::DollarQuotedString(_)
+        | Token::EscapedStringLiteral(_)
+        | Token::NationalStringLiteral(_)
+        | Token::UnicodeStringLiteral(_)
+        | Token::HexStringLiteral(_) => false,
+        _ => true,
+    };
+    let mut wrapped: Vec<(usize, usize)> = Vec::new();
+    for k in 2..solid.len() {
+        if *token(k) != Token::Mul || *token(k - 1) != Token::Period || !word(k - 2) {
+            continue;
+        }
+        // The relation's name before it, its parts a period apart.
+        let mut first = k - 2;
+        while first >= 2 && *token(first - 1) == Token::Period && word(first - 2) {
+            first -= 2;
+        }
+        if first > 0 && *token(first - 1) == Token::Period {
+            continue;
+        }
+        let Some(&next) = solid.get(k + 1) else {
+            continue;
+        };
+        let against = next == solid[k] + 1
+            && !matches!(tokens[next].token, Token::Word(_) | Token::DoubleColon);
+        if operator(&tokens[next].token) && !against {
+            wrapped.push((solid[first], solid[k]));
+        }
+    }
+    if wrapped.is_empty() {
+        return tokens;
+    }
+    let mut out = Vec::with_capacity(tokens.len() + 2 * wrapped.len());
+    for (i, t) in tokens.into_iter().enumerate() {
+        let span = t.span;
+        if wrapped.iter().any(|w| w.0 == i) {
+            out.push(TokenWithSpan::new(Token::LParen, span));
+        }
+        out.push(t);
+        if wrapped.iter().any(|w| w.1 == i) {
+            out.push(TokenWithSpan::new(Token::RParen, span));
+        }
     }
     out
 }

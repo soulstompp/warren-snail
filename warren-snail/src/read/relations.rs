@@ -3837,12 +3837,18 @@ fn along(table: &Table) -> Option<usize> {
 /// where an expression stands, or among a call's arguments, is its whole row too; among ROW's, its
 /// columns, each an argument; and in a subquery's select list, where the subquery's own FROM names
 /// no relation so, its columns as the subquery reads the query's around it. Each row made, by its
-/// place, with its type.
-fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr, ColumnType)> {
+/// place, with its type. A star of a relation neither its FROM nor a query around it holds is
+/// refused in PostgreSQL's words.
+fn whole_rows(
+    q: &mut Query,
+    from: &From,
+    catalog: &Catalog,
+    outer: Option<&Outer>,
+) -> Result<Vec<(*const Expr, ColumnType)>> {
     use sqlparser::ast::{VisitMut, VisitorMut};
     use std::ops::ControlFlow;
     let SetExpr::Select(s) = q.body.as_mut() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let typed = from.typed();
     let mut leaves = Vec::new();
@@ -3901,13 +3907,37 @@ fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr
         let (row, ty) = row_of_leaf(leaf)?;
         Some((row, ty, leaf.star.iter().map(|&p| typed[p].1.clone()).collect()))
     };
+    // The refusal of a star no relation of the FROM holds, where no query around it holds one.
+    let unheld = |n: &ObjectName| -> Option<Error> {
+        let q = match n.0.len() {
+            1 => crate::catalog::object_name(n),
+            _ => {
+                let names: Vec<String> = crate::catalog::object_name(n)
+                    .split('.')
+                    .map(str::to_string)
+                    .collect();
+                pipeline::qualified(&names)
+            }
+        };
+        if let Some(e) = pipeline::too_many_names(&q, "*") {
+            return Some(e);
+        }
+        let around = outer.is_some_and(|o| {
+            o.columns
+                .iter()
+                .any(|c| pipeline::answers_to(c.qualifier.as_deref(), &q))
+        });
+        (!around).then(|| from.no_entry(catalog, &q))
+    };
     struct Rows<'r> {
         row_of: &'r dyn Fn(&str) -> Option<(Expr, ColumnType)>,
         star_of: &'r dyn Fn(&ObjectName) -> Option<(Expr, ColumnType, Vec<String>)>,
+        unheld: &'r dyn Fn(&ObjectName) -> Option<Error>,
         depth: usize,
         // The names each subquery met so far binds in its FROM, the outermost first.
         bound: Vec<Vec<String>>,
         made: Vec<(*const Expr, ColumnType)>,
+        refused: Option<Error>,
     }
     impl Rows<'_> {
         // In parentheses, a value compared as a composite is, not a row constructor's fields one
@@ -3916,6 +3946,17 @@ fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr
             let row = Box::new(row);
             self.made.push((row.as_ref() as *const Expr, ty));
             Expr::Nested(row)
+        }
+
+        // A star no relation holds, refused: the first met.
+        fn unheld(&mut self, n: &ObjectName) -> ControlFlow<()> {
+            match (self.unheld)(n) {
+                Some(e) => {
+                    self.refused.get_or_insert(e);
+                    ControlFlow::Break(())
+                }
+                None => ControlFlow::Continue(()),
+            }
         }
     }
     impl VisitorMut for Rows<'_> {
@@ -3976,11 +4017,10 @@ fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr
                         *e = self.whole(row, ty);
                     }
                 }
-                Expr::QualifiedWildcard(n, _) => {
-                    if let Some((row, ty, _)) = (self.star_of)(n) {
-                        *e = self.whole(row, ty);
-                    }
-                }
+                Expr::QualifiedWildcard(n, _) => match (self.star_of)(n) {
+                    Some((row, ty, _)) => *e = self.whole(row, ty),
+                    None => return self.unheld(n),
+                },
                 Expr::Function(f) => {
                     let spread = crate::catalog::object_name(&f.name).eq_ignore_ascii_case("row");
                     let FunctionArguments::List(list) = &mut f.args else {
@@ -4001,6 +4041,10 @@ fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr
                             (Some((row, ty, _)), false) => args.push(FunctionArg::Unnamed(
                                 FunctionArgExpr::Expr(self.whole(row, ty)),
                             )),
+                            (None, _) => {
+                                let _ = self.unheld(n);
+                                args.push(a)
+                            }
                             _ => args.push(a),
                         }
                     }
@@ -4011,16 +4055,21 @@ fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr
             ControlFlow::Continue(())
         }
     }
-    // An item that is such a name alone keeps the name.
+    // An item that is such a name, alone or cast, keeps the name.
     for item in &mut s.projection {
-        if let SelectItem::UnnamedExpr(Expr::Identifier(i)) = item {
-            if row_of(&crate::catalog::ident(i)).is_some() {
-                let alias = i.clone();
-                *item = SelectItem::ExprWithAlias {
-                    expr: Expr::Identifier(alias.clone()),
-                    alias,
-                };
-            }
+        let SelectItem::UnnamedExpr(e) = item else {
+            continue;
+        };
+        let mut root = &*e;
+        while let Expr::Cast { expr: x, .. } | Expr::Nested(x) = root {
+            root = x;
+        }
+        if matches!(root, Expr::Identifier(i) if row_of(&crate::catalog::ident(i)).is_some()) {
+            let alias = Ident::with_quote('"', pipeline::default_name(e));
+            *item = SelectItem::ExprWithAlias {
+                expr: e.clone(),
+                alias,
+            };
         }
     }
     let named: Vec<String> = s
@@ -4037,9 +4086,11 @@ fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr
     let mut rows = Rows {
         row_of: &row_of,
         star_of: &star_of,
+        unheld: &unheld,
         depth: 0,
         bound: Vec::new(),
         made: Vec::new(),
+        refused: None,
     };
     for item in &mut s.projection {
         if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
@@ -4062,7 +4113,10 @@ fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr
             let _ = o.expr.visit(&mut rows);
         }
     }
-    rows.made
+    match rows.refused {
+        Some(e) => Err(e),
+        None => Ok(rows.made),
+    }
 }
 
 /// The names a relation of a FROM binds its columns by: its alias, or a table's or a function's
@@ -5628,7 +5682,7 @@ fn select_step(
     if let SetExpr::Select(s) = step.query.body.as_mut() {
         starred(&mut s.projection, &from, catalog)?;
     }
-    let rows_read = whole_rows(&mut step.query, &from, catalog);
+    let rows_read = whole_rows(&mut step.query, &from, catalog, outer)?;
     from.outer_at = from.columns.len();
     if let Some(o) = outer {
         from.columns.extend(o.columns.iter().cloned());

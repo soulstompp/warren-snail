@@ -5318,6 +5318,107 @@ fn a_relation_s_star_cast_is_its_whole_row() {
 }
 
 #[test]
+fn a_relation_s_star_an_operator_follows_is_its_whole_row() {
+    let path = tmp("reader-star-operators.snail");
+    write(&path, &Catalog::parse(WR_DDL).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO wr.a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, NULL, 50)")
+        .unwrap();
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT a.id, a.* IS NOT NULL FROM wr.a a ORDER BY a.id",
+                &["1|t", "2|t", "3|t", "4|t", "5|f"],
+            ),
+            ("SELECT wr.a.* IS NULL FROM wr.a WHERE id = 1", &["f"]),
+            (
+                "SELECT a.id, a.* IS NULL FROM wr.a a ORDER BY a.id",
+                &["1|f", "2|f", "3|f", "4|f", "5|f"],
+            ),
+            ("SELECT a.* = a.* FROM wr.a a WHERE id = 5", &["t"]),
+            (
+                "SELECT a.id, a.* > b.* FROM wr.a a, wr.a b WHERE b.id = 2 ORDER BY a.id",
+                &["1|f", "2|f", "3|t", "4|t", "5|t"],
+            ),
+            (
+                "SELECT a.* IS NOT NULL AND a.id > 2 FROM wr.a a ORDER BY a.id",
+                &["f", "f", "t", "t", "f"],
+            ),
+            ("SELECT NOT a.* IS NULL FROM wr.a a WHERE id = 1", &["t"]),
+            ("SELECT a.* IS NOT DISTINCT FROM a.* FROM wr.a a WHERE id = 5", &["t"]),
+            ("SELECT a.*, a.* IS NULL FROM wr.a a WHERE id = 5", &["5|NULL|50|f"]),
+            (
+                "SELECT a.* NOT IN (SELECT b FROM wr.a b WHERE b.id = 2) FROM wr.a a WHERE id = 1",
+                &["t"],
+            ),
+            (
+                "SELECT a.id, a.* IS DISTINCT FROM b.* FROM wr.a a JOIN wr.a b ON b.id = 2 ORDER \
+                 BY 1",
+                &["1|t", "2|f", "3|t", "4|t", "5|t"],
+            ),
+            ("SELECT coalesce(a.* IS NULL, true) FROM wr.a a WHERE id = 1", &["f"]),
+            ("SELECT a.*::text || 'x' FROM wr.a a WHERE id = 1", &["(1,1,10)x"]),
+            ("SELECT count(*) FILTER (WHERE a.* IS NOT NULL) FROM wr.a a", &["4"]),
+            (
+                "SELECT a.id FROM wr.a a ORDER BY a.* IS NULL, a.id DESC",
+                &["5", "4", "3", "2", "1"],
+            ),
+            (
+                "SELECT a.* IS NOT NULL FROM wr.a a WHERE id = 5 UNION ALL SELECT true",
+                &["f", "t"],
+            ),
+            ("SELECT a.*IS NULL FROM wr.a a WHERE id = 1", &["f"]),
+        ],
+    );
+    // Written against the star, an operator's character is one operator with it, as PostgreSQL's
+    // lexer reads `*=` and `*||`: a syntax error.
+    for sql in [
+        "SELECT a.*= a.* FROM wr.a a WHERE id = 1",
+        "SELECT a.*||'x' FROM wr.a a WHERE id = 1",
+    ] {
+        assert_eq!(refused(&mut w, sql).0, Some("42601"), "{sql}");
+    }
+    // Named as PostgreSQL names each: a cast by the relation the star names, an operator's not.
+    for (sql, name) in [
+        ("SELECT a.*::text FROM wr.a a WHERE id = 1", "a"),
+        ("SELECT CAST(a.* AS text) FROM wr.a a WHERE id = 1", "a"),
+        ("SELECT a::text FROM wr.a a WHERE id = 1", "a"),
+        ("SELECT a.* IS NULL FROM wr.a a WHERE id = 1", "?column?"),
+    ] {
+        let b = w.execute(sql).unwrap().answer.unwrap();
+        assert_eq!(b.schema().field(0).name(), name, "{sql}");
+    }
+}
+
+#[test]
+fn a_star_of_no_relation_is_refused_as_a_missing_entry() {
+    let path = tmp("reader-stars-unheld.snail");
+    write(&path, &Catalog::parse(WR_DDL).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO wr.a VALUES (1, 1, 10), (2, 1, 20)").unwrap();
+    let missing = |t: &str| (Some("42P01"), format!("missing FROM-clause entry for table \"{t}\""));
+    for (sql, want) in [
+        ("SELECT ROW(x.*) FROM wr.a a", missing("x")),
+        ("SELECT count(x.*) FROM wr.a a", missing("x")),
+        ("SELECT a.id FROM wr.a a ORDER BY x.*", missing("x")),
+        ("SELECT x.* IS NULL FROM wr.a a", missing("x")),
+        ("SELECT (x.*) IS NULL FROM wr.a a", missing("x")),
+        ("SELECT a.id FROM wr.a a WHERE x.* IS NULL", missing("x")),
+        ("SELECT a.id FROM wr.a a, wr.a b WHERE row_to_json(x.*) IS NULL", missing("x")),
+        (
+            "SELECT a.id FROM wr.a a WHERE EXISTS (SELECT 1 FROM wr.a b WHERE row_to_json(x.*) IS \
+             NOT NULL)",
+            missing("x"),
+        ),
+        ("SELECT row_to_json(wr.b.*) FROM wr.a", missing("b")),
+    ] {
+        assert_eq!(refused(&mut w, sql), want, "{sql}");
+    }
+    assert_eq!(refused(&mut w, "SELECT ROW(wr.a.*) FROM wr.a a").0, Some("42P01"));
+}
+
+#[test]
 fn an_arm_s_sorted_literal_is_text_before_its_set_operation_is_typed() {
     let mut w = snail("sorted-literal");
     let unmatched = |op: &str, a: &str, b: &str| {
