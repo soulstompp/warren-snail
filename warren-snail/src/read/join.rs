@@ -12,8 +12,8 @@
 //! WHERE reads on a table an outer join may leave NULL.
 
 use super::answer::{as_text, Answer, Cell, Dict};
-use super::hash::{WordHasher, WordMap};
-use super::held::{At, Cells, Slots};
+use super::hash::WordHasher;
+use super::held::{varied, At, Cells, Encoded, KeyRows, KeySet as Keys, Slots};
 use super::question::{Cmp, Key, Meet, Piece, Question, Test};
 use super::walk::{KeySet, Sink, Want};
 use super::{Round, Snail};
@@ -27,6 +27,18 @@ use arrow::array::RecordBatch;
 enum Part {
     Num(i128),
     Bytes(Box<[u8]>),
+}
+
+impl Encoded for Part {
+    fn encode(&self, _: &mut Vec<ColumnType>, out: &mut Vec<u8>) {
+        match self {
+            Part::Num(v) => {
+                out.push(0);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Part::Bytes(b) => varied(out, 1, b),
+        }
+    }
 }
 
 /// The value a cell of a column of type `ty` meets another by; none for a NULL, which meets none.
@@ -121,7 +133,7 @@ impl Held {
 struct Filter {
     at: Vec<usize>,
     types: Vec<ColumnType>,
-    keys: WordMap<Vec<Part>, ()>,
+    keys: Keys,
 }
 
 /// A table's rows as they arrive, each kept where it holds a key of every table it is kept to: as
@@ -161,7 +173,7 @@ impl Sink for Gather<'_> {
                     None => return false,
                 }
             }
-            if !f.keys.contains_key(self.probe.as_slice()) {
+            if !f.keys.contains(&self.probe) {
                 return false;
             }
         }
@@ -304,14 +316,15 @@ impl Tables<'_> {
     }
 
     /// Table `side`'s rows by their values on these of its columns.
-    fn by_key(&self, side: usize, cols: &[usize]) -> WordMap<Vec<Part>, Vec<u32>> {
-        let mut map: WordMap<Vec<Part>, Vec<u32>> = WordMap::default();
+    fn by_key(&self, side: usize, cols: &[usize]) -> (KeyRows, crate::room::Holding) {
+        let mut map = KeyRows::default();
+        let mut held = crate::room::holding(0);
         for r in 0..self.held[side].len() {
             if let Some(k) = self.key_of(side, r, cols) {
-                map.entry(k).or_default().push(r as u32);
+                held.more(map.push(&k, r as u32));
             }
         }
-        map
+        (map, held)
     }
 
     /// The rows met joined with table `side`'s on `meets`, each written from its column, and
@@ -324,24 +337,29 @@ impl Tables<'_> {
             .map(|m| Test::Two(*m))
             .chain(tests.iter().cloned())
             .collect();
-        let map = self.by_key(side, &eq.iter().map(|m| m.a.column).collect::<Vec<_>>());
+        let (map, _map_held) = self.by_key(side, &eq.iter().map(|m| m.a.column).collect::<Vec<_>>());
         let from: Vec<super::question::Col> = eq.iter().map(|m| m.b).collect();
-        let every: Vec<u32> = (0..self.held[side].len() as u32).collect();
+        let every: Vec<u32> = match eq.is_empty() {
+            true => (0..self.held[side].len() as u32).collect(),
+            false => Vec::new(),
+        };
         let mut out = Joined {
             width: j.width,
             rows: Vec::new(),
             weights: Vec::new(),
         };
         let mut row: Vec<u32> = vec![NONE; j.width];
+        let mut keyed: Vec<u32> = Vec::new();
         for i in 0..j.len() {
             row.copy_from_slice(j.row(i));
             let found: &[u32] = if eq.is_empty() {
                 &every
             } else {
-                match self.key(&row, &from).and_then(|k| map.get(&k)) {
-                    Some(rows) => rows,
-                    None => &[],
+                keyed.clear();
+                if let Some(k) = self.key(&row, &from) {
+                    keyed.extend(map.rows(&k));
                 }
+                &keyed
             };
             let mut joined = false;
             for &r in found {
@@ -607,13 +625,17 @@ pub(super) fn ask_join_within(
                     types: meets.iter().map(|m| table.columns[m.a.column].ty).collect(),
                     keys: {
                         let from: Vec<usize> = meets.iter().map(|m| m.b.column).collect();
-                        (0..t.held[*s].len())
-                            .filter_map(|r| t.key_of(*s, r, &from))
-                            .map(|k| (k, ()))
-                            .collect()
+                        let mut keys = Keys::default();
+                        for r in 0..t.held[*s].len() {
+                            if let Some(k) = t.key_of(*s, r, &from) {
+                                keys.insert(&k);
+                            }
+                        }
+                        keys
                     },
                 })
                 .collect();
+            let _filters = crate::room::holding(filters.iter().map(|f| f.keys.bytes()).sum());
             let mut held = Held::default();
             let mut sink = Gather {
                 held: &mut held,
@@ -783,7 +805,7 @@ fn meet_core(q: &Question, t: &Tables, sides: &[usize]) -> Joined {
 /// The rows of the first table joined FULL with table `side`'s: each pair that meets and passes the
 /// tests, then each row of either that joined none, the other NULL.
 fn full_join(t: &Tables, j: Joined, side: usize, meets: &[Meet], tests: &[Test]) -> Joined {
-    let map = t.by_key(side, &meets.iter().map(|m| m.a.column).collect::<Vec<_>>());
+    let (map, _map_held) = t.by_key(side, &meets.iter().map(|m| m.a.column).collect::<Vec<_>>());
     let from: Vec<super::question::Col> = meets.iter().map(|m| m.b).collect();
     let mut matched = vec![false; t.held[side].len()];
     let mut out = Joined {
@@ -792,11 +814,16 @@ fn full_join(t: &Tables, j: Joined, side: usize, meets: &[Meet], tests: &[Test])
         weights: Vec::new(),
     };
     let mut row = vec![NONE; j.width];
+    let mut found: Vec<u32> = Vec::new();
     for i in 0..j.len() {
         row.copy_from_slice(j.row(i));
         let mut joined = false;
-        if let Some(rows) = t.key(&row, &from).and_then(|k| map.get(&k)) {
-            for &r in rows {
+        found.clear();
+        if let Some(k) = t.key(&row, &from) {
+            found.extend(map.rows(&k));
+        }
+        if !found.is_empty() {
+            for &r in &found {
                 row[side] = r;
                 if tests.iter().all(|x| t.test(x, &row)) {
                     out.push(&row, j.weights[i] * t.held[side].weights[r as usize]);
@@ -829,8 +856,10 @@ struct Probe<'a> {
     answer: &'a mut Answer,
     inputs: &'a [Key],
     joined: &'a Joined,
-    rows: WordMap<Vec<Part>, Vec<u32>>,
-    counts: WordMap<Vec<Part>, u64>,
+    rows: KeyRows,
+    counted: Keys,
+    counts: Vec<u64>,
+    _held: crate::room::Holding,
     alone: bool,
     /// Its comparisons with the tables met other than on its keys, each written from its column.
     tests: Vec<Meet>,
@@ -863,14 +892,23 @@ impl<'a> Probe<'a> {
             .map(|m| m.seen_from(side))
             .collect();
         let alone = tests.is_empty() && inputs.iter().all(|k| k.col().side == side);
-        let mut rows: WordMap<Vec<Part>, Vec<u32>> = WordMap::default();
-        let mut counts: WordMap<Vec<Part>, u64> = WordMap::default();
+        let mut rows = KeyRows::default();
+        let mut counted = Keys::default();
+        let mut counts: Vec<u64> = Vec::new();
+        let mut held = crate::room::holding(0);
         for i in 0..joined.len() {
             if let Some(k) = t.key(joined.row(i), &others) {
                 if alone {
-                    *counts.entry(k).or_default() += joined.weights[i];
+                    match counted.ask(&k) {
+                        Some(c) => counts[c] += joined.weights[i],
+                        None => {
+                            held.more(counted.width() + 8);
+                            counted.hold();
+                            counts.push(joined.weights[i]);
+                        }
+                    }
                 } else {
-                    rows.entry(k).or_default().push(i as u32);
+                    held.more(rows.push(&k, i as u32));
                 }
             }
         }
@@ -885,7 +923,9 @@ impl<'a> Probe<'a> {
             inputs,
             joined,
             rows,
+            counted,
             counts,
+            _held: held,
             alone,
             tests,
             lead: at.iter().map(|a| a + 1).max().unwrap_or(0),
@@ -941,9 +981,9 @@ impl Sink for Probe<'_> {
             }
         }
         if self.alone {
-            self.counts.contains_key(self.probe.as_slice())
+            self.counted.contains(&self.probe)
         } else {
-            self.rows.contains_key(self.probe.as_slice())
+            self.rows.rows(&self.probe).next().is_some()
         }
     }
 
@@ -952,7 +992,7 @@ impl Sink for Probe<'_> {
         let t = self.t;
         let mine = |k: &Key| t.at(side, k.col().column, matches!(k, Key::Month(_)));
         if self.alone {
-            let Some(&n) = self.counts.get(self.probe.as_slice()) else {
+            let Some(n) = self.counted.ask(&self.probe).map(|c| self.counts[c]) else {
                 return;
             };
             for (cell, k) in self.cells.iter_mut().zip(self.inputs) {
@@ -961,9 +1001,10 @@ impl Sink for Probe<'_> {
             self.answer.add_times(&self.cells, n);
             return;
         }
-        let Some(found) = self.rows.get(self.probe.as_slice()) else {
+        let found: Vec<u32> = self.rows.rows(&self.probe).collect();
+        if found.is_empty() {
             return;
-        };
+        }
         let compared: Vec<Option<Part>> = self
             .tests
             .iter()
@@ -977,7 +1018,7 @@ impl Sink for Probe<'_> {
                 )
             })
             .collect();
-        for &i in found {
+        for &i in &found {
             let met = self.joined.row(i as usize);
             let passes = self
                 .tests

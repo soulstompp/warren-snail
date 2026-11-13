@@ -1001,8 +1001,7 @@ impl KeySet {
     }
 
     /// The bytes every key held takes.
-    #[cfg(test)]
-    fn bytes(&self) -> u64 {
+    pub(super) fn bytes(&self) -> u64 {
         (self.bytes.len() + self.ends.len() * 8) as u64 + self.slots.bytes()
     }
 }
