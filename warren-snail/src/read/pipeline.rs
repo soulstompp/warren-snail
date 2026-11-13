@@ -643,7 +643,7 @@ pub(super) struct Frame<'a> {
 /// their sets give, in levels and in lockstep, each expression's value after the FROM's columns.
 /// `at` is each expression read from them, by its place in the text, and the value it reads; `n`
 /// how many there are.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Below {
     at: Vec<(*const Expr, usize)>,
     n: usize,
@@ -1350,7 +1350,7 @@ pub(super) fn qualified(names: &[String]) -> String {
 }
 
 /// The aggregates and windows an expression holds, found once each, by their place in the text.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Calls<'q> {
     aggregates: Vec<&'q Expr>,
     windows: Vec<&'q Expr>,
@@ -6870,6 +6870,7 @@ type Running = HashMap<*const Expr, HashMap<Vec<Key>, Value>>;
 
 /// A SELECT of the pipeline as it is read: what it returns, its windows and aggregates, and how it
 /// groups.
+#[derive(Clone)]
 pub(super) struct Prepared<'q> {
     from: &'q [TableWithJoins],
     selection: Option<&'q Expr>,
@@ -8004,6 +8005,7 @@ fn grouped_places(
 
 /// The rows a step returns of those it makes: its LIMIT's or FETCH FIRST's count, its OFFSET, and
 /// whether the rows that tie by its ORDER BY with the last it returns come too (WITH TIES).
+#[derive(Clone)]
 struct Limit<'q> {
     count: Count<'q>,
     offset: Option<&'q Expr>,
@@ -8012,6 +8014,7 @@ struct Limit<'q> {
 
 /// How many rows a step returns at most: all, one (a FETCH FIRST that gives no count), or as many
 /// as an expression says.
+#[derive(Clone)]
 enum Count<'q> {
     All,
     One,

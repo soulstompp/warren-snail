@@ -289,6 +289,10 @@ struct Plan<'q> {
     written: RefCell<Answers>,
     refused: RefCell<HashMap<String, String>>,
     kept: Kept,
+    /// Its statement read once a round, where it is one SELECT after steps reading nothing of the
+    /// query around it; and the columns of that query as it reads them.
+    read: OnceCell<Option<relations::Once>>,
+    around_columns: OnceCell<Vec<Col>>,
 }
 
 /// A step's subqueries, by their places in its query.
@@ -562,7 +566,7 @@ impl<'q> Plan<'q> {
             }
             let outer = Outer {
                 values: vec![Value::Null; columns.len()],
-                columns,
+                columns: columns.into(),
                 kept: &kept,
                 clause,
                 unseen: on.map(<[String]>::to_vec).unwrap_or_default(),
@@ -627,6 +631,8 @@ impl<'q> Plan<'q> {
                 in_order: std::cell::Cell::new(in_order),
                 ..Kept::default()
             },
+            read: OnceCell::new(),
+            around_columns: OnceCell::new(),
         })
     }
 }
@@ -640,6 +646,8 @@ pub(super) struct Subs<'a, 'q> {
     /// The step's columns, those of the query around it among them.
     columns: &'a [Col],
     accrued: &'a Accrued,
+    /// Each subquery's last step read off its text, once a round, by its plan.
+    ready: RefCell<HashMap<*const Plan<'q>, Option<Rc<relations::Ready<'a>>>>>,
 }
 
 impl Kept {
@@ -693,6 +701,7 @@ impl<'a, 'q> Subs<'a, 'q> {
             casings,
             columns,
             accrued,
+            ready: RefCell::default(),
         }
     }
 
@@ -713,7 +722,12 @@ impl<'a, 'q> Subs<'a, 'q> {
     /// What a subquery returns for a row: once, where it reads nothing of the query around it; else
     /// for the values the row gives what it names, and the group the aggregates of the step's it is
     /// handed, the query around it read from those alone.
-    fn returned(&self, plan: &Plan, row: &[Value], computed: &Computed) -> Result<Rc<Returned>> {
+    fn returned(
+        &self,
+        plan: &'a Plan<'q>,
+        row: &[Value],
+        computed: &Computed,
+    ) -> Result<Rc<Returned>> {
         let asked = Asked {
             answer_kept: true,
             ..self.asked
@@ -786,16 +800,11 @@ impl<'a, 'q> Subs<'a, 'q> {
         Ok(Some(Returned::of_rows(run.read_at(at, n)?)))
     }
 
-    /// The subquery made for a set of values.
-    fn answer_for(&self, plan: &Plan, values: Vec<Value>) -> Result<Rc<Returned>> {
-        let places = plan.around.as_ref().expect("a subquery reading around it");
+    /// The subquery made for a set of values: its last step run for them, where its statement is
+    /// read once a round; else its statement made for them.
+    fn answer_for(&self, plan: &'a Plan<'q>, values: Vec<Value>) -> Result<Rc<Returned>> {
         let outer = Outer {
-            columns: places
-                .iter()
-                .map(|&i| &self.columns[i])
-                .chain(&plan.lifted_columns)
-                .map(relations::marked)
-                .collect(),
+            columns: std::borrow::Cow::Borrowed(self.around_columns(plan)),
             values,
             kept: &plan.kept,
             clause: None,
@@ -810,6 +819,10 @@ impl<'a, 'q> Subs<'a, 'q> {
             answer_kept: true,
             ..self.asked
         };
+        if let Some(ready) = self.ready(plan, asked, &outer)? {
+            let m = ready.run(asked, Some(&outer), self.accrued, None)?;
+            return Returned::of(&plan.asks, m);
+        }
         let (m, _) = relations::made_by(
             asked,
             &plan.query,
@@ -819,6 +832,50 @@ impl<'a, 'q> Subs<'a, 'q> {
             self.accrued,
         )?;
         Returned::of(&plan.asks, m)
+    }
+
+    /// The columns of the query around a subquery reading it, as the subquery reads them.
+    fn around_columns(&self, plan: &'a Plan<'q>) -> &'a [Col] {
+        plan.around_columns.get_or_init(|| {
+            let places = plan.around.as_ref().expect("a subquery reading around it");
+            places
+                .iter()
+                .map(|&i| &self.columns[i])
+                .chain(&plan.lifted_columns)
+                .map(relations::marked)
+                .collect()
+        })
+    }
+
+    /// A subquery's last step read off its text, once a round; none where its statement is not
+    /// read so.
+    fn ready(
+        &self,
+        plan: &'a Plan<'q>,
+        asked: Asked,
+        outer: &Outer,
+    ) -> Result<Option<Rc<relations::Ready<'a>>>> {
+        let at = plan as *const Plan<'q>;
+        if let Some(r) = self.ready.borrow().get(&at) {
+            return Ok(r.clone());
+        }
+        if plan.read.get().is_none() {
+            let once = relations::Once::of(
+                asked,
+                &plan.query,
+                self.made,
+                self.casings,
+                outer,
+                self.accrued,
+            )?;
+            let _ = plan.read.set(once);
+        }
+        let ready = match plan.read.get() {
+            Some(Some(once)) => Some(Rc::new(once.ready(asked, outer, self.accrued)?)),
+            _ => None,
+        };
+        self.ready.borrow_mut().insert(at, ready.clone());
+        Ok(ready)
     }
 
     /// An answer kept for the rows that ask for its values again, where the room has room for it;

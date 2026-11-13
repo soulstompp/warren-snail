@@ -343,7 +343,7 @@ pub(super) struct Asked<'a> {
 /// The columns of the queries around a subquery, each qualifier marked once more for each query
 /// out, their values on the row it is answered for, and what its reads keep between rows.
 pub(super) struct Outer<'o> {
-    pub(super) columns: Vec<Col>,
+    pub(super) columns: std::borrow::Cow<'o, [Col]>,
     pub(super) values: Vec<Value>,
     pub(super) kept: &'o super::subqueries::Kept,
     /// The clause of the query around it that it stands in, where a refusal of an aggregate of that
@@ -2175,7 +2175,7 @@ impl Laying<'_> {
         }
         let outer = Outer {
             values: vec![Value::Null; columns.len()],
-            columns,
+            columns: columns.into(),
             kept: &kept,
             clause: None,
             unseen: Vec::new(),
@@ -2295,7 +2295,7 @@ impl Laying<'_> {
         }
         let outer = Outer {
             values: vec![Value::Null; columns.len()],
-            columns,
+            columns: columns.into(),
             kept: &kept,
             clause: None,
             unseen: Vec::new(),
@@ -2421,7 +2421,7 @@ impl Laying<'_> {
             let typed: Vec<TypedColumn> = self
                 .columns
                 .iter()
-                .chain(self.outer.iter().flat_map(|o| &o.columns))
+                .chain(self.outer.iter().flat_map(|o| o.columns.iter()))
                 .map(|c| (c.qualifier.clone(), c.name.clone(), c.ty))
                 .collect();
             pipeline::no_own_calls(e, &typed, "JOIN conditions")?;
@@ -3689,7 +3689,7 @@ impl Reading<'_> {
             values.extend(o.values.iter().cloned());
         }
         let outer = Outer {
-            columns,
+            columns: columns.into(),
             values,
             kept,
             clause: None,
@@ -5603,8 +5603,129 @@ fn select_step(
     accrued: &Accrued,
     arm_before: Option<&Made>,
 ) -> Result<Made> {
+    let (from, rows_read) = laid(asked, step, made, casings, outer)?;
+    let ready = Ready::of(
+        asked, step, &from, rows_read, made, casings, outer, accrued, false,
+    )?;
+    ready.run(asked, outer, accrued, arm_before)
+}
+
+/// A subquery's statement read once a round: each step before its last made, none of them reading
+/// the query around it, and its last, a SELECT, laid out, to be read off its text and run for each
+/// set of values that asks.
+pub(super) struct Once {
+    steps: Vec<Step>,
+    made: Steps,
+    casings: Casings,
+    from: From,
+    rows_read: Vec<(*const Expr, ColumnType)>,
+}
+
+impl Once {
+    /// A subquery's statement, `outer` laying the query around it; none where its last step is not
+    /// a SELECT or a step before it reads that query.
+    pub(super) fn of(
+        asked: Asked,
+        q: &Query,
+        before: &Steps,
+        casings: &Casings,
+        outer: &Outer,
+        accrued: &Accrued,
+    ) -> Result<Option<Once>> {
+        let catalog = asked.reads.catalog();
+        let visible: Vec<String> = before.keys().cloned().collect();
+        let mut steps = steps(catalog, q, &visible)?;
+        let selects = |s: &Step| {
+            s.set.is_none()
+                && s.recursion.is_none()
+                && s.name.is_empty()
+                && matches!(s.query.body.as_ref(), SetExpr::Select(_))
+        };
+        if !steps.last().is_some_and(selects) {
+            return Ok(None);
+        }
+        let mut arms = HashMap::new();
+        for s in &steps {
+            if let Some(a) = &s.set {
+                kept_arms(a, &mut arms);
+            }
+        }
+        let mut making = Making {
+            asked,
+            made: before.clone(),
+            casings: casings.clone(),
+            outer: None,
+            accrued,
+            held: 0,
+            arms,
+        };
+        let theirs: Vec<usize> = steps
+            .iter()
+            .filter_map(|s| s.recursion.as_ref())
+            .flat_map(|r| r.body.clone())
+            .collect();
+        let mut last = steps.pop().expect("a step");
+        for i in 0..steps.len() {
+            if theirs.contains(&i) {
+                continue;
+            }
+            let made = match steps[i].recursion.is_some() {
+                true => {
+                    let (before, rest) = steps.split_at_mut(i);
+                    recursive::make(&mut making, &rest[0], before)
+                        .and_then(|m| making.keep(&rest[0], m))
+                }
+                false => making.make(&mut steps[i]),
+            };
+            if made.is_err() {
+                return Ok(None);
+            }
+        }
+        let (made, casings) = (making.made, making.casings);
+        let (from, rows_read) = laid(asked, &mut last, &made, &casings, Some(outer))?;
+        steps.push(last);
+        Ok(Some(Once {
+            steps,
+            made,
+            casings,
+            from,
+            rows_read,
+        }))
+    }
+
+    /// Its last step read off its text, `outer` laying the query around it.
+    pub(super) fn ready(
+        &self,
+        asked: Asked,
+        outer: &Outer,
+        accrued: &Accrued,
+    ) -> Result<Ready<'_>> {
+        let mut casings = self.casings.clone();
+        Ready::of(
+            asked,
+            self.steps.last().expect("a step"),
+            &self.from,
+            self.rows_read.clone(),
+            &self.made,
+            &mut casings,
+            Some(outer),
+            accrued,
+            true,
+        )
+    }
+}
+
+/// A SELECT step's FROM laid out, its stars read as its columns, and the type of each relation's
+/// whole row it reads; the columns of the query around it after its own.
+fn laid(
+    asked: Asked,
+    step: &mut Step,
+    made: &Steps,
+    casings: &Casings,
+    outer: Option<&Outer>,
+) -> Result<(From, Vec<(*const Expr, ColumnType)>)> {
     let catalog = asked.reads.catalog();
-    let (params, release, now) = (asked.params, asked.release, asked.now);
+    let release = asked.release;
     // The FROM laid out, and its stars read as its columns.
     let mut from = {
         let SetExpr::Select(s) = step.query.body.as_ref() else {
@@ -5687,534 +5808,602 @@ fn select_step(
     if let Some(o) = outer {
         from.columns.extend(o.columns.iter().cloned());
     }
-    let step = &*step;
-    // An aggregate of the query's around a subquery alone is that query's, wherever in the
-    // subquery it stands: refused in PostgreSQL's words where the subquery stands in a clause of
-    // that query no aggregate may stand in.
-    if let Some(clause) = outer.and_then(|o| o.clause) {
-        if aggregate_around(&step.query, &from) {
-            return Err(Error::new(format!(
-                "aggregate functions are not allowed in {clause}"
-            )));
-        }
-    }
-    let (plans, mut seeded) =
-        super::subqueries::Plans::of(asked, &step.query, &from.columns, made, casings)?;
-    // A relation's whole row is of its row type.
-    seeded.extend(rows_read);
-    let typed = from.typed();
-    let mut keyed: Vec<(String, Vec<String>)> = Vec::new();
-    let mut joined: Vec<&Expr> = Vec::new();
-    let mut joins: Vec<&Node> = Vec::new();
-    {
-        let mut leaves = Vec::new();
-        for n in &from.items {
-            n.leaves(&mut leaves);
-        }
-        for l in &leaves {
-            match &l.what {
-                What::Table { table, qualifier, .. } => {
-                    let t = &catalog.tables[*table];
-                    let primary: Vec<String> = t
-                        .orders
-                        .iter()
-                        .find(|o| o.constraint.as_ref().is_some_and(|k| k.primary))
-                        .map(|o| {
-                            o.levels
-                                .iter()
-                                .map(|lv| t.columns[lv.column()].name.clone())
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    keyed.push((qualifier.clone(), primary));
-                }
-                What::Call { call, .. } => joined.extend(call.functions.iter().map(|c| &c.expr)),
-                _ => {}
-            }
-        }
-        fn ons<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
-            if let What::Join {
-                left, right, on, ..
-            } = &n.what
-            {
-                ons(left, out);
-                ons(right, out);
-                if on.is_some() {
-                    out.push(n);
-                }
-            }
-        }
-        for n in &from.items {
-            ons(n, &mut joins);
-        }
-        joined.extend(joins.iter().filter_map(|n| match &n.what {
-            What::Join { on, .. } => on.as_ref(),
-            _ => None,
-        }));
-    }
-    // A join's ON takes no set-returning function, refused with the FROM it is read in; and names
-    // only its two sides and the query around the step.
-    for n in &joins {
-        if let What::Join { on: Some(on), .. } = &n.what {
-            pipeline::sets_refused(on, "JOIN conditions")?;
-            on_names(&from, n, on)?;
-        }
-    }
-    // Each join's ON holding a subquery: its subqueries read as the pairs it meets are, over the
-    // join's two sides and the query's around the step; a FULL JOIN's checked once they are.
-    let mut on_plans: Vec<(*const Node, Vec<Col>, super::subqueries::Plans)> = Vec::new();
-    {
-        let mut leaves = Vec::new();
-        for n in &from.items {
-            n.leaves(&mut leaves);
-        }
-        for n in &joins {
-            let What::Join {
-                left,
-                right,
-                kind,
-                on: Some(on),
-                ..
-            } = &n.what
-            else {
-                continue;
-            };
-            let mut found = Vec::new();
-            pipeline::subqueries_in(on, &mut found);
-            if found.is_empty() {
-                continue;
-            }
-            let columns: Vec<Col> = from.columns[n.at..n.at + left.width + right.width]
-                .iter()
-                .chain(&from.columns[from.outer_at..])
-                .cloned()
-                .collect();
-            let unseen: Vec<String> = leaves
-                .iter()
-                .filter(|l| l.at < n.at)
-                .filter_map(|l| l.leaf_named().map(str::to_string))
-                .collect();
-            let full = *kind == Kind::Full;
-            let (p, types) = super::subqueries::Plans::of_on(
-                asked, on, &columns, made, casings, full, &unseen,
-            )?;
-            if full && !hashable(&from.columns, left, right, on, &|e| p.read_by(e)) {
-                return Err(Error::new(FULL_UNMET));
-            }
-            seeded.extend(types);
-            on_plans.push((*n as *const Node, columns, p));
-        }
-    }
-    // Each column of a table of the FROM of the domain its DDL gives it, for a row made of it.
-    let mut domains: Vec<Option<String>> = vec![None; typed.len()];
-    {
-        let mut leaves = Vec::new();
-        for n in &from.items {
-            n.leaves(&mut leaves);
-        }
-        for l in leaves {
-            match &l.what {
-                What::Table { table, .. } => {
-                    let t = &catalog.tables[*table];
-                    for (k, c) in stored(t).enumerate() {
-                        if let Some(d) = domains.get_mut(l.at + k) {
-                            d.clone_from(&t.columns[c].domain);
-                        }
-                    }
-                }
-                What::Made { name, .. } => {
-                    for (k, m) in super::handed::step_domains(name).into_iter().flatten().enumerate() {
-                        if let Some(d) = domains.get_mut(l.at + k) {
-                            *d = m;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    let _domains = typed::domains_held(domains);
-    let mut p = pipeline::prepare(
-        &step.query,
-        &typed,
-        &keyed,
-        release,
-        now,
-        &joined,
-        seeded,
-        plans.around(),
-    )?;
-    // A column it returns as it reads it, or cast to a domain, is of that domain for what reads it.
-    if let SetExpr::Select(s) = step.query.body.as_ref() {
-        let out = s
-            .projection
-            .iter()
-            .map(|i| match i {
-                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                    typed::domain_in(e, &typed)
-                }
-                _ => None,
-            })
-            .collect();
-        super::handed::step_made(&step.name, out);
-    }
-    let place = |q: &Option<String>, n: &str| {
-        pipeline::naming(
-            from.columns
-                .iter()
-                .map(|c| (c.qualifier.as_deref(), c.name.as_str())),
-            q.as_deref(),
-            n,
-        )
-    };
-    // An aggregate of the query's around a subquery alone is that query's: refused in PostgreSQL's
-    // words where the subquery stands in a clause of that query no aggregate may stand in.
-    if let Some(o) = outer {
-        for a in p.aggregates() {
-            let mut read = Vec::new();
-            pipeline::columns_read(a, &mut read);
-            let around = |(q, n): &(Option<String>, String)| {
-                place(q, n).first().is_some_and(|&i| i >= from.outer_at)
-            };
-            if !read.is_empty() && read.iter().all(around) {
-                return Err(Error::new(match o.clause {
-                    Some(c) => format!("aggregate functions are not allowed in {c}"),
-                    None => format!("{a} is not read: an aggregate of the query around a subquery"),
-                }));
-            }
-        }
-    }
-    // Each column it reads is one of its FROM's, refused before any row as PostgreSQL's parser
-    // refuses one it finds none or two of. A parse tree handed to pg_get_expr is read there alone.
-    let outside_trees: Vec<usize> = p
-        .reads_but_trees()
-        .iter()
-        .filter_map(|(q, n)| match place(q, n).as_slice() {
-            [one] => Some(*one),
-            _ => None,
-        })
-        .collect();
-    // A name read only in joins' ONs is the one each ON's sides hold, as `on_names` found it.
-    let ons: Vec<*const Expr> = joins
-        .iter()
-        .filter_map(|n| match &n.what {
-            What::Join { on: Some(on), .. } => Some(on as *const Expr),
-            _ => None,
-        })
-        .collect();
-    let beside = p.reads_beside(&ons);
-    for (q, n) in p.reads() {
-        let found = place(&q, &n);
-        if found.len() > 1 && !beside.contains(&(q.clone(), n.clone())) {
-            continue;
-        }
-        if let [one] = found.as_slice() {
-            if let Some(why) = from.refused.get(one).filter(|_| outside_trees.contains(one)) {
+    Ok((from, rows_read))
+}
+
+/// A SELECT step read off its text before any row: its subqueries' plans, its pipeline prepared,
+/// the words it writes, the conjuncts of its WHERE its FROM is read by and those that tie it to the
+/// query around it. A subquery's is read so once a round and run for each set of values that asks.
+pub(super) struct Ready<'s> {
+    step: &'s Step,
+    from: &'s From,
+    made: &'s Steps,
+    plans: super::subqueries::Plans<'s>,
+    on_plans: Vec<(*const Node, Vec<Col>, super::subqueries::Plans<'s>)>,
+    p: pipeline::Prepared<'s>,
+    casings: Casings,
+    domains: Vec<Option<String>>,
+    named: Named,
+    wheres: Vec<&'s Expr>,
+    tied: Vec<(&'s Expr, &'s Expr)>,
+    /// Whether a one-time condition of its WHERE does not hold, so its FROM gives no rows.
+    shut: bool,
+    /// Whether, as a subquery's, its FROM reads nothing of the query around it, read once and met
+    /// with each row by the =s that tie them.
+    keepable: bool,
+}
+
+impl<'s> Ready<'s> {
+    /// `made_once` where the steps before it were made once a round, reading nothing of the query
+    /// around it.
+    #[allow(clippy::too_many_arguments)]
+    fn of(
+        asked: Asked,
+        step: &'s Step,
+        from: &'s From,
+        rows_read: Vec<(*const Expr, ColumnType)>,
+        made: &'s Steps,
+        casings: &mut Casings,
+        outer: Option<&Outer>,
+        accrued: &Accrued,
+        made_once: bool,
+    ) -> Result<Ready<'s>> {
+        let catalog = asked.reads.catalog();
+        let (params, release, now) = (asked.params, asked.release, asked.now);
+        // An aggregate of the query's around a subquery alone is that query's, wherever in the
+        // subquery it stands: refused in PostgreSQL's words where the subquery stands in a clause
+        // of that query no aggregate may stand in.
+        if let Some(clause) = outer.and_then(|o| o.clause) {
+            if aggregate_around(&step.query, from) {
                 return Err(Error::new(format!(
-                    "{why}, only a running server's, and a snail has no server: it is not read"
+                    "aggregate functions are not allowed in {clause}"
                 )));
             }
         }
-        if let Some(e) = q.as_deref().and_then(|q| pipeline::too_many_names(q, &n)) {
-            return Err(e);
-        }
-        match (found.len(), q) {
-            (1, _) => {}
-            (0, Some(q))
-                if !from
-                    .columns
-                    .iter()
-                    .any(|c| pipeline::answers_to(c.qualifier.as_deref(), &q)) =>
-            {
-                return Err(from.no_entry(catalog, &q))
+        let (plans, mut seeded) =
+            super::subqueries::Plans::of(asked, &step.query, &from.columns, made, casings)?;
+        // A relation's whole row is of its row type.
+        seeded.extend(rows_read);
+        let typed = from.typed();
+        let mut keyed: Vec<(String, Vec<String>)> = Vec::new();
+        let mut joined: Vec<&Expr> = Vec::new();
+        let mut joins: Vec<&Node> = Vec::new();
+        {
+            let mut leaves = Vec::new();
+            for n in &from.items {
+                n.leaves(&mut leaves);
             }
-            (0, Some(q)) => return Err(from.no_column(catalog, Some(&q), &n)),
-            (0, None) => return Err(from.no_column(catalog, None, &n)),
-            _ => return Err(Error::new(format!("column reference \"{n}\" is ambiguous"))),
-        }
-    }
-    let carried: Vec<(Option<String>, String, Carried)> = from
-        .columns
-        .iter()
-        .map(|c| (c.qualifier.clone(), c.name.clone(), c.carried.clone()))
-        .collect();
-    p.carried = casings.add_step(&step.name, &p, &carried)?;
-    let casings: &Casings = casings;
-    // The FROM's rows.
-    // The words it writes, its functions' calls and LATERAL subqueries among them.
-    let text = std::iter::once(step.query.to_string())
-        .chain(
-            step.calls
-                .iter()
-                .flat_map(|c| &c.functions)
-                .map(|c| c.expr.to_string()),
-        )
-        .chain(step.laterals.iter().map(|(q, _)| q.to_string()))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let named = Named::of(&text);
-    let mut wheres = Vec::new();
-    if let SetExpr::Select(s) = step.query.body.as_ref() {
-        if let Some(w) = &s.selection {
-            conjuncts(w, &mut wheres);
-        }
-    }
-    let tied = ties(&wheres, &from, &p.types, casings);
-    // A conjunct reading no column, its subqueries reading nothing of the query around it, is read
-    // once before any row, as PostgreSQL's one-time filter is: where it does not hold, the FROM gives
-    // no rows.
-    let mut shut = false;
-    let gates: Vec<&Expr> = wheres
-        .iter()
-        .copied()
-        .filter(|w| {
-            let mut read = Vec::new();
-            pipeline::columns_read(w, &mut read);
-            read.is_empty() && plans.only_once(w)
-        })
-        .collect();
-    if !gates.is_empty() {
-        let subs =
-            super::subqueries::Subs::new(&plans, asked, made, casings, &from.columns, accrued);
-        let frame = pipeline::Frame {
-            columns: from.frame_columns(0, from.columns.len()),
-            params,
-            release,
-            casings,
-            types: &p.types,
-            now,
-            subqueries: Some(&subs),
-            reads: Some(asked.reads),
-            below: None,
-        };
-        let row = vec![Value::Null; from.columns.len()];
-        for g in gates {
-            let v = pipeline::holds(g, &row, &frame, &pipeline::computed_none())?;
-            if v != Some(true) {
-                shut = true;
-                break;
-            }
-        }
-    }
-    // A conjunct naming the query around it is the pipeline's alone.
-    let around: Vec<&str> = from.columns[from.outer_at..]
-        .iter()
-        .flat_map(|c| {
-            std::iter::once(c.name.as_str()).chain(c.qualifier.as_deref().map(pipeline::unmarked))
-        })
-        .collect();
-    wheres.retain(|w| {
-        !words(&w.to_string())
-            .iter()
-            .any(|x| around.contains(&x.as_str()))
-    });
-    let mut leaves = Vec::new();
-    for n in &from.items {
-        n.leaves(&mut leaves);
-    }
-    let run_types = p.types.clone();
-    let windowed = !p.windows().is_empty();
-    // A join's ON naming the query around it meets other pairs for each row that asks.
-    let on_around = joins.iter().any(|n| match &n.what {
-        What::Join { on: Some(e), .. } => words(&e.to_string())
-            .iter()
-            .any(|x| around.contains(&x.as_str())),
-        _ => false,
-    });
-    let kept = outer.filter(|_| {
-        !on_around && leaves.iter().all(|l| matches!(l.what, What::Table { .. }))
-    });
-    let names: Vec<String> = from.columns.iter().map(|c| c.name.clone()).collect();
-    let columns: Columns = from
-        .columns
-        .iter()
-        .map(|c| (c.qualifier.clone(), c.name.clone()))
-        .collect();
-    let types = p.returns.clone();
-    let carried = p.carried.clone();
-    // A step the steps after it read keeps its rows in the round's room as it makes them, those past
-    // it written; the answer is the caller's.
-    let run_out = (!step.name.is_empty() || asked.answer_kept).then(super::spill::Run::new);
-    let mut gathered: Vec<Vec<Value>> = Vec::new();
-    let mut put = |rows: Vec<Vec<Value>>| -> Result<()> {
-        match &run_out {
-            Some(run) => rows.into_iter().try_for_each(|r| run.push(r)),
-            None => {
-                gathered.extend(rows);
-                Ok(())
-            }
-        }
-    };
-    let subs = super::subqueries::Subs::new(&plans, asked, made, casings, &from.columns, accrued);
-    let on_subs: Vec<(*const Node, super::subqueries::Subs)> = on_plans
-        .iter()
-        .map(|(n, columns, p)| {
-            (
-                *n,
-                super::subqueries::Subs::new(p, asked, made, casings, columns, accrued),
-            )
-        })
-        .collect();
-    let ons: Ons = on_subs
-        .iter()
-        .map(|(n, s)| (*n, s as &dyn pipeline::Subqueries))
-        .collect();
-    let mut run = pipeline::StepRun::new(p);
-    run.hands_on = true;
-    run.reads = Some(asked.reads);
-    if !plans.is_empty() {
-        run.subqueries = Some(&subs);
-    }
-    if let Some(o) = outer {
-        let mut row = vec![Value::Null; from.outer_at];
-        row.extend(o.values.iter().cloned());
-        run.empty_row = Some(row);
-    }
-    let fed = std::cell::Cell::new(false);
-    let mut order_out = None;
-    // A step of its own over one relation, or a join of relations, with no subquery asked after it,
-    // may have its rows come in the order a strand of its first table gives.
-    let wanted_along = match (&kept, arm_before, shut) {
-        (None, None, false) if from.items.len() == 1 => super::strands::wants(&step.query),
-        _ => None,
-    };
-    let in_order: std::cell::Cell<Option<super::strands::Led>> =
-        std::cell::Cell::new(wanted_along.as_ref().map(|w| w.led));
-    let along_wanted = wanted_along.as_ref().map(|w| (w, &in_order));
-    let rows_known: std::cell::Cell<Option<u64>> = std::cell::Cell::new(None);
-    let mut feed = |mut rows: Vec<Vec<Value>>, order: Option<usize>| -> Result<()> {
-        if !fed.get() {
-            if let Some(led) = in_order.get() {
-                run.along(led);
-            }
-            if let Some(n) = rows_known.get() {
-                run.expect_rows(n);
-            }
-        }
-        fed.set(true);
-        if let Some(o) = outer {
-            for r in &mut rows {
-                r.extend(o.values.iter().cloned());
-            }
-        }
-        let rel = Relation {
-            names: names.clone(),
-            rows,
-            order,
-        };
-        if let Some(out) = run.feed(rel, columns.clone(), params, release, casings)? {
-            order_out = out.order;
-            put(out.rows)?;
-        }
-        Ok(())
-    };
-    match kept {
-        _ if shut => {}
-        // A subquery's FROM of tables alone reads nothing of the query around it: read once, and
-        // met with each row by the =s that tie them.
-        Some(o) => {
-            let found = o.kept.rows.borrow().get(&step.name).cloned();
-            let tie = Tie {
-                tied: &tied,
-                from: &from,
-                asked,
-                casings,
-                types: &run_types,
-            };
-            let parted = match found {
-                Some(p) => p,
-                None => {
-                    let keeps = tied_keeps(&tied, &from, o, asked, casings, &run_types)?;
-                    let in_passes = !tied.is_empty()
-                        && o.kept.in_order.get()
-                        && o.kept.around.borrow().is_some()
-                        && o.kept.rows.borrow().is_empty();
-                    let read = |each: Each| {
-                        read_from(
-                            asked,
-                            &from,
-                            &named,
-                            wheres.clone(),
-                            casings,
-                            &run_types,
-                            made,
-                            accrued,
-                            &step.laterals,
-                            outer,
-                            &ons,
-                            keeps.clone(),
-                            &rows_known,
-                            None,
-                            each,
-                        )
-                    };
-                    let parted = Rc::new(Parted::read(&tie, in_passes, &rows_known, read)?);
-                    o.kept
-                        .rows
-                        .borrow_mut()
-                        .insert(step.name.clone(), parted.clone());
-                    // Past the room, the answers are made in the order of the keys' hashes: this
-                    // row's among them.
-                    if parted.in_passes() {
-                        tie.in_hash_order(o)?;
-                        o.kept.answers_now.set(true);
-                        feed(Vec::new(), None)?;
-                        return Ok(Made::of(
-                            Relation {
-                                names: Vec::new(),
-                                rows: Vec::new(),
-                                order: None,
-                            },
-                            types,
-                            carried,
-                        ));
+            for l in &leaves {
+                match &l.what {
+                    What::Table { table, qualifier, .. } => {
+                        let t = &catalog.tables[*table];
+                        let primary: Vec<String> = t
+                            .orders
+                            .iter()
+                            .find(|o| o.constraint.as_ref().is_some_and(|k| k.primary))
+                            .map(|o| {
+                                o.levels
+                                    .iter()
+                                    .map(|lv| t.columns[lv.column()].name.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        keyed.push((qualifier.clone(), primary));
                     }
-                    parted
+                    What::Call { call, .. } => {
+                        joined.extend(call.functions.iter().map(|c| &c.expr))
+                    }
+                    _ => {}
                 }
-            };
-            parted.rows_for(&tie, o, &mut feed)?;
-        }
-        None => {
-            let keeps = match arm_before {
-                Some(m)
-                    if !windowed
-                        && step.query.limit_clause.is_none()
-                        && step.query.fetch.is_none() =>
+            }
+            fn ons<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
+                if let What::Join {
+                    left, right, on, ..
+                } = &n.what
                 {
-                    arm_keeps(&step.query, &from, m)?
+                    ons(left, out);
+                    ons(right, out);
+                    if on.is_some() {
+                        out.push(n);
+                    }
                 }
-                _ => Vec::new(),
+            }
+            for n in &from.items {
+                ons(n, &mut joins);
+            }
+            joined.extend(joins.iter().filter_map(|n| match &n.what {
+                What::Join { on, .. } => on.as_ref(),
+                _ => None,
+            }));
+        }
+        // A join's ON takes no set-returning function, refused with the FROM it is read in; and
+        // names only its two sides and the query around the step.
+        for n in &joins {
+            if let What::Join { on: Some(on), .. } = &n.what {
+                pipeline::sets_refused(on, "JOIN conditions")?;
+                on_names(from, n, on)?;
+            }
+        }
+        // Each join's ON holding a subquery: its subqueries read as the pairs it meets are, over
+        // the join's two sides and the query's around the step; a FULL JOIN's checked once they
+        // are.
+        let mut on_plans: Vec<(*const Node, Vec<Col>, super::subqueries::Plans)> = Vec::new();
+        {
+            let mut leaves = Vec::new();
+            for n in &from.items {
+                n.leaves(&mut leaves);
+            }
+            for n in &joins {
+                let What::Join {
+                    left,
+                    right,
+                    kind,
+                    on: Some(on),
+                    ..
+                } = &n.what
+                else {
+                    continue;
+                };
+                let mut found = Vec::new();
+                pipeline::subqueries_in(on, &mut found);
+                if found.is_empty() {
+                    continue;
+                }
+                let columns: Vec<Col> = from.columns[n.at..n.at + left.width + right.width]
+                    .iter()
+                    .chain(&from.columns[from.outer_at..])
+                    .cloned()
+                    .collect();
+                let unseen: Vec<String> = leaves
+                    .iter()
+                    .filter(|l| l.at < n.at)
+                    .filter_map(|l| l.leaf_named().map(str::to_string))
+                    .collect();
+                let full = *kind == Kind::Full;
+                let (p, types) = super::subqueries::Plans::of_on(
+                    asked, on, &columns, made, casings, full, &unseen,
+                )?;
+                if full && !hashable(&from.columns, left, right, on, &|e| p.read_by(e)) {
+                    return Err(Error::new(FULL_UNMET));
+                }
+                seeded.extend(types);
+                on_plans.push((*n as *const Node, columns, p));
+            }
+        }
+        // Each column of a table of the FROM of the domain its DDL gives it, for a row made of it.
+        let mut domains: Vec<Option<String>> = vec![None; typed.len()];
+        {
+            let mut leaves = Vec::new();
+            for n in &from.items {
+                n.leaves(&mut leaves);
+            }
+            for l in leaves {
+                match &l.what {
+                    What::Table { table, .. } => {
+                        let t = &catalog.tables[*table];
+                        for (k, c) in stored(t).enumerate() {
+                            if let Some(d) = domains.get_mut(l.at + k) {
+                                d.clone_from(&t.columns[c].domain);
+                            }
+                        }
+                    }
+                    What::Made { name, .. } => {
+                        let made = super::handed::step_domains(name);
+                        for (k, m) in made.into_iter().flatten().enumerate() {
+                            if let Some(d) = domains.get_mut(l.at + k) {
+                                *d = m;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let _domains = typed::domains_held(domains.clone());
+        let mut p = pipeline::prepare(
+            &step.query,
+            &typed,
+            &keyed,
+            release,
+            now,
+            &joined,
+            seeded,
+            plans.around(),
+        )?;
+        // A column it returns as it reads it, or cast to a domain, is of that domain for what
+        // reads it.
+        if let SetExpr::Select(s) = step.query.body.as_ref() {
+            let out = s
+                .projection
+                .iter()
+                .map(|i| match i {
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                        typed::domain_in(e, &typed)
+                    }
+                    _ => None,
+                })
+                .collect();
+            super::handed::step_made(&step.name, out);
+        }
+        let place = |q: &Option<String>, n: &str| {
+            pipeline::naming(
+                from.columns
+                    .iter()
+                    .map(|c| (c.qualifier.as_deref(), c.name.as_str())),
+                q.as_deref(),
+                n,
+            )
+        };
+        // An aggregate of the query's around a subquery alone is that query's: refused in
+        // PostgreSQL's words where the subquery stands in a clause of that query no aggregate may
+        // stand in.
+        if let Some(o) = outer {
+            for a in p.aggregates() {
+                let mut read = Vec::new();
+                pipeline::columns_read(a, &mut read);
+                let around = |(q, n): &(Option<String>, String)| {
+                    place(q, n).first().is_some_and(|&i| i >= from.outer_at)
+                };
+                if !read.is_empty() && read.iter().all(around) {
+                    return Err(Error::new(match o.clause {
+                        Some(c) => format!("aggregate functions are not allowed in {c}"),
+                        None => format!(
+                            "{a} is not read: an aggregate of the query around a subquery"
+                        ),
+                    }));
+                }
+            }
+        }
+        // Each column it reads is one of its FROM's, refused before any row as PostgreSQL's parser
+        // refuses one it finds none or two of. A parse tree handed to pg_get_expr is read there
+        // alone.
+        let outside_trees: Vec<usize> = p
+            .reads_but_trees()
+            .iter()
+            .filter_map(|(q, n)| match place(q, n).as_slice() {
+                [one] => Some(*one),
+                _ => None,
+            })
+            .collect();
+        // A name read only in joins' ONs is the one each ON's sides hold, as `on_names` found it.
+        let ons: Vec<*const Expr> = joins
+            .iter()
+            .filter_map(|n| match &n.what {
+                What::Join { on: Some(on), .. } => Some(on as *const Expr),
+                _ => None,
+            })
+            .collect();
+        let beside = p.reads_beside(&ons);
+        for (q, n) in p.reads() {
+            let found = place(&q, &n);
+            if found.len() > 1 && !beside.contains(&(q.clone(), n.clone())) {
+                continue;
+            }
+            if let [one] = found.as_slice() {
+                if let Some(why) = from.refused.get(one).filter(|_| outside_trees.contains(one)) {
+                    return Err(Error::new(format!(
+                        "{why}, only a running server's, and a snail has no server: it is not read"
+                    )));
+                }
+            }
+            if let Some(e) = q.as_deref().and_then(|q| pipeline::too_many_names(q, &n)) {
+                return Err(e);
+            }
+            match (found.len(), q) {
+                (1, _) => {}
+                (0, Some(q))
+                    if !from
+                        .columns
+                        .iter()
+                        .any(|c| pipeline::answers_to(c.qualifier.as_deref(), &q)) =>
+                {
+                    return Err(from.no_entry(catalog, &q))
+                }
+                (0, Some(q)) => return Err(from.no_column(catalog, Some(&q), &n)),
+                (0, None) => return Err(from.no_column(catalog, None, &n)),
+                _ => return Err(Error::new(format!("column reference \"{n}\" is ambiguous"))),
+            }
+        }
+        let carried: Vec<(Option<String>, String, Carried)> = from
+            .columns
+            .iter()
+            .map(|c| (c.qualifier.clone(), c.name.clone(), c.carried.clone()))
+            .collect();
+        p.carried = casings.add_step(&step.name, &p, &carried)?;
+        let casings: &Casings = casings;
+        // The FROM's rows.
+        // The words it writes, its functions' calls and LATERAL subqueries among them.
+        let text = std::iter::once(step.query.to_string())
+            .chain(
+                step.calls
+                    .iter()
+                    .flat_map(|c| &c.functions)
+                    .map(|c| c.expr.to_string()),
+            )
+            .chain(step.laterals.iter().map(|(q, _)| q.to_string()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let named = Named::of(&text);
+        let mut wheres = Vec::new();
+        if let SetExpr::Select(s) = step.query.body.as_ref() {
+            if let Some(w) = &s.selection {
+                conjuncts(w, &mut wheres);
+            }
+        }
+        let tied = ties(&wheres, from, &p.types, casings);
+        // A conjunct reading no column, its subqueries reading nothing of the query around it, is
+        // read once before any row, as PostgreSQL's one-time filter is: where it does not hold, the
+        // FROM gives no rows.
+        let mut shut = false;
+        let gates: Vec<&Expr> = wheres
+            .iter()
+            .copied()
+            .filter(|w| {
+                let mut read = Vec::new();
+                pipeline::columns_read(w, &mut read);
+                read.is_empty() && plans.only_once(w)
+            })
+            .collect();
+        if !gates.is_empty() {
+            let subs =
+                super::subqueries::Subs::new(&plans, asked, made, casings, &from.columns, accrued);
+            let frame = pipeline::Frame {
+                columns: from.frame_columns(0, from.columns.len()),
+                params,
+                release,
+                casings,
+                types: &p.types,
+                now,
+                subqueries: Some(&subs),
+                reads: Some(asked.reads),
+                below: None,
             };
-            // A step holding subqueries has every row of its FROM before the first asks, and reads
-            // no table while it reads its rows: any other is handed them as they come.
-            match plans.is_empty() {
-                true => read_from(
+            let row = vec![Value::Null; from.columns.len()];
+            for g in gates {
+                let v = pipeline::holds(g, &row, &frame, &pipeline::computed_none())?;
+                if v != Some(true) {
+                    shut = true;
+                    break;
+                }
+            }
+        }
+        // A conjunct naming the query around it is the pipeline's alone.
+        let around: Vec<&str> = from.columns[from.outer_at..]
+            .iter()
+            .flat_map(|c| {
+                std::iter::once(c.name.as_str())
+                    .chain(c.qualifier.as_deref().map(pipeline::unmarked))
+            })
+            .collect();
+        wheres.retain(|w| {
+            !words(&w.to_string())
+                .iter()
+                .any(|x| around.contains(&x.as_str()))
+        });
+        let mut leaves = Vec::new();
+        for n in &from.items {
+            n.leaves(&mut leaves);
+        }
+        // A join's ON naming the query around it meets other pairs for each row that asks.
+        let on_around = joins.iter().any(|n| match &n.what {
+            What::Join { on: Some(e), .. } => words(&e.to_string())
+                .iter()
+                .any(|x| around.contains(&x.as_str())),
+            _ => false,
+        });
+        let keepable = !on_around
+            && leaves.iter().all(|l| match l.what {
+                What::Table { .. } => true,
+                What::Made { .. } => made_once,
+                _ => false,
+            });
+        Ok(Ready {
+            step,
+            from,
+            made,
+            plans,
+            on_plans,
+            p,
+            casings: casings.clone(),
+            domains,
+            named,
+            wheres,
+            tied,
+            shut,
+            keepable,
+        })
+    }
+
+    /// The step run: its FROM read, then each row read as the pipeline reads it; a subquery's for
+    /// the values `outer` gives the query around it.
+    pub(super) fn run(
+        &self,
+        asked: Asked,
+        outer: Option<&Outer>,
+        accrued: &Accrued,
+        arm_before: Option<&Made>,
+    ) -> Result<Made> {
+        let _domains = typed::domains_held(self.domains.clone());
+        let (params, release, made) = (asked.params, asked.release, self.made);
+        let (step, from, plans, casings) = (self.step, self.from, &self.plans, &self.casings);
+        let (named, tied, shut) = (&self.named, &self.tied, self.shut);
+        let wheres = &self.wheres;
+        let run_types = &self.p.types;
+        let windowed = !self.p.windows().is_empty();
+        let kept = outer.filter(|_| self.keepable);
+        let names: Vec<String> = from.columns.iter().map(|c| c.name.clone()).collect();
+        let columns: Columns = from
+            .columns
+            .iter()
+            .map(|c| (c.qualifier.clone(), c.name.clone()))
+            .collect();
+        let types = self.p.returns.clone();
+        let carried = self.p.carried.clone();
+        // A step the steps after it read keeps its rows in the round's room as it makes them, those
+        // past it written; the answer is the caller's.
+        let run_out = (!step.name.is_empty() || asked.answer_kept).then(super::spill::Run::new);
+        let mut gathered: Vec<Vec<Value>> = Vec::new();
+        let mut put = |rows: Vec<Vec<Value>>| -> Result<()> {
+            match &run_out {
+                Some(run) => rows.into_iter().try_for_each(|r| run.push(r)),
+                None => {
+                    gathered.extend(rows);
+                    Ok(())
+                }
+            }
+        };
+        let subs =
+            super::subqueries::Subs::new(plans, asked, made, casings, &from.columns, accrued);
+        let on_subs: Vec<(*const Node, super::subqueries::Subs)> = self
+            .on_plans
+            .iter()
+            .map(|(n, columns, p)| {
+                (
+                    *n,
+                    super::subqueries::Subs::new(p, asked, made, casings, columns, accrued),
+                )
+            })
+            .collect();
+        let ons: Ons = on_subs
+            .iter()
+            .map(|(n, s)| (*n, s as &dyn pipeline::Subqueries))
+            .collect();
+        let mut run = pipeline::StepRun::new(self.p.clone());
+        run.hands_on = true;
+        run.reads = Some(asked.reads);
+        if !plans.is_empty() {
+            run.subqueries = Some(&subs);
+        }
+        if let Some(o) = outer {
+            let mut row = vec![Value::Null; from.outer_at];
+            row.extend(o.values.iter().cloned());
+            run.empty_row = Some(row);
+        }
+        let fed = std::cell::Cell::new(false);
+        let mut order_out = None;
+        // A step of its own over one relation, or a join of relations, with no subquery asked after
+        // it, may have its rows come in the order a strand of its first table gives.
+        let wanted_along = match (&kept, arm_before, shut) {
+            (None, None, false) if from.items.len() == 1 => super::strands::wants(&step.query),
+            _ => None,
+        };
+        let in_order: std::cell::Cell<Option<super::strands::Led>> =
+            std::cell::Cell::new(wanted_along.as_ref().map(|w| w.led));
+        let along_wanted = wanted_along.as_ref().map(|w| (w, &in_order));
+        let rows_known: std::cell::Cell<Option<u64>> = std::cell::Cell::new(None);
+        let mut feed = |mut rows: Vec<Vec<Value>>, order: Option<usize>| -> Result<()> {
+            if !fed.get() {
+                if let Some(led) = in_order.get() {
+                    run.along(led);
+                }
+                if let Some(n) = rows_known.get() {
+                    run.expect_rows(n);
+                }
+            }
+            fed.set(true);
+            if let Some(o) = outer {
+                for r in &mut rows {
+                    r.extend(o.values.iter().cloned());
+                }
+            }
+            let rel = Relation {
+                names: names.clone(),
+                rows,
+                order,
+            };
+            if let Some(out) = run.feed(rel, columns.clone(), params, release, casings)? {
+                order_out = out.order;
+                put(out.rows)?;
+            }
+            Ok(())
+        };
+        match kept {
+            _ if shut => {}
+            // A subquery's FROM of tables alone reads nothing of the query around it: read once,
+            // and met with each row by the =s that tie them.
+            Some(o) => {
+                let found = o.kept.rows.borrow().get(&step.name).cloned();
+                let tie = Tie {
+                    tied,
+                    from,
                     asked,
-                    &from,
-                    &named,
-                    wheres,
                     casings,
-                    &run_types,
-                    made,
-                    accrued,
-                    &step.laterals,
-                    outer,
-                    &ons,
-                    keeps,
-                    &rows_known,
-                    along_wanted,
-                    &mut feed,
-                )?,
-                false => {
-                    let place = super::spill::Run::new();
-                    let mut order = None;
-                    read_from(
+                    types: run_types,
+                };
+                let parted = match found {
+                    Some(p) => p,
+                    None => {
+                        let keeps = tied_keeps(tied, from, o, asked, casings, run_types)?;
+                        let in_passes = !tied.is_empty()
+                            && o.kept.in_order.get()
+                            && o.kept.around.borrow().is_some()
+                            && o.kept.rows.borrow().is_empty();
+                        let read = |each: Each| {
+                            read_from(
+                                asked,
+                                from,
+                                named,
+                                wheres.clone(),
+                                casings,
+                                run_types,
+                                made,
+                                accrued,
+                                &step.laterals,
+                                outer,
+                                &ons,
+                                keeps.clone(),
+                                &rows_known,
+                                None,
+                                each,
+                            )
+                        };
+                        let parted = Rc::new(Parted::read(&tie, in_passes, &rows_known, read)?);
+                        o.kept
+                            .rows
+                            .borrow_mut()
+                            .insert(step.name.clone(), parted.clone());
+                        // Past the room, the answers are made in the order of the keys' hashes:
+                        // this row's among them.
+                        if parted.in_passes() {
+                            tie.in_hash_order(o)?;
+                            o.kept.answers_now.set(true);
+                            feed(Vec::new(), None)?;
+                            return Ok(Made::of(
+                                Relation {
+                                    names: Vec::new(),
+                                    rows: Vec::new(),
+                                    order: None,
+                                },
+                                types,
+                                carried,
+                            ));
+                        }
+                        parted
+                    }
+                };
+                parted.rows_for(&tie, o, &mut feed)?;
+            }
+            None => {
+                let keeps = match arm_before {
+                    Some(m)
+                        if !windowed
+                            && step.query.limit_clause.is_none()
+                            && step.query.fetch.is_none() =>
+                    {
+                        arm_keeps(&step.query, from, m)?
+                    }
+                    _ => Vec::new(),
+                };
+                // A step holding subqueries has every row of its FROM before the first asks, and
+                // reads no table while it reads its rows: any other is handed them as they come.
+                match plans.is_empty() {
+                    true => read_from(
                         asked,
-                        &from,
-                        &named,
-                        wheres,
+                        from,
+                        named,
+                        wheres.clone(),
                         casings,
-                        &run_types,
+                        run_types,
                         made,
                         accrued,
                         &step.laterals,
@@ -6223,36 +6412,57 @@ fn select_step(
                         keeps,
                         &rows_known,
                         along_wanted,
-                        &mut |c, at| {
-                            order = at;
-                            c.into_iter().try_for_each(|r| place.push(r))
-                        },
-                    )?;
-                    place.seal()?;
-                    let place = super::spill::Rows::one(place);
-                    rows_known.set(Some(place.len() as u64));
-                    subs.foresee(&place)?;
-                    place.each_chunk(&mut |c| feed(c, order))?;
+                        &mut feed,
+                    )?,
+                    false => {
+                        let place = super::spill::Run::new();
+                        let mut order = None;
+                        read_from(
+                            asked,
+                            from,
+                            named,
+                            wheres.clone(),
+                            casings,
+                            run_types,
+                            made,
+                            accrued,
+                            &step.laterals,
+                            outer,
+                            &ons,
+                            keeps,
+                            &rows_known,
+                            along_wanted,
+                            &mut |c, at| {
+                                order = at;
+                                c.into_iter().try_for_each(|r| place.push(r))
+                            },
+                        )?;
+                        place.seal()?;
+                        let place = super::spill::Rows::one(place);
+                        rows_known.set(Some(place.len() as u64));
+                        subs.foresee(&place)?;
+                        place.each_chunk(&mut |c| feed(c, order))?;
+                    }
                 }
             }
         }
+        if !fed.get() {
+            feed(Vec::new(), None)?;
+        }
+        let (names_out, tail_order) = run.finish_each(params, release, casings, &mut put)?;
+        order_out = order_out.or(tail_order);
+        let rel = Relation {
+            names: names_out,
+            rows: gathered,
+            order: order_out,
+        };
+        let mut m = Made::of(rel, types, carried);
+        if let Some(run) = run_out {
+            run.seal()?;
+            m.kept = Some(super::spill::Rows::one(run));
+        }
+        Ok(m)
     }
-    if !fed.get() {
-        feed(Vec::new(), None)?;
-    }
-    let (names_out, tail_order) = run.finish_each(params, release, casings, &mut put)?;
-    order_out = order_out.or(tail_order);
-    let rel = Relation {
-        names: names_out,
-        rows: gathered,
-        order: order_out,
-    };
-    let mut m = Made::of(rel, types, carried);
-    if let Some(run) = run_out {
-        run.seal()?;
-        m.kept = Some(super::spill::Rows::one(run));
-    }
-    Ok(m)
 }
 
 /// What the rows that ask for a subquery hold of the columns its =s tie to the query around it:
