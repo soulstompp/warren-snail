@@ -399,17 +399,3 @@ fn a_uuid_is_written_from_its_spellings_and_its_defaults_hand_out_a_v4_and_risin
         .contains("is of type uuid but expression is of type text"));
 }
 
-#[test]
-#[cfg(feature = "standalone")]
-fn a_snail_of_format_eight_refuses_a_uuid_by_name() {
-    let catalog = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.k (id uuid NOT NULL, PRIMARY KEY (id));").unwrap();
-    let path = tmp("uuid-eight.snail");
-    let e = warren_snail::write::write_format_eight(&path, &catalog, &[], weather::span())
-        .err()
-        .unwrap()
-        .to_string();
-    assert!(
-        e.contains("s.k.id is uuid, which a snail of format 8 cannot hold") && e.contains("`out`"),
-        "{e}"
-    );
-}

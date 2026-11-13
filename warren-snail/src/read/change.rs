@@ -17,8 +17,7 @@ use crate::directory::{
 };
 use crate::encode::{decode_leaf, tail_pages};
 use crate::file::{
-    decode_free, encode_free, Extent, Place, Root, Run, Writer, FORMAT, FORMAT_SEVEN, REUSED_KEPT,
-    STAGED,
+    decode_free, encode_free, Extent, Place, Root, Run, Writer, REUSED_KEPT, STAGED,
 };
 use crate::lock;
 
@@ -1736,12 +1735,6 @@ impl Snail {
     fn marked(&mut self, source: Option<&str>) -> Result<Done> {
         if source == Some("") {
             return Err(Error::new("a replica's source is named: the name is empty"));
-        }
-        if source.is_some() && self.reader.format() < crate::file::FORMAT {
-            return Err(Error::new(format!(
-                "a snail of format {} is marked a replica of no source: `out`, then `write`",
-                self.reader.format()
-            )));
         }
         if self.begun.is_none() && self.rounds > 0 {
             self.renew()?;
@@ -3480,11 +3473,11 @@ impl Snail {
         // The free map: its runs whose tag no older round still runs under are free now, and the
         // commit takes pages from the free runs first.
         let (mut runs, mut spent) = if root.free.bytes > 0 {
-            decode_free(&self.reader.read_extent(root.free)?, w.format())?
+            decode_free(&self.reader.read_extent(root.free)?)?
         } else {
             (Vec::new(), Vec::new())
         };
-        let mut maps = MapPages::new(w.format() != FORMAT_SEVEN);
+        let mut maps = MapPages::new(true);
         let mut gone: Vec<Extent> = Vec::new();
         if root.free.bytes > 0 {
             gone.push(root.free);
@@ -3574,8 +3567,7 @@ impl Snail {
             for (tn, on) in &d.made {
                 if let Some(t) = self.catalog.table(tn) {
                     if let Some(o) = t.orders.iter().find(|x| x.name == *on) {
-                        let top =
-                            w.place(&encode_top(&empty_head(t, o, self.reader.format()), &[]))?;
+                        let top = w.place(&encode_top(&empty_head(t, o), &[]))?;
                         orders.push((tn.clone(), on.clone(), top));
                     }
                 }
@@ -3687,8 +3679,7 @@ impl Snail {
             root.orders[at].2 = w.place(&bytes)?;
         }
         maps.finish(w)?;
-        self.reader
-            .settle(&mut root, w.format(), generation, w, &mut gone)?;
+        self.reader.settle(&mut root, generation, w, &mut gone)?;
         spent.sort_unstable();
         // The free map as it stands now: the runs left free, those still waiting, and the pages
         // this generation stops naming, tagged with it.
@@ -3718,7 +3709,7 @@ impl Snail {
         root.free = if runs.is_empty() && spent.is_empty() {
             Extent::default()
         } else {
-            w.place_end(&encode_free(&runs, &spent, w.format()))?
+            w.place_end(&encode_free(&runs, &spent))?
         };
         for (start, pages) in w.taken() {
             self.reused += pages;
@@ -3899,16 +3890,6 @@ impl Snail {
             match c {
                 Change::Insert(r) | Change::Replace(_, r) => {
                     check(&table, r)?;
-                    for (ci, (col, d)) in table.columns.iter().zip(r).enumerate() {
-                        if let ColumnType::Numeric { precision, .. } = col.ty {
-                            if d.wide() == Some(crate::numeric::nan_units(precision)) {
-                                crate::file::holds_nan(self.reader.format(), &table, ci)?;
-                            }
-                        }
-                        if col.ty.is_timestamptz() && matches!(d, Datum::Int(i64::MAX | i64::MIN)) {
-                            crate::file::instant_ends(self.reader.format(), &table, ci)?;
-                        }
-                    }
                 }
                 Change::Delete(_) => {}
             }
@@ -4111,9 +4092,6 @@ impl Snail {
         let effects = self.effects_on(table, order, changes)?;
         if effects.is_empty() {
             return Ok(None);
-        }
-        if effects.iter().any(|e| e.key.iter().any(KeyValue::is_null)) {
-            crate::file::keys_null(self.reader.format(), table, order)?;
         }
         let at = self
             .root
@@ -4643,15 +4621,9 @@ impl Snail {
         let mut rows = None;
         let split = !added.is_empty() && writing != Writing::Beside && {
             let r = rows_now();
-            let cut = laid_out(
-                table,
-                order,
-                &r,
-                Some(&head.level_text),
-                self.reader.format(),
-            )?
-            .blocks
-            .len()
+            let cut = laid_out(table, order, &r, Some(&head.level_text))?
+                .blocks
+                .len()
                 > 1;
             rows = Some(r);
             cut
@@ -4663,14 +4635,12 @@ impl Snail {
             // Written in order, and cut by the counts as a block written afresh is.
             let rows = rows.unwrap_or_else(rows_now);
             let mut written = self.blocks_written(w, table, order, head, &rows)?;
-            if head.separated {
-                crate::directory::separate(
-                    &mut written,
-                    &head.level_text,
-                    Some(&entry.first),
-                    Some(entry.bound()),
-                );
-            }
+            crate::directory::separate(
+                &mut written,
+                &head.level_text,
+                Some(&entry.first),
+                Some(entry.bound()),
+            );
             return Ok((written, true));
         }
         // The new rows go after the block's last, into its tail: plain pages of one disk page, each
@@ -4813,7 +4783,7 @@ impl Snail {
         entry.rows = entry.rows + added.len() as u32 - gone.len() as u32;
         entry.dead += gone.len() as u32;
         for (key, _) in &added {
-            crate::directory::widened(&mut entry, key, head.separated);
+            crate::directory::widened(&mut entry, key);
         }
         let mut tails = std::mem::take(&mut entry.tails);
         for s in 0..leaves.len() {
@@ -4954,17 +4924,10 @@ impl Snail {
             blocks,
             widths,
             ..
-        } = laid_out(
-            table,
-            order,
-            rows,
-            Some(&head.level_text),
-            self.reader.format(),
-        )?;
+        } = laid_out(table, order, rows, Some(&head.level_text))?;
         let descs = leaf_descriptors(table, order)?;
-        // In format 9 each block takes the unit of its own furthest-out place.
-        let kept = self.reader.format() >= crate::file::FORMAT;
-        let block_units: Vec<Vec<usize>> = if kept {
+        // Each block takes the unit of its own furthest-out place.
+        let block_units: Vec<Vec<usize>> =
             crate::cut::largest_places(&keys, &blocks, order, table, &widths)
                 .iter()
                 .map(|m| {
@@ -4972,10 +4935,7 @@ impl Snail {
                         .map(|s| widths.unit(s, m[s], rows.len()))
                         .collect()
                 })
-                .collect()
-        } else {
-            vec![head.units.iter().map(|&k| k as usize).collect(); blocks.len()]
-        };
+                .collect();
         let month_slots: Vec<usize> = head.month_slots.iter().map(|&s| s as usize).collect();
         let text_slots: Vec<usize> = head.text_slots.iter().map(|&s| s as usize).collect();
         let mut entries = Vec::with_capacity(blocks.len());
@@ -4994,7 +4954,6 @@ impl Snail {
                 &text_slots,
                 &[],
                 &mut MapPages::new(false),
-                kept,
             )?;
             entries.push(entry);
         }
@@ -5018,12 +4977,10 @@ impl Snail {
                 push(values, order.slot(c).map_or(&Datum::Null, |s| &r[s]));
             }
         }
-        let laid = laid_out(table, order, &rows, None, self.reader.format())?;
-        let head = head_of(table, order, &laid, held.len(), self.reader.format());
+        let laid = laid_out(table, order, &rows, None)?;
+        let head = head_of(table, order, &laid, held.len());
         let mut written = self.blocks_written(w, table, order, &head, &rows)?;
-        if head.separated {
-            crate::directory::separate(&mut written, &head.level_text, None, None);
-        }
+        crate::directory::separate(&mut written, &head.level_text, None, None);
         Ok((written, head))
     }
 
@@ -5148,11 +5105,9 @@ impl Snail {
         let text = format!("{base}{ddl};\n");
         let kept = Catalog::statements_in(&self.catalog.ddl)?;
         let its_place = kept;
-        let format = self.reader.format();
         let (release, monetary) = (self.root.release, self.root.monetary.clone());
         let searched = self.root.text_search().to_string();
         let prepared = |catalog: &mut Catalog| -> Result<()> {
-            super::old_names(catalog, format);
             catalog.with_release(release)?;
             catalog.with_monetary(&crate::file::monetary_of(catalog, &monetary))?;
             catalog.with_text_search(&searched)
@@ -5190,9 +5145,7 @@ impl Snail {
         }
         let mut made: Vec<(String, String)> = Vec::new();
         let mut kept: Vec<(String, String)> = Vec::new();
-        crate::file::holds_catalog(self.reader.format(), &catalog)?;
         for t in &catalog.tables {
-            crate::file::holds(self.reader.format(), t)?;
             let old = self.catalog.tables.iter().find(|x| x.name == t.name);
             // A strand made new is a change to the table it is of.
             if let (None, Some(of)) = (old, &t.elements_of) {
@@ -5302,7 +5255,7 @@ impl Snail {
         // else at its commit. Where it takes others than the text went on to, it is read again
         // with them.
         let mut took = None;
-        if self.begun.is_some() && format >= FORMAT {
+        if self.begun.is_some() {
             if let Some(run) = catalog.oids.run_at(its_place) {
                 let place = match self.declared.as_ref() {
                     Some(d) => Catalog::statements_in(&d.own)?,
@@ -5334,7 +5287,7 @@ impl Snail {
         for (tn, on) in &made {
             let t = catalog.table(tn).expect("a table the catalog names");
             let o = t.orders.iter().find(|x| x.name == *on).unwrap();
-            let top = stage.place(&encode_top(&empty_head(t, o, self.reader.format()), &[]))?;
+            let top = stage.place(&encode_top(&empty_head(t, o), &[]))?;
             orders.push((tn.clone(), on.clone(), top));
         }
         self.root.catalog = stage.place(text.as_bytes())?;
@@ -5600,7 +5553,7 @@ impl Snail {
                 match held {
                     Some(h) => orders.push(h.clone()),
                     None => {
-                        let head = empty_head(t, o, self.reader.format());
+                        let head = empty_head(t, o);
                         let top = stage.place(&encode_top(&head, &[]))?;
                         orders.push((t.name.clone(), o.name.clone(), top));
                     }
@@ -5657,15 +5610,11 @@ impl Snail {
     /// statements that took none from the counter every writer of the file shares takes its own
     /// now, its statements read again where one takes others than the text went on to; the record
     /// of the statements whose OIDs depart from the text's order written where it changed; and the
-    /// counter kept only where it is past where the text goes on. A snail of format 7 or 8 keeps
-    /// its text's order alone.
+    /// counter kept only where it is past where the text goes on.
     fn oids_at_commit(&mut self, root: &mut Root, w: &mut Writer, gone: &mut Vec<Extent>) -> Result<()> {
         let Some(d) = self.declared.as_ref() else {
             return Ok(());
         };
-        if w.format() < FORMAT {
-            return Ok(());
-        }
         let mine = Catalog::statements_in(&d.own)?;
         let committed = Catalog::statements_in(&self.catalog.ddl)? - mine;
         let mut given = d.given.clone();
@@ -5735,7 +5684,7 @@ impl Snail {
         for (tn, on) in &d.made {
             if let Some(t) = self.catalog.table(tn) {
                 if let Some(o) = t.orders.iter().find(|x| x.name == *on) {
-                    let head = empty_head(t, o, self.reader.format());
+                    let head = empty_head(t, o);
                     orders.push((tn.clone(), on.clone(), stage.place(&encode_top(&head, &[]))?));
                 }
             }
@@ -5919,8 +5868,8 @@ pub(super) fn settle(
         path.pop();
         gone.push(kid.at);
         let mut parents = Vec::new();
-        for page in pack(kid.entries, head.separated)? {
-            let at = w.place(&encode_page(&page, head.separated))?;
+        for page in pack(kid.entries)? {
+            let at = w.place(&encode_page(&page))?;
             parents.push(Entry::over(&page, at, &head.bound_slots)?);
         }
         node.entries.splice(i..i + 1, parents);

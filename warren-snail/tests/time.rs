@@ -7,6 +7,7 @@ mod weather;
 
 #[cfg(feature = "standalone")]
 use arrow::array::{Array, RecordBatch};
+#[cfg(feature = "standalone")]
 use warren_snail::catalog::Catalog;
 #[cfg(feature = "standalone")]
 use warren_snail::catalog::ColumnType;
@@ -14,7 +15,9 @@ use warren_snail::catalog::ColumnType;
 use warren_snail::read::Snail;
 #[cfg(feature = "standalone")]
 use warren_snail::scalars::{field_scalar, interval_at, scalar_key_at, scalar_text};
+#[cfg(feature = "standalone")]
 use warren_snail::write::Rows;
+#[cfg(feature = "standalone")]
 use weather::tmp;
 #[cfg(feature = "standalone")]
 use weather::write;
@@ -394,32 +397,6 @@ fn a_setting_set_to_the_value_the_snail_answers_under_does_nothing_and_any_other
         let e = snail.execute(s).unwrap_err().to_string();
         assert!(e.contains(says), "{s}: {e}");
     }
-}
-
-#[test]
-fn a_snail_of_format_8_refuses_an_infinite_instant_on_a_level_by_name() {
-    let catalog =
-        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (at timestamptz NOT NULL, PRIMARY KEY (at));").unwrap();
-    let path = tmp("time-format8.snail");
-    let _ = std::fs::remove_file(&path);
-    let rows = Rows {
-        columns: vec![warren_snail::values::Values::Int(vec![
-            Some(0),
-            Some(i64::MAX),
-        ])],
-    };
-    let e = warren_snail::write::write_format_eight(
-        &path,
-        &catalog,
-        &[("s.t".into(), rows)],
-        warren_snail::file::FILE_PAGES,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(
-        e.contains("holds an infinite instant on a level, which a snail of format 8 cannot hold"),
-        "{e}"
-    );
 }
 
 #[cfg(feature = "standalone")]

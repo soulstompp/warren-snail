@@ -318,7 +318,7 @@ impl Snail {
 }
 
 /// The greatest key a block holds on its order's first level, where its entry says it: its last
-/// key, kept whole where the order keeps both keys or at the order's end; a number's greatest its
+/// key, kept whole at the order's end; a number's greatest its
 /// leaves keep, `last`; a numeric's that may hold NaN, its decimal's greatest where the block holds
 /// no NaN, else NaN's; or text whose greatest ends within the first 8 bytes its leaves keep.
 fn greatest(on: (&Table, &Order), head: &Head, e: &Entry, last: &KeyValue) -> Option<KeyValue> {
@@ -327,7 +327,7 @@ fn greatest(on: (&Table, &Order), head: &Head, e: &Entry, last: &KeyValue) -> Op
     let slot = order.leaf_slot(table, c)?;
     let sum = &e.columns[slot];
     let ends_null = matches!(last, KeyValue::Null { first: false }) && sum.nulls > 0;
-    if !head.separated || ends_null {
+    if ends_null {
         return Some(last.clone());
     }
     let bounded = crate::write::bounded(table, c);

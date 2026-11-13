@@ -897,45 +897,6 @@ fn the_order_a_keyless_table_is_given_is_no_index() {
     assert_eq!(b.num_rows(), 1);
 }
 
-/// 0.1.x reads the DDL a snail of format 7 or 8 keeps again as it opens, and refuses a table with
-/// no key there: such a snail refuses one, written or made on `exec`, by name.
-#[test]
-fn a_snail_of_format_eight_refuses_a_keyless_table() {
-    let says =
-        "s.nk names no key, and lies along every column it orders, which a snail of format 8 \
-                cannot hold: put the snail `out` and `write` it afresh, in format 9";
-    let catalog =
-        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.nk (a integer, b text);").unwrap();
-    let rows = Rows {
-        columns: vec![
-            Values::Int(vec![Some(1)]),
-            Values::Text(vec![Some("x".into())]),
-        ],
-    };
-    let e = warren_snail::write::write_format_eight(
-        &tmp("nokey-format-eight.snail"),
-        &catalog,
-        &[("s.nk".into(), rows)],
-        weather::span(),
-    )
-    .unwrap_err();
-    assert_eq!(e.to_string(), says);
-    let path = tmp("nokey-format-eight-exec.snail");
-    let keyed =
-        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY);").unwrap();
-    warren_snail::write::write_format_eight(&path, &keyed, &[], weather::span()).unwrap();
-    let mut w = Snail::open_writing(&path).unwrap();
-    let e = w
-        .execute("CREATE TABLE s.nk (a integer, b text)")
-        .unwrap_err();
-    assert_eq!(e.to_string(), says);
-    // Nor one laid out as its rows arrive.
-    let e = w
-        .execute("CREATE TABLE s.nob (p point, j json)")
-        .unwrap_err();
-    assert!(e.to_string().starts_with("s.nob names no key"), "{e}");
-}
-
 /// The DDL of the tables with no column of a B-tree, or none at all, that the tests below write.
 const NOB: &str = "CREATE SCHEMA s;
      CREATE TABLE s.nob (p point, j json);

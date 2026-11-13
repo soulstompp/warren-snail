@@ -1311,27 +1311,6 @@ fn a_table_declaring_no_brin_keeps_its_pages_byte_for_byte() {
 }
 
 #[test]
-fn a_snail_of_format_eight_refuses_a_brin_by_name_with_the_way_across() {
-    let e = warren_snail::write::write_format_eight(
-        &tmp("brin-eight.snail"),
-        &Catalog::parse(
-            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a)); \
-             CREATE INDEX t_b ON s.t USING brin (b);",
-        )
-        .unwrap(),
-        &[],
-        weather::span(),
-    )
-    .err()
-    .unwrap()
-    .to_string();
-    assert!(
-        e.contains("s.t: the brin index t_b, which a snail of format 8") && e.contains("`out`"),
-        "{e}"
-    );
-}
-
-#[test]
 fn a_filter_on_text_rules_out_each_block_its_value_is_not_in() {
     // Each block's own values, and both ends of every block's: its bounds rule out none between them.
     let value = |i: i64| {

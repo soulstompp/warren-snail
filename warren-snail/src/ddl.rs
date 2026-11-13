@@ -6473,7 +6473,6 @@ impl Draft {
                         monetary: crate::monetary::Monetary::C,
                         brins: Vec::new(),
                         text_search: crate::tsearch::TextSearch::Simple,
-                        format: crate::file::FORMAT,
                         element_keys: Vec::new(),
                         elements_of: None,
                     }],
@@ -6979,7 +6978,6 @@ fn finish_table(d: &Declared) -> Result<Table> {
         foreign_keys: d.foreign_keys.clone(),
         monetary: crate::monetary::Monetary::C,
         text_search: crate::tsearch::TextSearch::Simple,
-        format: crate::file::FORMAT,
         element_keys,
         elements_of: None,
         brins,
@@ -8572,70 +8570,6 @@ fn index_on(text: &str) -> Option<String> {
     c.kw("ON");
     c.kw("ONLY");
     c.name().ok()
-}
-
-/// The first statement of a DDL that 0.1.x does not read, as its head names it: CREATE SCHEMA, and
-/// DROP of a schema or a relation. None where it holds none.
-pub(crate) fn past_first_formats(ddl: &str) -> Option<String> {
-    statements(ddl)
-        .ok()?
-        .iter()
-        .map(|t| head(t))
-        .find(|(kind, _)| kind == "CREATE SCHEMA" || kind.starts_with("DROP "))
-        .map(|(kind, object)| format!("{kind} {object}"))
-}
-
-/// The DDL a snail of format 7 or 8 keeps, as 0.1.x kept it: no CREATE SCHEMA, which 0.1.x does not
-/// read, each schema then named by what lies in it, as 0.1.x named one. Refused for a schema nothing
-/// lies in, which such a file cannot hold. Each CREATE SCHEMA written on a line of its own goes with
-/// its line, the rest of the DDL as written; one written beside another statement, the statements
-/// written again.
-pub(crate) fn as_first_formats(ddl: &str, format: u32) -> Result<String> {
-    let all = statements(ddl)?;
-    let made: Vec<String> = all
-        .iter()
-        .map(|t| head(t))
-        .filter(|(kind, _)| kind == "CREATE SCHEMA")
-        .map(|(_, object)| object)
-        .collect();
-    if made.is_empty() {
-        return Ok(ddl.to_string());
-    }
-    for s in &made {
-        let holds = all.iter().any(|t| {
-            let (kind, object) = head(t);
-            let name = match kind.ends_with("INDEX") {
-                true => index_on(&written(t)).unwrap_or_default(),
-                false => object,
-            };
-            kind != "CREATE SCHEMA" && name.rsplit_once('.').is_some_and(|(x, _)| x == s)
-        });
-        if !holds {
-            return Err(Error::new(format!(
-                "the schema {s} holds nothing, and a snail of format {format} holds a schema only by \
-                 what lies in it: write it in format {}",
-                crate::file::FORMAT
-            )));
-        }
-    }
-    let alone = |l: &str| {
-        let t = l.trim();
-        t.len() > 14
-            && t.is_char_boundary(14)
-            && t[..14].eq_ignore_ascii_case("CREATE SCHEMA ")
-            && t.ends_with(';')
-            && t.matches(';').count() == 1
-    };
-    let text: String = ddl.split_inclusive('\n').filter(|l| !alone(l)).collect();
-    if statements(&text)?.iter().all(|t| head(t).0 != "CREATE SCHEMA") {
-        return Ok(text);
-    }
-    Ok(all
-        .iter()
-        .filter(|t| head(t).0 != "CREATE SCHEMA")
-        .map(|t| format!("{};", written(t)))
-        .collect::<Vec<_>>()
-        .join("\n"))
 }
 
 /// Whether an ALTER TABLE says IF EXISTS.

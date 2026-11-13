@@ -240,7 +240,6 @@ impl Snail {
         if self.own_from.is_none() {
             self.own_from = Some(self.root.clone());
         }
-        self.format_holds(table, &changes)?;
         let found: Vec<&Row> = {
             let own = self.own.get(&table.name);
             changes
@@ -270,50 +269,6 @@ impl Snail {
         self.touch(ti, &changes);
         self.touch_exclusions(ti, &changes);
         Ok((0, orders))
-    }
-
-    /// A snail of an older format holds a transaction's rows on one version of a block: a row written
-    /// into a block another wrote since the snapshot is refused by name, with the way across.
-    fn format_holds(&self, table: &Table, changes: &[Change]) -> Result<()> {
-        let format = self.reader.format();
-        if format >= crate::file::FORMAT {
-            return Ok(());
-        }
-        let newest = self.reader.peek_root()?;
-        let from = self.own_from.as_ref().expect("the transaction's snapshot");
-        if newest.generation == from.generation {
-            return Ok(());
-        }
-        for order in &table.orders {
-            let effects = self.effects_on(table, order, changes)?;
-            let (Some((nh, mut nt)), Some((sh, mut st))) = (
-                self.top_on(&newest, table, order)?,
-                self.top_on(from, table, order)?,
-            ) else {
-                continue;
-            };
-            for e in &effects {
-                let same = match (nt.entries.is_empty(), st.entries.is_empty()) {
-                    (true, true) => true,
-                    (false, false) => {
-                        let (mut np, mut sp) = (Vec::new(), Vec::new());
-                        self.locate(&mut nt, &nh, &e.key, &mut np)?;
-                        self.locate(&mut st, &sh, &e.key, &mut sp)?;
-                        entry_at(&nt, &np).child == entry_at(&st, &sp).child
-                    }
-                    _ => false,
-                };
-                if !same {
-                    return Err(Error::new(format!(
-                        "a snail of format {format} writes no row into a block another wrote since \
-                         the transaction's snapshot, each block lying in one version: put the snail \
-                         `out` and `write` it afresh, in format {}",
-                        crate::file::FORMAT
-                    )));
-                }
-            }
-        }
-        Ok(())
     }
 
     /// What became of rows of a table since the transaction's snapshot, by the newest root: the first
@@ -685,9 +640,6 @@ impl Snail {
         if effects.is_empty() {
             return Ok(false);
         }
-        if effects.iter().any(|e| e.key.iter().any(KeyValue::is_null)) {
-            crate::file::keys_null(self.reader.format(), table, order)?;
-        }
         let at = self
             .root
             .orders
@@ -856,8 +808,7 @@ impl Snail {
                         .iter()
                         .find(|x| x.name == *on)
                         .expect("an order it declared");
-                    let top =
-                        stage.place(&encode_top(&empty_head(t, o, self.reader.format()), &[]))?;
+                    let top = stage.place(&encode_top(&empty_head(t, o), &[]))?;
                     match root.orders.iter_mut().find(|(a, b, _)| a == tn && b == on) {
                         Some(named) => named.2 = top,
                         None => root.orders.push((tn.clone(), on.clone(), top)),

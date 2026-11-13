@@ -178,26 +178,6 @@ use walk::{condition_columns, next_down, ruled_out, KeySet, Plan, Sink, Want};
 /// `shared_buffers`.
 pub const HELD_BYTES: usize = 128 << 20;
 
-/// A catalog as a snail of `format` holds its tables: their columns as the format's leaves, and
-/// their orders as it names them: 0.1.x, formats 7 and 8, named a primary key's order for its
-/// table, whatever its constraint was named.
-pub(crate) fn old_names(catalog: &mut Catalog, format: u32) {
-    for t in &mut catalog.tables {
-        t.format = format;
-    }
-    if format >= 9 {
-        return;
-    }
-    for t in &mut catalog.tables {
-        let bare = t.name.rsplit('.').next().unwrap_or(&t.name).to_string();
-        for o in &mut t.orders {
-            if o.constraint.as_ref().is_some_and(|k| k.primary) {
-                o.name = format!("{bare}_pkey");
-            }
-        }
-    }
-}
-
 /// Calls `f` on each table a query's FROMs name, in its steps and in its body, each arm of a set
 /// operation among them, and in its derived tables and subqueries.
 fn each_table(q: &mut sqlparser::ast::Query, f: &mut dyn FnMut(&mut sqlparser::ast::TableFactor)) {
@@ -1023,7 +1003,6 @@ impl Snail {
             .map_err(|_| Error::new("the catalog is not UTF-8"))?;
         let record = reader.oid_record(root)?;
         let mut catalog = Catalog::parse_recorded(&ddl, usize::MAX, &record)?;
-        old_names(&mut catalog, reader.format());
         catalog.with_release(root.release)?;
         catalog.with_monetary(&root.monetary)?;
         catalog.with_text_search(root.text_search())?;
@@ -1062,15 +1041,10 @@ impl Snail {
             record.sort_unstable();
         }
         let mut catalog = Catalog::parse_recorded(&text, usize::MAX, &record)?;
-        old_names(&mut catalog, self.reader.format());
         catalog.with_release(newest.release)?;
         catalog.with_monetary(&crate::file::monetary_of(&catalog, &newest.monetary))?;
         catalog.with_text_search(newest.text_search())?;
         catalog.collation = newest.collation().to_string();
-        crate::file::holds_catalog(self.reader.format(), &catalog)?;
-        for t in &catalog.tables {
-            crate::file::holds(self.reader.format(), t)?;
-        }
         Ok(catalog)
     }
 
@@ -2459,10 +2433,7 @@ impl Snail {
         }
         let (runs, spent) = if self.root.free.bytes > 0 {
             mark(self.root.free, 1)?;
-            crate::file::decode_free(
-                &self.reader.read_extent(self.root.free)?,
-                self.reader.format(),
-            )?
+            crate::file::decode_free(&self.reader.read_extent(self.root.free)?)?
         } else {
             (Vec::new(), Vec::new())
         };

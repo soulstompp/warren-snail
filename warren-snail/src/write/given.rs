@@ -80,37 +80,6 @@ impl Given<'_> {
         }
         Ok(())
     }
-
-    /// The rows whole, as a write in an older format reads them.
-    pub fn whole(&self, catalog: &Catalog) -> Result<Rows> {
-        if let Given::Held(rows) = self {
-            return Ok(Rows {
-                columns: rows.columns.clone(),
-            });
-        }
-        if let Given::Files { table, files } = self {
-            use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-            let mut batches = Vec::new();
-            for f in files {
-                let file = std::fs::File::open(f)
-                    .map_err(|e| Error::new(format!("{}: {e}", f.display())))?;
-                batches.extend(
-                    ParquetRecordBatchReaderBuilder::try_new(file)?
-                        .build()?
-                        .collect::<std::result::Result<Vec<_>, _>>()?,
-                );
-            }
-            return Rows::from_batches(table, &batches);
-        }
-        let mut out: Option<Rows> = None;
-        self.each(catalog, &mut |chunk| {
-            appended(&mut out, &chunk);
-            Ok(())
-        })?;
-        Ok(out.unwrap_or(Rows {
-            columns: Vec::new(),
-        }))
-    }
 }
 
 /// `chunk`'s rows after those of `out`.

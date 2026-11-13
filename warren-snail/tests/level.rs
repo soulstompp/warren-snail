@@ -9,7 +9,7 @@ use warren_snail::places::KeyValue;
 use warren_snail::read::{LevelCounts, Snail};
 use warren_snail::values::Values;
 use warren_snail::write::Rows;
-use weather::{fresh, ints64, span, tmp, write};
+use weather::{fresh, ints64, tmp, write};
 
 const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, k integer, w integer NOT NULL, \
                    m integer NOT NULL, PRIMARY KEY (id));
@@ -173,9 +173,8 @@ fn gap_of(i: i64) -> (i64, i64) {
 }
 
 /// A level whose places each fill blocks of their own, the next block's value never the next
-/// value, is counted exactly from the entries' least and greatest, in format 9 as in format 8, on
-/// the table's order and on a strand; and a date's level so in format 9, which a snail of format 8
-/// does not hold.
+/// value, is counted exactly from the entries' least and greatest, on the table's order and on a
+/// strand; and a date's level so.
 #[test]
 fn places_apart_are_counted_exactly_from_the_leaves_least_and_greatest() {
     let rows = || Rows {
@@ -187,14 +186,11 @@ fn places_apart_are_counted_exactly_from_the_leaves_least_and_greatest() {
     };
     let catalog = Catalog::parse(GAPS).unwrap();
     let dated = Catalog::parse(&GAPS.replace("d bigint", "d date")).unwrap();
-    let nine = tmp("level-gaps-9.snail");
-    write(&nine, &catalog, &[("s.g".into(), rows())]).unwrap();
-    let eight = tmp("level-gaps-8.snail");
-    warren_snail::write::write_format_eight(&eight, &catalog, &[("s.g".into(), rows())], span())
-        .unwrap();
+    let numbered = tmp("level-gaps-9.snail");
+    write(&numbered, &catalog, &[("s.g".into(), rows())]).unwrap();
     let date = tmp("level-gaps-date.snail");
     write(&date, &dated, &[("s.g".into(), rows())]).unwrap();
-    for (path, format) in [(nine, "9"), (eight, "8"), (date, "9, a date")] {
+    for (path, format) in [(numbered, "a bigint"), (date, "a date")] {
         let snail = fresh(&path);
         for (column, held) in [
             ("g", plain((0..ROWS).map(|i| gap_of(i).0))),

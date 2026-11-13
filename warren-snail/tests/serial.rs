@@ -1121,65 +1121,6 @@ fn at_repeatable_read_three_transactions_in_one_block_break() {
     assert!(w.broken_count > 0, "{w:?}");
 }
 
-#[test]
-fn the_older_formats_refuse_the_level_by_name_with_the_way_across() {
-    let catalog = Catalog::parse(DDL).unwrap();
-    let rows = || {
-        let table = catalog.table("s.t").unwrap();
-        Rows {
-            columns: table
-                .columns
-                .iter()
-                .map(|c| {
-                    let mut v = Values::new(c.ty);
-                    push_datum(
-                        &mut v,
-                        &warren_snail::composed::scalar_in(c.ty, "1").unwrap(),
-                    );
-                    v
-                })
-                .collect(),
-        }
-    };
-    for (format, path) in [
-        (8, tmp("serial-format-eight.snail")),
-        (7, tmp("serial-format-seven.snail")),
-    ] {
-        let tables = [("s.t".to_string(), rows())];
-        match format {
-            8 => warren_snail::write::write_format_eight(&path, &catalog, &tables, weather::span()),
-            _ => warren_snail::write::write_format_seven(&path, &catalog, &tables, weather::span()),
-        }
-        .unwrap();
-        let mut w = open(&path);
-        let said = format!(
-            "a snail of format {format} runs no SERIALIZABLE transaction, its root holding no \
-             records of one: put the snail `out` and `write` it afresh, in format 9"
-        );
-        for sql in [
-            "BEGIN ISOLATION LEVEL SERIALIZABLE",
-            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
-        ] {
-            assert_eq!(w.execute(sql).unwrap_err().to_string(), said, "{sql}");
-        }
-        run(&mut w, "BEGIN");
-        assert_eq!(
-            w.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
-                .unwrap_err()
-                .to_string(),
-            said
-        );
-        run(&mut w, "ROLLBACK");
-        // The levels it holds no records for are taken, READ ONLY and DEFERRABLE among them.
-        run(
-            &mut w,
-            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY DEFERRABLE",
-        );
-        assert_eq!(read(&mut w, 1), 1);
-        run(&mut w, "COMMIT");
-    }
-}
-
 /// Two snails, `s.t` as `made` holds it and `o.t` the same rows.
 fn two_snails(name: &str) -> (PathBuf, PathBuf) {
     let one = made(&format!("{name}-one"));
@@ -1429,42 +1370,6 @@ fn a_session_s_level_across_snails_makes_each_statement_a_transaction() {
         "cannot execute UPDATE in a read-only transaction"
     );
     run_across(&mut a, "ROLLBACK");
-}
-
-#[test]
-fn an_older_format_among_several_refuses_the_level_by_name() {
-    let (_, q) = two_snails("older-across");
-    let path = tmp("serial-older-across.snail");
-    let catalog = Catalog::parse(DDL).unwrap();
-    let table = catalog.table("s.t").unwrap();
-    let columns = table
-        .columns
-        .iter()
-        .map(|c| {
-            let mut v = Values::new(c.ty);
-            push_datum(
-                &mut v,
-                &warren_snail::composed::scalar_in(c.ty, "1").unwrap(),
-            );
-            v
-        })
-        .collect();
-    warren_snail::write::write_format_eight(
-        &path,
-        &catalog,
-        &[("s.t".to_string(), Rows { columns })],
-        weather::span(),
-    )
-    .unwrap();
-    let mut w = both(&path, &q);
-    let e = w
-        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
-        .unwrap_err()
-        .to_string();
-    assert!(
-        e.starts_with("a snail of format 8 runs no SERIALIZABLE transaction"),
-        "{e}"
-    );
 }
 
 #[test]

@@ -129,7 +129,7 @@ pub fn newest(path: &Path) -> Result<u64> {
     [Root::decode(&both[..PAGE]), Root::decode(&both[PAGE..])]
         .into_iter()
         .flatten()
-        .map(|(r, _)| r.generation)
+        .map(|r| r.generation)
         .max()
         .ok_or_else(|| Error::new("neither copy of the root is whole"))
 }
@@ -185,14 +185,14 @@ impl Commit {
     pub fn host(&self) -> Option<u64> {
         let mut page = self.root.clone();
         page.resize(PAGE, 0);
-        Root::decode(&page).and_then(|(r, _)| r.host)
+        Root::decode(&page).and_then(|r| r.host)
     }
 
     /// The source the commit's root marks the snail a replica of, where it marks it one.
     pub fn replica(&self) -> Option<String> {
         let mut page = self.root.clone();
         page.resize(PAGE, 0);
-        Root::decode(&page).and_then(|(r, _)| r.replica)
+        Root::decode(&page).and_then(|r| r.replica)
     }
 
     /// The commit `encode` wrote, refused where its bytes are not whole.
@@ -258,13 +258,12 @@ fn land(path: &Path, commit: &Commit, stop: Option<Stop>) -> Result<()> {
 fn land_at_turn(files: &Files, commit: &Commit, stop: Option<Stop>) -> Result<()> {
     let mut both = vec![0u8; 2 * PAGE];
     files.first.read_exact_at(&mut both, 0)?;
-    let (root, format) = newer(&both)?;
+    let root = newer(&both)?;
     files.span.set(root.span);
-    files.format.set(format);
     let mut page = commit.root.clone();
     page.resize(PAGE, 0);
-    let (theirs, their_format) = Root::decode(&page)
-        .filter(|(r, _)| {
+    let theirs = Root::decode(&page)
+        .filter(|r| {
             commit.root.len() <= PAGE
                 && r.generation == commit.generation
                 && commit.parent + 1 == commit.generation
@@ -285,16 +284,15 @@ fn land_at_turn(files: &Files, commit: &Commit, stop: Option<Stop>) -> Result<()
             commit.parent, root.generation
         )));
     }
-    if their_format != format || theirs.span != root.span {
+    if theirs.span != root.span {
         return Err(Error::new(format!(
-            "the commit is of format {their_format} in files of {} pages, and the follower of \
-             format {format} in files of {}",
+            "the commit is in files of {} pages, and the follower in files of {}",
             theirs.span, root.span
         )));
     }
     let span = root.span;
     let pages = pages_of(commit, span)?;
-    crate::lock::wait_older_let_go(&files.first, freed(files, &root, &theirs, &pages, format)?)?;
+    crate::lock::wait_older_let_go(&files.first, freed(files, &root, &theirs, &pages)?)?;
     write_pages(files, &pages)?;
     match stop {
         Some(Stop::BeforeRoot) => return Err(Error::new("the apply stopped before the root")),
@@ -406,8 +404,8 @@ fn replay_at_turn(
     files.first.read_exact_at(&mut both, 0)?;
     let mut page = commit.root.clone();
     page.resize(PAGE, 0);
-    let (theirs, their_format) = Root::decode(&page)
-        .filter(|(r, _)| {
+    let theirs = Root::decode(&page)
+        .filter(|r| {
             commit.root.len() <= PAGE
                 && r.generation == commit.generation
                 && commit.parent + 1 == commit.generation
@@ -423,10 +421,10 @@ fn replay_at_turn(
         return Ok(Replayed::Already);
     }
     let decoded = [Root::decode(&both[..PAGE]), Root::decode(&both[PAGE..])];
-    let newest = decoded.iter().flatten().map(|(r, _)| r.generation).max();
-    let (root, format) = match (&decoded[1 - c], newest) {
+    let newest = decoded.iter().flatten().map(|r| r.generation).max();
+    let root = match (&decoded[1 - c], newest) {
         (_, Some(n)) if n > commit.generation => return Ok(Replayed::Passed),
-        (Some((r, f)), _) if r.generation == commit.parent => (r.clone(), *f),
+        (Some(r), _) if r.generation == commit.parent => r.clone(),
         (None, Some(n)) if n == commit.generation => return Ok(Replayed::Passed),
         _ => {
             return Err(Error::new(format!(
@@ -437,16 +435,14 @@ fn replay_at_turn(
         }
     };
     files.span.set(root.span);
-    files.format.set(format);
-    if their_format != format || theirs.span != root.span {
+    if theirs.span != root.span {
         return Err(Error::new(format!(
-            "the commit is of format {their_format} in files of {} pages, and the snail of \
-             format {format} in files of {}",
+            "the commit is in files of {} pages, and the snail in files of {}",
             theirs.span, root.span
         )));
     }
     let pages = pages_of(commit, root.span)?;
-    let f = freed(files, &root, &theirs, &pages, format)?;
+    let f = freed(files, &root, &theirs, &pages)?;
     let mut nap = std::time::Duration::from_millis(1);
     while crate::lock::older_held(&files.first, f)? {
         waiting(f)?;
@@ -461,13 +457,7 @@ fn replay_at_turn(
 
 /// The newest tag of the runs a commit frees: those its parent's free map holds waiting on a tag the
 /// commit's free map no longer holds; 0 where it frees none.
-fn freed(
-    files: &Files,
-    parent: &Root,
-    root: &Root,
-    pages: &BTreeMap<u64, &[u8]>,
-    format: u32,
-) -> Result<u64> {
+fn freed(files: &Files, parent: &Root, root: &Root, pages: &BTreeMap<u64, &[u8]>) -> Result<u64> {
     let tags = |runs: Vec<Run>| -> BTreeSet<u64> {
         runs.into_iter().map(|r| r.tag).filter(|&t| t > 0).collect()
     };
@@ -476,7 +466,7 @@ fn freed(
         let mut buf = vec![0u8; parent.free.pages() as usize * PAGE];
         files.read_at(&mut buf, parent.free.start)?;
         buf.truncate(parent.free.bytes as usize);
-        before = tags(decode_free(&buf, format)?.0);
+        before = tags(decode_free(&buf)?.0);
     }
     let mut after = BTreeSet::new();
     if root.free.bytes > 0 {
@@ -487,7 +477,7 @@ fn freed(
             })?);
         }
         buf.truncate(root.free.bytes as usize);
-        after = tags(decode_free(&buf, format)?.0);
+        after = tags(decode_free(&buf)?.0);
     }
     Ok(before.difference(&after).max().copied().unwrap_or(0))
 }
@@ -505,7 +495,6 @@ pub fn copy(leader: &Path, to: &Path) -> Result<u64> {
     }
     let reader = Reader::open(leader)?;
     let root = reader.root()?;
-    let format = reader.format();
     let mut copied = Vec::new();
     for n in 0.. {
         let (from, into) = match n {
@@ -523,11 +512,9 @@ pub fn copy(leader: &Path, to: &Path) -> Result<u64> {
     first.read_exact_at(&mut both, 0)?;
     let at = (root.generation % 2) as usize * PAGE;
     let other = PAGE - at;
-    let mut ours = root.encode(format)?;
+    let mut ours = root.encode()?;
     ours.resize(PAGE, 0);
-    if !Root::decode(&both[other..other + PAGE])
-        .is_some_and(|(r, _)| r.generation < root.generation)
-    {
+    if !Root::decode(&both[other..other + PAGE]).is_some_and(|r| r.generation < root.generation) {
         both[other..other + PAGE].fill(0);
     }
     both[at..at + PAGE].copy_from_slice(&ours);

@@ -229,24 +229,21 @@ pub fn column_byte_key(column: &crate::catalog::Column, key: &[u8]) -> KeyValue 
 }
 
 /// The sublevels a level of a string type, bytea or a bit string is cut on so that a value keyed
-/// by `key` lies whole on them, at least `had`: one more than its bytes, or than a bit varying's
-/// bits; `BYTES_LEVEL` beside them for a level keyed by bytes, as `had` says of a string under a
-/// library collation. Where `had` holds `BITS_LEVEL`, a bit a rung, a composed value's on its
-/// structure, its key written as hex.
+/// by `key` lies whole on them, at least `had`: one more than its bits, a bit a rung, or than a bit
+/// varying's bits; a composed value's on its structure, its key written as hex. `BYTES_LEVEL`
+/// beside them for a level keyed by bytes, as `had` says of a string under a library collation,
+/// and `BITS_LEVEL` where `had` holds it.
 pub fn rungs_for(ty: ColumnType, key: &[u8], had: u32) -> u32 {
     use crate::directory::{BITS_LEVEL, BYTES_LEVEL};
-    let bits = had & BITS_LEVEL != 0;
     let n = match ty {
         ColumnType::Bit(n) => n,
         ColumnType::Varbit(_) => crate::strings::bits_of_key(key).0 + 1,
-        ColumnType::Composed(r) if bits && crate::composed::is_nested(r) => {
+        ColumnType::Composed(r) if crate::composed::is_nested(r) => {
             crate::composed::structure_rungs(ty, &|i| hex_byte(key, i)) as u32 + 1
         }
-        _ if bits => 8 * key.len() as u32 + 1,
-        _ => key.len() as u32 + 1,
+        _ => 8 * key.len() as u32 + 1,
     };
-    let n = n.max(had & !(BYTES_LEVEL | BITS_LEVEL));
-    let n = if bits { n | BITS_LEVEL } else { n };
+    let n = n.max(had & !(BYTES_LEVEL | BITS_LEVEL)) | (had & BITS_LEVEL);
     if ty.keyed_by_bytes() || had & BYTES_LEVEL != 0 {
         n | BYTES_LEVEL
     } else {
@@ -268,7 +265,7 @@ pub fn part_rungs(ty: ColumnType) -> usize {
 
 /// Rung `r` of a part of a composed value of type `ty` keyed `key`, as a level of the type is cut.
 pub fn part_rung(ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
-    sublevel_of(Level::Column(0), ty, key, r, false)
+    sublevel_of(Level::Column(0), ty, key, r)
 }
 
 /// The value a numeric level keys, from its column's value.
@@ -416,13 +413,13 @@ fn decimal_digit(k: i128, r: usize) -> i64 {
     ((biased / 10u128.pow(WIDE_DECIMAL_DIGITS - 1 - r as u32)) % 10) as i64
 }
 
-fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize, bits: bool) -> i64 {
+fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
     let bit = |b: &[u8]| {
         b.get(r / 8)
             .map_or(-1, |&x| ((x >> (7 - r % 8)) & 1) as i64)
     };
     match key {
-        KeyValue::Text(s) if bits => {
+        KeyValue::Text(s) => {
             return match ty {
                 ColumnType::Composed(t) if crate::composed::is_nested(t) => {
                     crate::composed::structure_rung(ty, &|i| hex_byte(s.as_bytes(), i), r)
@@ -430,7 +427,6 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize, bits: boo
                 _ => bit(s.as_bytes()),
             }
         }
-        KeyValue::Text(s) => return s.as_bytes().get(r).map_or(-1, |&b| b as i64),
         KeyValue::Null { first: true } => return i64::MIN,
         KeyValue::Null { first: false } => return i64::MAX,
         KeyValue::Wide(k) if ty.is_numeric() => return decimal_digit(*k, r),
@@ -439,10 +435,9 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize, bits: boo
         }
         KeyValue::Wide(k) => return ((k.wrapping_sub(i128::MIN) as u128 >> (127 - r)) & 1) as i64,
         // A bit string is cut by its bits, each a place of three, an ended one first; bytea by its
-        // bytes, as text is.
+        // bytes' bits, as text is.
         KeyValue::Bytes(b) if ty.is_bits() => return crate::strings::bit_of_key(b, r),
-        KeyValue::Bytes(b) if bits => return bit(b),
-        KeyValue::Bytes(b) => return b.get(r).map_or(-1, |&x| x as i64),
+        KeyValue::Bytes(b) => return bit(b),
         KeyValue::Int(_) => {}
     }
     let key = key.int();
@@ -580,26 +575,20 @@ fn interval_rung(total: i128, r: usize) -> i64 {
 /// The sublevels an order's blocks are cut on, outermost first, each a sublevel of one of its levels.
 pub struct Sublevels {
     map: Vec<(usize, usize)>,
-    levels: Vec<(Level, ColumnType, bool)>,
+    levels: Vec<(Level, ColumnType)>,
 }
 
 impl Sublevels {
-    /// `text_sublevels` holds, for each level, the sublevels a text level is cut on (its longest value's bytes
+    /// `text_sublevels` holds, for each level, the sublevels a text level is cut on (its longest value's bits
     /// and one more), and 0 for a numeric level, whose sublevels its type gives.
     pub fn new(order: &Order, table: &Table, text_sublevels: &[u32]) -> Sublevels {
-        let levels: Vec<(Level, ColumnType, bool)> = order
+        let levels: Vec<(Level, ColumnType)> = order
             .levels
             .iter()
-            .enumerate()
-            .map(|(i, &l)| {
-                let text = text_sublevels.get(i).copied().unwrap_or(0);
-                let bits = text != crate::directory::WIDE_LEVEL
-                    && text & crate::directory::BITS_LEVEL != 0;
-                (l, table.columns[l.column()].ty, bits)
-            })
+            .map(|&l| (l, table.columns[l.column()].ty))
             .collect();
         let mut map = Vec::new();
-        for (i, &(l, ty, _)) in levels.iter().enumerate() {
+        for (i, &(l, ty)) in levels.iter().enumerate() {
             for r in 0..sublevel_count(l, ty, text_sublevels.get(i).copied().unwrap_or(0)) {
                 map.push((i, r));
             }
@@ -630,8 +619,8 @@ impl Sublevels {
     /// The value at sublevel `r` for a row whose levels key `key`.
     pub fn value(&self, key: &[KeyValue], r: usize) -> i64 {
         let (i, sub) = self.map[r];
-        let (l, ty, bits) = self.levels[i];
-        sublevel_of(l, ty, &key[i], sub, bits)
+        let (l, ty) = self.levels[i];
+        sublevel_of(l, ty, &key[i], sub)
     }
 
     /// The values at every sublevel for a row whose levels key `key`, a composed level's read in one
@@ -639,10 +628,10 @@ impl Sublevels {
     pub fn all(&self, key: &[KeyValue]) -> Vec<i64> {
         let mut out = Vec::with_capacity(self.map.len());
         for (r, &(i, sub)) in self.map.iter().enumerate() {
-            let (l, ty, bits) = self.levels[i];
+            let (l, ty) = self.levels[i];
             match (&key[i], ty) {
                 (KeyValue::Text(s), ColumnType::Composed(t))
-                    if bits && sub == 0 && crate::composed::is_nested(t) =>
+                    if sub == 0 && crate::composed::is_nested(t) =>
                 {
                     let n = self.map[r..].iter().take_while(|m| m.0 == i).count();
                     let mut walk =
@@ -650,9 +639,8 @@ impl Sublevels {
                     walk.resize(n, -1);
                     out.extend(walk);
                 }
-                (KeyValue::Text(_), ColumnType::Composed(t))
-                    if bits && crate::composed::is_nested(t) => {}
-                _ => out.push(sublevel_of(l, ty, &key[i], sub, bits)),
+                (KeyValue::Text(_), ColumnType::Composed(t)) if crate::composed::is_nested(t) => {}
+                _ => out.push(sublevel_of(l, ty, &key[i], sub)),
             }
         }
         out
@@ -1015,20 +1003,25 @@ mod tests {
     }
 
     #[test]
-    fn text_is_cut_by_its_bytes_and_an_ended_value_comes_first() {
+    fn text_is_cut_by_its_bits_and_an_ended_value_comes_first() {
         let c = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (s text NOT NULL, PRIMARY KEY (s));").unwrap();
         let t = &c.tables[0];
-        let sublevels = Sublevels::new(&t.orders[0], t, &[4]);
-        assert_eq!(sublevels.len(), 4);
-        let bytes = |s: &str| {
-            (0..4)
+        // Three bytes and one more, a bit a rung.
+        let sublevels = Sublevels::new(&t.orders[0], t, &[25 | crate::directory::BITS_LEVEL]);
+        assert_eq!(sublevels.len(), 25);
+        let bits = |s: &str| {
+            (0..25)
                 .map(|r| sublevels.value(&[KeyValue::Text(s.into())], r))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(bytes("ab"), [97, 98, -1, -1]);
+        assert_eq!(
+            bits("ab")[..17],
+            [0, 1, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, -1]
+        );
+        assert!(bits("ab")[16..].iter().all(|&b| b == -1));
         let mut all: Vec<(Vec<i64>, &str)> = ["b", "ab", "abc", "", "a"]
             .iter()
-            .map(|s| (bytes(s), *s))
+            .map(|s| (bits(s), *s))
             .collect();
         all.sort();
         assert_eq!(

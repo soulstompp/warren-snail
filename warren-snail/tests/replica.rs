@@ -440,40 +440,27 @@ fn a_follower_carries_its_leaders_mark_and_refuses_a_stray_writer_while_the_lead
 
 #[test]
 #[cfg(feature = "standalone")]
-fn a_snail_of_format_seven_or_eight_is_marked_no_replica() {
+fn a_mark_refused_in_a_transaction_leaves_it_nothing_but_its_end() {
     use warren_snail::catalog::Catalog;
     let catalog = Catalog::parse(
         "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b bigint NOT NULL, PRIMARY KEY (a, b));",
     )
     .unwrap();
-    for (n, path) in [
-        (7, tmp("replica-seven.snail")),
-        (8, tmp("replica-eight.snail")),
-    ] {
-        match n {
-            7 => warren_snail::write::write_format_seven(&path, &catalog, &[], span()),
-            _ => warren_snail::write::write_format_eight(&path, &catalog, &[], span()),
-        }
-        .unwrap();
-        let mut w = Snail::open_writing(&path).unwrap();
-        let e = w.mark_replica(Some(SOURCE)).unwrap_err().to_string();
-        assert!(
-            e.contains(&format!(
-                "a snail of format {n} is marked a replica of no source: `out`, then `write`"
-            )),
-            "{e}"
-        );
-        // Refused as it is asked, in a transaction too, which then takes nothing but its end.
-        w.execute("BEGIN").unwrap();
-        assert!(w.mark_replica(Some(SOURCE)).is_err());
-        let e = w
-            .execute("INSERT INTO s.t (a, b) VALUES (1, 1)")
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("aborted"), "{e}");
-        w.execute("ROLLBACK").unwrap();
-        assert_eq!(w.mark_replica(None).unwrap().pages_written, 0);
-    }
+    let path = tmp("replica-refused.snail");
+    warren_snail::write::write_spanned(&path, &catalog, &[], &[], span()).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    let e = w.mark_replica(Some("")).unwrap_err().to_string();
+    assert_eq!(e, "a replica's source is named: the name is empty");
+    // Refused as it is asked, in a transaction too, which then takes nothing but its end.
+    w.execute("BEGIN").unwrap();
+    assert!(w.mark_replica(Some("")).is_err());
+    let e = w
+        .execute("INSERT INTO s.t (a, b) VALUES (1, 1)")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("aborted"), "{e}");
+    w.execute("ROLLBACK").unwrap();
+    assert_eq!(w.mark_replica(None).unwrap().pages_written, 0);
 }
 
 #[test]

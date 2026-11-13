@@ -498,19 +498,3 @@ fn a_tid_written_into_a_block_goes_into_each_leaf_s_tail_and_is_pruned_back_in_o
     check(&mut Snail::open(&path).unwrap());
 }
 
-#[test]
-#[cfg(feature = "standalone")]
-fn a_snail_of_format_eight_refuses_a_tid_by_its_leaves() {
-    let catalog =
-        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v tid, PRIMARY KEY (id));").unwrap();
-    let path = tmp("tid-eight.snail");
-    let e = warren_snail::write::write_format_eight(&path, &catalog, &[], weather::span())
-        .err()
-        .unwrap()
-        .to_string();
-    assert!(
-        e.contains("s.t.v is tid, a group of 2 leaves, v.block and v.offset, which a snail of format 8 cannot hold")
-            && e.contains("`out`"),
-        "{e}"
-    );
-}

@@ -848,54 +848,6 @@ fn a_locked_row_is_held_to_the_newest_root_by_the_row_and_its_own_is_its_own() {
 }
 
 #[test]
-fn an_older_format_refuses_a_write_of_a_block_written_since_by_name() {
-    let catalog = Catalog::parse(DDL).unwrap();
-    let table = catalog.table("s.t").unwrap();
-    let columns = table
-        .columns
-        .iter()
-        .map(|c| {
-            let mut v = Values::new(c.ty);
-            for i in 0..ROWS {
-                push_datum(
-                    &mut v,
-                    &warren_snail::composed::scalar_in(c.ty, &(i * 16).to_string()).unwrap(),
-                );
-            }
-            v
-        })
-        .collect();
-    let path = tmp("beside-older.snail");
-    warren_snail::write::write_format_eight(
-        &path,
-        &catalog,
-        &[("s.t".into(), Rows { columns })],
-        weather::span(),
-    )
-    .unwrap();
-    let (mut a, mut b) = (open(&path), open(&path));
-    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
-    assert_eq!(count(&mut a, SECOND_BLOCK), 1024);
-    run(&mut b, &format!("UPDATE s.t SET v = 1 WHERE id = {D}"));
-    let e = refused(&mut a, &format!("UPDATE s.t SET v = 2 WHERE id = {C}"));
-    assert!(
-        e.starts_with("a snail of format 8 writes no row into a block"),
-        "{e}"
-    );
-    assert!(e.contains("`out`"), "{e}");
-    run(&mut a, "ROLLBACK");
-    // A block no other wrote is written, and its later statement beside it.
-    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
-    assert_eq!(count(&mut a, SECOND_BLOCK), 1024);
-    run(&mut b, "UPDATE s.t SET v = 1 WHERE id = 16");
-    run(&mut a, &format!("UPDATE s.t SET v = 2 WHERE id = {C}"));
-    run(&mut a, &format!("UPDATE s.t SET v = 3 WHERE id = {D}"));
-    run(&mut a, "COMMIT");
-    let mut r = Snail::open(&path).unwrap();
-    assert_eq!((value(&mut r, C), value(&mut r, D)), (2, 3));
-}
-
-#[test]
 fn a_child_written_beside_a_key_taken_is_refused_at_the_commit() {
     let path = tmp("beside-keys-commit.snail");
     let ddl = "CREATE SCHEMA s; CREATE TABLE s.p (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id)); \

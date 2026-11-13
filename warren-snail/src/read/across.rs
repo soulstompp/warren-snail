@@ -517,8 +517,7 @@ impl Snails {
             };
             let root = &self.snails[i].reader.peek_root()?;
             let written = root.generation > w.generation
-                || (root.generation == w.generation
-                    && root.crc(self.snails[i].reader.format())? == w.crc);
+                || (root.generation == w.generation && root.crc()? == w.crc);
             if !written {
                 return Ok(false);
             }
@@ -651,11 +650,11 @@ impl Snails {
                     .is_some_and(|p| self.holder(&p.decider).is_some())
             });
             let s = &mut self.snails[i];
-            let (format, parent) = (s.reader.format(), s.reader.root_copy());
+            let parent = s.reader.root_copy();
             let w = s.writer.as_mut().expect("a snail open to write");
             // A root owed goes over its parent, never over its pending copy.
             match (owed, void) {
-                (Some(root), _) => w.write_copy(parent, &root.encode(format)?)?,
+                (Some(root), _) => w.write_copy(parent, &root.encode()?)?,
                 (None, Some(_)) => w.write_copy(1 - parent, &[0u8; PAGE])?,
                 (None, None) => {}
             }
@@ -1442,17 +1441,6 @@ impl Snails {
                 return Err(e);
             }
         }
-        if let Some(&i) = written
-            .iter()
-            .find(|&&i| self.snails[i].reader.format() < 9)
-        {
-            self.end_all()?;
-            return Err(Error::new(format!(
-                "{} is of format {}, which holds no transaction across snails: `out`, then `write`",
-                self.paths[i].display(),
-                self.snails[i].reader.format()
-            )));
-        }
         let names: Vec<String> = written
             .iter()
             .map(|&i| self.name_of(i))
@@ -1573,11 +1561,8 @@ impl Snails {
                 decider: names[0].clone(),
                 at,
             });
-            let format = self.snails[i].reader.format();
             let w = writers[i].as_mut().unwrap();
-            let wrote = copy
-                .encode(format)
-                .and_then(|b| w.write_copy(1 - parents[k], &b));
+            let wrote = copy.encode().and_then(|b| w.write_copy(1 - parents[k], &b));
             if let Err(e) = wrote {
                 Snails::let_go(&written[1..k + 2], &parents, writers);
                 return Err(e);
@@ -1656,12 +1641,9 @@ pub(super) fn carried_root(
             let bytes = decode_carried(&snails[decider].reader.read_extent(d.carried)?)?;
             let mut page = bytes.get(k).cloned().unwrap_or_default();
             page.resize(PAGE, 0);
-            let root = Root::decode(&page)
-                .map(|(r, _)| r)
-                .filter(|r| r.generation == w.generation);
-            let format = snails[holder].reader.format();
+            let root = Root::decode(&page).filter(|r| r.generation == w.generation);
             return match root {
-                Some(r) if r.crc(format)? == w.crc => Ok(Some(r)),
+                Some(r) if r.crc()? == w.crc => Ok(Some(r)),
                 _ => Err(Error::new(format!(
                     "{} carries a root for {} that is not whole",
                     shown(decider),

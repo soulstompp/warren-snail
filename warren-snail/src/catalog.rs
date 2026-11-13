@@ -27,8 +27,7 @@ pub enum ColumnType {
     /// A numeric of at most 38 digits, `scale` of them after the point, held as the integer of its
     /// smallest unit: in 64 bits up to 18 digits, past them in 128, as Parquet's decimal in the
     /// fewest bytes that hold them. Keyed with NaN one past its greatest integer, and held in the
-    /// file as a group of two leaves, its decimal and beside it whether it is NaN; as its decimal
-    /// alone in formats 7 and 8, which hold no NaN.
+    /// file as a group of two leaves, its decimal and beside it whether it is NaN.
     Numeric {
         precision: u8,
         scale: u8,
@@ -314,19 +313,6 @@ impl ColumnType {
             }
             t => ColumnType::NumericText(t.map(|(p, s)| (p as u16, s as i16))),
         }
-    }
-
-    /// Whether 0.1.x held it, so that a snail of format 7 or 8 can.
-    pub fn held_by_0_1(self) -> bool {
-        matches!(
-            self,
-            ColumnType::Int2
-                | ColumnType::Int4
-                | ColumnType::Int8
-                | ColumnType::Timestamptz
-                | ColumnType::Text(_)
-                | ColumnType::Bytes
-        ) || matches!(self, ColumnType::Numeric { precision, .. } if precision <= 18)
     }
 
     /// The bits a value takes where the type is narrower than 4 bytes, so that the cut passes over
@@ -1527,8 +1513,6 @@ pub struct Table {
     pub brins: Vec<Brin>,
     /// The configuration a call naming none reads: the file's.
     pub text_search: crate::tsearch::TextSearch,
-    /// The format of the file it lies in, whose leaves its columns are held as.
-    pub format: u32,
     /// The keys of its indexes held as element strands, each index's keys in turn.
     pub element_keys: Vec<ElementKey>,
     /// Whose element strand it is, where it is one: the table an index names.
@@ -1596,37 +1580,24 @@ impl Table {
             .collect()
     }
 
-    /// Whether a column may hold NaN: a numeric(p, s) in a file of format 9; formats 7 and 8 hold
-    /// none.
+    /// Whether a column may hold NaN: a numeric(p, s).
     pub fn may_hold_nan(&self, column: usize) -> bool {
         matches!(self.columns[column].ty, ColumnType::Numeric { .. })
-            && self.format >= crate::file::FORMAT
     }
 
-    /// The leaves a column is held as: its type's, a numeric(p, s) that may hold no NaN its decimal
-    /// alone.
+    /// The leaves a column is held as: its type's.
     pub fn column_leaves(&self, column: usize) -> Vec<Leaf> {
-        let ty = self.columns[column].ty;
-        match ty {
-            ColumnType::Numeric { .. } if !self.may_hold_nan(column) => vec![Leaf::whole(ty)],
-            _ => ty.leaves(),
-        }
+        self.columns[column].ty.leaves()
     }
 
     /// How many leaves a column is held as.
     pub fn leaf_count(&self, column: usize) -> usize {
-        match self.columns[column].ty {
-            ColumnType::Numeric { .. } if !self.may_hold_nan(column) => 1,
-            ty => ty.leaf_count(),
-        }
+        self.columns[column].ty.leaf_count()
     }
 
     /// Whether a column's values are held as a tree of leaves rather than as one.
     pub fn is_group(&self, column: usize) -> bool {
-        match self.columns[column].ty {
-            ColumnType::Numeric { .. } if !self.may_hold_nan(column) => false,
-            ty => ty.is_group(),
-        }
+        self.columns[column].ty.is_group()
     }
 
     /// A column's values as the leaves it is held as hold them, one `Values` a leaf.

@@ -448,32 +448,35 @@ mod tests {
 
     #[test]
     fn thin_parts_in_a_row_that_fill_a_page_are_a_block_of_their_own() {
-        let c = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (s text NOT NULL, PRIMARY KEY (s));").unwrap();
+        let c = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (d date NOT NULL, PRIMARY KEY (d));").unwrap();
         let t = &c.tables[0];
-        let sublevels = Sublevels::new(&t.orders[0], t, &[6]);
-        // Each value takes 9 bytes written plain. Under `a` 2,000 values fill four pages; under each
-        // of `b`, `c` and `d` 200 fill none, and the three together fill one; `e` fills two alone.
-        let mut text: Vec<String> = (0..2000).map(|i| format!("a{i:04}")).collect();
-        for p in ["b", "c", "d"] {
-            text.extend((0..200).map(|i| format!("{p}{i:04}")));
+        let sublevels = Sublevels::new(&t.orders[0], t, &[0]);
+        // A date is cut on its year, its month and its day; each value takes 9 bytes here. In 2000,
+        // January's 2,000 values fill four pages, a thousand on each of its first two days; under
+        // each of February, March and April 200 fill none, and the three together fill one; May's
+        // thousand, on its first day, fill two alone. Days since 1970.
+        let (jan, feb, mar, apr, may) = (10_957, 10_988, 11_017, 11_048, 11_078);
+        let mut days: Vec<i64> = [jan, jan + 1]
+            .iter()
+            .flat_map(|&d| std::iter::repeat_n(d, 1000))
+            .collect();
+        for d in [feb, mar, apr] {
+            days.extend(std::iter::repeat_n(d, 200));
         }
-        text.extend((0..1000).map(|i| format!("e{i:04}")));
+        days.extend(std::iter::repeat_n(may, 1000));
         let keys = Keys {
             stride: 1,
-            data: text
-                .iter()
-                .map(|s| KeyValue::Text(s.as_str().into()))
-                .collect(),
+            data: days.iter().map(|&d| KeyValue::Int(d)).collect(),
         };
         let widths = Widths(vec![Width::Varying(
             std::iter::once(0)
-                .chain((1..=text.len() as u64).map(|n| n * 9))
+                .chain((1..=days.len() as u64).map(|n| n * 9))
                 .collect(),
         )]);
         let blocks = cut(&keys, &sublevels, &widths);
         let rows: Vec<usize> = blocks.iter().map(|b| b.rows()).collect();
         assert_eq!(rows, [1000, 1000, 600, 1000]);
-        assert_eq!(blocks[2].place, Vec::<i64>::new());
+        assert_eq!(blocks[2].place, [2000]);
     }
 
     #[test]

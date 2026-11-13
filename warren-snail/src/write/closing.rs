@@ -507,7 +507,7 @@ mod tests {
         let t = &c.tables[0];
         let order = &t.orders[0];
         let stride = order.levels.len();
-        let mut text = crate::write::level_kinds(t, order, crate::file::FORMAT);
+        let mut text = crate::write::level_kinds(t, order);
         for r in 0..keys.len() / stride {
             for li in 0..stride {
                 if let KeyValue::Text(s) = &keys[r * stride + li] {

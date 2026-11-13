@@ -2368,7 +2368,7 @@ fn assess_entry(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
         }
     } else if interval == Status::Must && j == 0 {
         whole
-    } else if walk.head.separated && !leads_by_its_own(&e, order, want.table, m.max(j)) {
+    } else if !leads_by_its_own(&e, order, want.table, m.max(j)) {
         0
     } else {
         slots.len() as u64

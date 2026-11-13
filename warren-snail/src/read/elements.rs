@@ -150,7 +150,6 @@ pub(crate) fn strand_table(table: &Table, key: &ElementKey) -> Table {
         foreign_keys: Vec::new(),
         monetary: table.monetary,
         text_search: table.text_search,
-        format: table.format,
         element_keys: Vec::new(),
         elements_of: Some(table.name.clone()),
         brins: Vec::new(),

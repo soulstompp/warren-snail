@@ -435,33 +435,6 @@ fn a_gin_index_is_read_or_refused_as_postgresql_reads_it() {
 }
 
 #[test]
-fn a_snail_of_an_old_format_refuses_an_element_strand_by_name() {
-    for (ddl, what) in [
-        ("USING gin (a)", "the gin index t_x"),
-        ("USING gist (v)", "the gist index t_x"),
-    ] {
-        let path = tmp("gin-eight.snail");
-        let e = warren_snail::write::write_format_eight(
-            &path,
-            &Catalog::parse(&format!(
-                "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, a int[], v tsvector, PRIMARY KEY (id)); \
-                 CREATE INDEX t_x ON s.t {ddl};"
-            ))
-            .unwrap(),
-            &[],
-            weather::span(),
-        )
-        .err()
-        .unwrap()
-        .to_string();
-        assert!(
-            e.contains(&format!("s.t: {what}, which a snail of format 8")) && e.contains("`out`"),
-            "{e}"
-        );
-    }
-}
-
-#[test]
 fn a_table_is_not_clustered_on_an_element_strand() {
     let table = "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, a int[], v tsvector);";
     let got = outcomes(&format!(
@@ -2732,24 +2705,6 @@ fn a_gist_index_beside_a_key_of_another_kind_holds_a_strand_of_each() {
         "{table}\nCREATE INDEX e ON s.t USING gist (v, r);\nALTER TABLE s.t CLUSTER ON e;"
     ));
     assert!(got[2].as_deref().unwrap().contains("element"), "{got:?}");
-    // A format with no strands refuses it by name.
-    let path = tmp("gin-beside-eight.snail");
-    let e = warren_snail::write::write_format_eight(
-        &path,
-        &Catalog::parse(&format!(
-            "{table}\nCREATE INDEX e ON s.t USING gist (v, r);"
-        ))
-        .unwrap(),
-        &[],
-        weather::span(),
-    )
-    .err()
-    .unwrap()
-    .to_string();
-    assert!(
-        e.contains("the gist index e, which a snail of format 8"),
-        "{e}"
-    );
 }
 
 #[test]

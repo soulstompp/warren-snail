@@ -556,53 +556,6 @@ CREATE INDEX c_p ON s.c (pid, id);";
     }
 }
 
-#[test]
-fn formats_seven_and_eight_refuse_a_null_on_a_level_by_name() {
-    let catalog = Catalog::parse(DDL).unwrap();
-    for name in ["seven", "eight"] {
-        let path = tmp(&format!("null-format-{name}.snail"));
-        let make = |rows: Rows| {
-            let tables = [("s.t".to_string(), rows)];
-            if name == "seven" {
-                warren_snail::write::write_format_seven(&path, &catalog, &tables, weather::span())
-            } else {
-                warren_snail::write::write_format_eight(&path, &catalog, &tables, weather::span())
-            }
-        };
-        let e = make(rows(64)).err().unwrap().to_string();
-        assert!(
-            e.contains("s.t: a level of t_b holds NULL, which a snail of format")
-                && e.contains("`out`"),
-            "{e}"
-        );
-        // A nullable level holding no NULL is written, and a statement putting a NULL on it is
-        // refused.
-        let full = Rows {
-            columns: vec![
-                Values::Int((0..64).map(Some).collect()),
-                Values::Int((0..64).map(Some).collect()),
-                Values::Text((0..64).map(|a| Some(a.to_string())).collect()),
-            ],
-        };
-        make(full).unwrap();
-        #[cfg(feature = "standalone")]
-        {
-            let mut w = Snail::open_writing(&path).unwrap();
-            let e = w
-                .execute("INSERT INTO s.t (a, b, s) VALUES (64, NULL, 'x')")
-                .err()
-                .unwrap()
-                .to_string();
-            assert!(
-                e.contains("a level of t_b holds NULL, which a snail of format"),
-                "{e}"
-            );
-            w.execute("INSERT INTO s.t (a, b, s) VALUES (64, 64, 'x')")
-                .unwrap();
-        }
-    }
-}
-
 /// A table ordered on a unique index of a nullable key, `k`: 2, NULL, 1 and 3.
 fn window_snail(name: &str, index: &str) -> std::path::PathBuf {
     let path = tmp(&format!("{name}.snail"));

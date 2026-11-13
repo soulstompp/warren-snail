@@ -357,44 +357,6 @@ fn a_boolean_is_written_as_postgresql_reads_its_input() {
 }
 
 #[test]
-#[cfg(feature = "standalone")]
-fn a_snail_of_format_seven_or_eight_refuses_a_boolean_by_name() {
-    let catalog = Catalog::parse(FLAGS).unwrap();
-    let path = tmp("flags-eight.snail");
-    let e = warren_snail::write::write_format_eight(&path, &catalog, &[], weather::span())
-        .err()
-        .unwrap()
-        .to_string();
-    assert!(
-        e.contains("s.flags.v is boolean, which a snail of format 8 cannot hold")
-            && e.contains("`out`"),
-        "{e}"
-    );
-    for name in ["seven", "eight"] {
-        let path = tmp(&format!("ints-{name}.snail"));
-        let ints =
-            Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));").unwrap();
-        if name == "seven" {
-            warren_snail::write::write_format_seven(&path, &ints, &[], weather::span()).unwrap();
-        } else {
-            warren_snail::write::write_format_eight(&path, &ints, &[], weather::span()).unwrap();
-        }
-        let mut w = Snail::open_writing(&path).unwrap();
-        let e = w
-            .execute("CREATE TABLE s.u (a integer NOT NULL, f boolean, PRIMARY KEY (a))")
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            e.contains("s.u.f is boolean, which a snail of format"),
-            "{e}"
-        );
-        w.execute("CREATE TABLE s.u (a integer NOT NULL, PRIMARY KEY (a))")
-            .unwrap();
-    }
-}
-
-#[test]
 fn a_null_takes_no_width_in_a_column_s_unit_or_in_its_pages() {
     // On t_g a block is a day's 1,024 rows, all of g = 0, so the furthest-out place is the block. b
     // is NULL on every other row: its 512 values are 4,096 bytes, a unit of one page, where at its

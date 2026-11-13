@@ -739,26 +739,6 @@ fn write_refuses_an_orphan_among_the_rows_it_is_given() {
     write(&path, &catalog, &[p(), c]).unwrap();
 }
 
-#[test]
-fn a_snail_of_format_seven_or_eight_refuses_a_foreign_key_by_name() {
-    let catalog = Catalog::parse(
-        "CREATE SCHEMA s; CREATE TABLE s.p (id integer NOT NULL, PRIMARY KEY (id)); CREATE TABLE s.c (id integer NOT NULL, r integer REFERENCES s.p, PRIMARY KEY (id));",
-    )
-    .unwrap();
-    for n in [7, 8] {
-        let path = tmp(&format!("keys-format-{n}.snail"));
-        let made = match n {
-            7 => warren_snail::write::write_format_seven(&path, &catalog, &[], weather::span()),
-            _ => warren_snail::write::write_format_eight(&path, &catalog, &[], weather::span()),
-        };
-        let e = made.unwrap_err().to_string();
-        assert!(
-            e.contains("the FOREIGN KEY c_r_fkey") && e.contains("`out` and `write`"),
-            "{e}"
-        );
-    }
-}
-
 /// A writer's statements run on a thread of its own, its results sent back when they end.
 fn later(
     path: &std::path::Path,

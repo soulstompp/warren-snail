@@ -1152,29 +1152,3 @@ fn a_composed_value_s_operators_answer_as_postgresql_s() {
     }
 }
 
-#[test]
-#[cfg(feature = "standalone")]
-fn a_snail_of_format_eight_refuses_a_composed_column_by_name() {
-    for (ddl, why) in [
-        (
-            "CREATE TABLE s.k (id integer NOT NULL, a integer[], PRIMARY KEY (id));",
-            "s.k.a is integer[], a group of 3 leaves",
-        ),
-        (
-            "CREATE TABLE s.k (id integer NOT NULL, r int4range, PRIMARY KEY (id));",
-            "s.k.r is int4range, a group of 3 leaves",
-        ),
-        (
-            "CREATE TYPE s.m AS ENUM ('a'); CREATE TABLE s.k (id integer NOT NULL, m s.m, PRIMARY KEY (id));",
-            "which a snail of format 8",
-        ),
-    ] {
-        let catalog = warren_snail::catalog::Catalog::parse(&format!("CREATE SCHEMA s; {ddl}")).unwrap();
-        let path = weather::tmp("composed-eight.snail");
-        let e = warren_snail::write::write_format_eight(&path, &catalog, &[], weather::span())
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(e.contains(why) && e.contains("`out`"), "{e}");
-    }
-}

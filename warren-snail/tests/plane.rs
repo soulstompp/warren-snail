@@ -721,7 +721,7 @@ fn a_distance_beside_a_condition_finds_its_nearest_rows_along_its_strand() {
 }
 
 #[test]
-fn write_and_the_old_formats_treat_a_shape_as_postgresql_and_their_refusals_name_the_way_across() {
+fn write_treats_a_shape_as_postgresql() {
     // A circle whose bounding box overflows, refused where it enters the strand.
     let catalog = Catalog::parse(
         "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v circle, PRIMARY KEY (id)); \
@@ -748,27 +748,6 @@ fn write_and_the_old_formats_treat_a_shape_as_postgresql_and_their_refusals_name
     .unwrap()
     .to_string();
     assert!(e.contains("value out of range: overflow"), "{e}");
-    for (ty, method) in [("point", "gist"), ("polygon", "spgist")] {
-        let e = warren_snail::write::write_format_eight(
-            &tmp("plane-eight.snail"),
-            &Catalog::parse(&format!(
-                "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, v {ty}, PRIMARY KEY (a)); \
-                 CREATE INDEX t_v ON s.t USING {method} (v);",
-            ))
-            .unwrap(),
-            &[],
-            weather::span(),
-        )
-        .err()
-        .unwrap()
-        .to_string();
-        assert!(
-            e.contains(&format!(
-                "s.t: the {method} index t_v, which a snail of format 8"
-            )) && e.contains("`out`"),
-            "{e}"
-        );
-    }
 }
 
 #[test]

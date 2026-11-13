@@ -14,7 +14,7 @@ use warren_snail::file::Reader;
 use warren_snail::read::Snail;
 use warren_snail::values::Values;
 use warren_snail::write::Rows;
-use weather::{fresh, span, tmp, write};
+use weather::{fresh, tmp, write};
 
 /// Tables enough that no root holds them.
 const MANY: usize = 600;
@@ -1011,34 +1011,3 @@ mod written {
     }
 }
 
-#[test]
-fn formats_seven_and_eight_refuse_a_schema_their_root_does_not_hold() {
-    let catalog = Catalog::parse(&ddl(MANY)).unwrap();
-    for (format, written) in [
-        (
-            8,
-            warren_snail::write::write_format_eight(
-                &tmp("tables-eight.snail"),
-                &catalog,
-                &[],
-                span(),
-            ),
-        ),
-        (
-            7,
-            warren_snail::write::write_format_seven(
-                &tmp("tables-seven.snail"),
-                &catalog,
-                &[],
-                span(),
-            ),
-        ),
-    ] {
-        let e = written.unwrap_err().to_string();
-        assert!(
-            e.contains("does not fit one page")
-                && e.contains(&format!("format {format} cannot cut")),
-            "{e}"
-        );
-    }
-}

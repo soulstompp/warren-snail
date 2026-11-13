@@ -1,4 +1,4 @@
-//! What grows with the schema, once a format 9 root no longer holds it: the tables' orders and money
+//! What grows with the schema, once the root no longer holds it: the tables' orders and money
 //! columns, the catalog's text and the sequences, each a list of entries, a key and its value, packed
 //! whole into pages in the keys' order. A page is named by the first key it holds and the generation
 //! that wrote it; levels stand above the entries until the top fits where it is kept, in the root or

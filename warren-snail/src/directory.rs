@@ -255,9 +255,6 @@ pub struct Head {
     pub bound_slots: Vec<u32>,
     /// The first leaves of the columns whose BRIN summary each entry keeps, a summary each.
     pub summed: Vec<u32>,
-    /// Whether each entry keeps one key, the separator below it, as format 9 keeps an order: its upper
-    /// bound read from the separator above it.
-    pub separated: bool,
 }
 
 /// What `Head::level_text` holds for a level keyed in 128 bits.
@@ -267,8 +264,8 @@ pub const WIDE_LEVEL: u32 = 1 << 31;
 /// be text: a bytea's, a bit string's.
 pub const BYTES_LEVEL: u32 = 1 << 30;
 
-/// The bit `Head::level_text` sets beside its sublevels for a level of format 9 cut a bit a rung, or
-/// on its structure where it is composed, rather than a byte a rung.
+/// The bit `Head::level_text` sets beside its sublevels for a level cut a bit a rung, or on its
+/// structure where it is composed: every level keyed by its bytes or its text but a bit string's.
 pub const BITS_LEVEL: u32 = 1 << 29;
 
 /// The top bit of a head's height, set where the order holds a column keyed in 128 bits: the
@@ -291,8 +288,8 @@ const HEAD_BOUNDS: u32 = 1 << 28;
 
 /// The bit of a head's height set where each entry keeps one key, the separator below it, its
 /// upper bound the separator above it: the next entry's, or for a page's last the entry above
-/// the page's, or for the top's last the order's greatest end, which follows the bounds' slots. A
-/// head without it keeps each entry's first and last keys whole.
+/// the page's, or for the top's last the order's greatest end, which follows the bounds' slots.
+/// Every head this build writes sets it.
 const HEAD_SEPARATED: u32 = 1 << 27;
 
 /// The bit of a head's height set where each entry keeps a BRIN summary: the slots follow the bounds'.
@@ -528,24 +525,15 @@ pub fn separate(
     }
 }
 
-/// A block's bounds after a key written into it, where its order keeps one separator between
-/// blocks: its first key lowered, as `cut_below` cuts it, or its last raised, as `cut_above` widens
-/// it, each beside the bound it leaves, where the key lies beyond them; whole where it keeps both
-/// keys.
-pub fn widened(e: &mut Entry, key: &[KeyValue], separated: bool) {
+/// A block's bounds after a key written into it, its order keeping one separator between blocks:
+/// its first key lowered, as `cut_below` cuts it, or its last raised, as `cut_above` widens it, each
+/// beside the bound it leaves, where the key lies beyond them.
+pub fn widened(e: &mut Entry, key: &[KeyValue]) {
     if key < e.first.as_slice() {
-        e.first = if separated {
-            cut_below(key, &e.last)
-        } else {
-            key.to_vec()
-        };
+        e.first = cut_below(key, &e.last);
     }
     if key > e.last.as_slice() || (e.open && key == e.last.as_slice()) {
-        (e.last, e.open) = if separated {
-            cut_above(key, &e.first)
-        } else {
-            (key.to_vec(), false)
-        };
+        (e.last, e.open) = cut_above(key, &e.first);
     }
 }
 
@@ -602,7 +590,7 @@ fn add(a: u32, b: u32) -> Result<u32> {
 }
 
 /// The top bit of an entry's depth, set where its month columns hold an infinite instant: their
-/// counts at each end follow their months. An entry holding none is written as format 8 writes it.
+/// counts at each end follow their months. An entry holding none is written as before.
 const ENTRY_ENDS: u32 = 1 << 31;
 
 /// The next bit, set where a column's least and greatest take more than 8 bytes to part: what it keeps
@@ -632,19 +620,10 @@ impl Entry {
         (&self.last, self.open)
     }
 
-    /// The bytes the entry takes in its page.
+    /// The bytes the entry takes in its page, as one key, its separator.
     pub fn size(&self) -> usize {
-        self.size_in(false)
-    }
-
-    /// The bytes the entry takes in its page, as one key, its separator, where `separated`.
-    pub fn size_in(&self, separated: bool) -> usize {
-        let keys = if separated {
-            32 + keys_len(kept(&self.first))
-        } else {
-            36 + keys_len(&self.first) + keys_len(&self.last)
-        };
-        keys + self.columns.iter().map(Summary::size).sum::<usize>()
+        32 + keys_len(kept(&self.first))
+            + self.columns.iter().map(Summary::size).sum::<usize>()
             + 48 * self.months.len()
             + if self.has_ends() {
                 8 * self.ends.len()
@@ -743,18 +722,13 @@ impl Entry {
         Ok(e)
     }
 
-    fn encode(&self, o: &mut Out, separated: bool) {
+    fn encode(&self, o: &mut Out) {
         let ends = self.has_ends();
         let tails = self.has_tails();
         o.u32(self.depth | if ends { ENTRY_ENDS } else { 0 } | if tails { ENTRY_TAILS } else { 0 });
         o.u32(self.rows);
         o.u32(self.dead);
-        if separated {
-            keys_out(o, kept(&self.first));
-        } else {
-            keys_out(o, &self.first);
-            keys_out(o, &self.last);
-        }
+        keys_out(o, kept(&self.first));
         for c in &self.columns {
             o.u32(c.nulls);
             if c.wide {
@@ -808,14 +782,10 @@ impl Entry {
         let rows = i.u32()?;
         let dead = i.u32()?;
         let levels = head.level_text.len();
-        let (first, last) = if head.separated {
-            (
-                padded(keys_in(i, &head.level_text)?, levels, LEAST),
-                Vec::new(),
-            )
-        } else {
-            (keys_in(i, &head.level_text)?, keys_in(i, &head.level_text)?)
-        };
+        let (first, last) = (
+            padded(keys_in(i, &head.level_text)?, levels, LEAST),
+            Vec::new(),
+        );
         let mut columns = Vec::with_capacity(head.units.len());
         for s in 0..head.units.len() {
             let wide = head.wide_slots.contains(&(s as u32));
@@ -905,7 +875,7 @@ impl Entry {
 
 /// The top bit of a key's count, set where the key holds a NULL: each level's value then follows a
 /// byte saying what it is, a value (0), or a NULL before its level's values (1) or after them (2),
-/// which takes no more. A key holding none is written as format 8 writes it.
+/// which takes no more. A key holding none is written as before.
 const KEY_NULLS: u32 = 1 << 31;
 
 /// A key's bytes past its count: a number in 8, text in its length and its bytes, and where the key
@@ -1008,9 +978,7 @@ pub fn encode_top(head: &Head, entries: &[Entry]) -> Vec<u8> {
     if !head.summed.is_empty() {
         height |= HEAD_SUMMED;
     }
-    if head.separated {
-        height |= HEAD_SEPARATED;
-    }
+    height |= HEAD_SEPARATED;
     o.u32(height);
     if !head.wide_slots.is_empty() {
         u32s(&mut o, &head.wide_slots);
@@ -1030,14 +998,12 @@ pub fn encode_top(head: &Head, entries: &[Entry]) -> Vec<u8> {
     if !head.summed.is_empty() {
         u32s(&mut o, &head.summed);
     }
-    if head.separated {
-        keys_out(
-            &mut o,
-            entries.last().map_or(&[][..], |e| e.last.as_slice()),
-        );
-        o.u8(entries.last().is_some_and(|e| e.open) as u8);
-    }
-    o.0.extend_from_slice(&encode_page(entries, head.separated));
+    keys_out(
+        &mut o,
+        entries.last().map_or(&[][..], |e| e.last.as_slice()),
+    );
+    o.u8(entries.last().is_some_and(|e| e.open) as u8);
+    o.0.extend_from_slice(&encode_page(entries));
     o.0
 }
 
@@ -1085,47 +1051,40 @@ pub fn decode_top(buf: &[u8]) -> Result<(Head, Vec<Entry>)> {
         span_slots,
         bound_slots,
         summed,
-        separated: height & HEAD_SEPARATED != 0,
     };
-    // Where each entry keeps one key, the top's last is bounded by the order's greatest end.
-    let greatest = if head.separated {
-        keys_in(&mut i, &head.level_text)?
-    } else {
-        Vec::new()
-    };
-    let open = head.separated && i.u8()? != 0;
+    // Each entry keeps one key: the top's last is bounded by the order's greatest end.
+    let greatest = keys_in(&mut i, &head.level_text)?;
+    let open = i.u8()? != 0;
     let entries = decode_page(&buf[i.at()..], &head, (&greatest, open))?;
     Ok((head, entries))
 }
 
 /// A directory page: how many entries it holds, then the entries.
-pub fn encode_page(entries: &[Entry], separated: bool) -> Vec<u8> {
+pub fn encode_page(entries: &[Entry]) -> Vec<u8> {
     let mut o = Out::default();
     o.u32(entries.len() as u32);
     for e in entries {
-        e.encode(&mut o, separated);
+        e.encode(&mut o);
     }
     o.0
 }
 
-/// A directory page, its entries' kinds told by `head`. Where each entry keeps one key, an entry's
-/// last is the greatest the next entry's separator leaves it, and the page's last entry's `upper`,
-/// the last of the entry above the page.
+/// A directory page, its entries' kinds told by `head`. Each entry keeps one key: an entry's last is
+/// the greatest the next entry's separator leaves it, and the page's last entry's `upper`, the last
+/// of the entry above the page.
 pub fn decode_page(buf: &[u8], head: &Head, upper: (&[KeyValue], bool)) -> Result<Vec<Entry>> {
     let mut i = In::new(buf);
     let mut entries = (0..i.u32()?)
         .map(|_| Entry::decode(&mut i, head))
         .collect::<Result<Vec<_>>>()?;
-    if head.separated {
-        for k in 0..entries.len() {
-            (entries[k].last, entries[k].open) = match entries.get(k + 1) {
-                Some(next) => below(&next.first, &head.level_text),
-                None => (
-                    padded(upper.0.to_vec(), head.level_text.len(), GREATEST),
-                    upper.1,
-                ),
-            };
-        }
+    for k in 0..entries.len() {
+        (entries[k].last, entries[k].open) = match entries.get(k + 1) {
+            Some(next) => below(&next.first, &head.level_text),
+            None => (
+                padded(upper.0.to_vec(), head.level_text.len(), GREATEST),
+                upper.1,
+            ),
+        };
     }
     Ok(entries)
 }
@@ -1154,13 +1113,13 @@ pub fn build_from(
     head.height = height;
     loop {
         let top = encode_top(&head, &level);
-        // Where each entry keeps one key, a top of two entries or fewer is the top, a page or more.
-        if top.len() <= PAGE || (head.separated && level.len() <= 2) {
+        // Each entry keeps one key: a top of two entries or fewer is the top, a page or more.
+        if top.len() <= PAGE || level.len() <= 2 {
             return Ok((top, below));
         }
         let mut parents = Vec::new();
-        for page in pack(level, head.separated)? {
-            let at = place(&encode_page(&page, head.separated))?;
+        for page in pack(level)? {
+            let at = place(&encode_page(&page))?;
             below += at.pages();
             parents.push(Entry::over(&page, at, &head.bound_slots)?);
         }
@@ -1169,21 +1128,17 @@ pub fn build_from(
     }
 }
 
-/// Entries packed whole into directory pages, in their order, each page as full as it goes. Where each
-/// entry keeps one key, a page holds two entries at least, and takes the disk pages they need.
-pub fn pack(entries: Vec<Entry>, separated: bool) -> Result<Vec<Vec<Entry>>> {
+/// Entries packed whole into directory pages, in their order, each page as full as it goes. Each
+/// entry keeps one key: a page holds two entries at least, and takes the disk pages they need.
+pub fn pack(entries: Vec<Entry>) -> Result<Vec<Vec<Entry>>> {
     let mut pages = Vec::new();
     let mut page: Vec<Entry> = Vec::new();
     let mut used = 4;
-    let least = if separated { 2 } else { 1 };
     for e in entries {
-        let size = e.size_in(separated);
-        if used + size > PAGE && page.len() >= least {
+        let size = e.size();
+        if used + size > PAGE && page.len() >= 2 {
             pages.push(std::mem::take(&mut page));
             used = 4;
-        }
-        if !separated && page.is_empty() && used + size > PAGE {
-            return Err(Error::new("a directory entry does not fit a page"));
         }
         used += size;
         page.push(e);
@@ -1209,22 +1164,21 @@ pub struct PageEntry {
 pub struct ColumnPages {
     pub dictionary: Option<Extent>,
     pub pages: Vec<PageEntry>,
-    /// The leaf's counting unit in the block, in disk pages, where its map keeps one, as a map of
-    /// format 9 does; 0 where the order's head gives it.
+    /// The leaf's counting unit in the block, in disk pages, where its map keeps one; 0 where the
+    /// order's head gives it.
     pub unit: u32,
 }
 
 /// The bit a page map sets on its count of leaves where it keeps each leaf's unit.
 const UNITS_KEPT: u32 = 1 << 31;
 
-/// The bytes a run of page maps begins with, in a snail of the current format: how many maps it holds.
+/// The bytes a run of packed page maps begins with: how many maps it holds.
 pub(crate) const MAP_HEAD: usize = 4;
 
 impl Entry {
     /// Where a block's page map lies: the run of pages that holds it, and where in that run it
     /// begins. The block's entry names the run's first page, and where the map begins and its bytes
-    /// in the two halves of the bytes it names; a map that begins its run, as every map of format 7
-    /// does, lies alone in it.
+    /// in the two halves of the bytes it names; a map that begins its run lies alone in it.
     pub(crate) fn map_run(&self) -> (Extent, usize) {
         map_run_of(self.child)
     }
@@ -1267,9 +1221,9 @@ pub(crate) fn maps_held(first: &[u8], at: usize) -> u32 {
     }
 }
 
-/// Page maps written as they come: in the current format packed whole into shared pages, each page
-/// beginning with how many maps it holds, a map too wide for a page in a run of its own; in format 7
-/// each in pages of its own. A packed page is written once no further map goes into it.
+/// Page maps written as they come: packed whole into shared pages, each page beginning with how many
+/// maps it holds, a map too wide for a page in a run of its own; or, not packed, each in pages of its
+/// own. A packed page is written once no further map goes into it.
 pub(crate) struct MapPages {
     packed: bool,
     open: Option<(u64, Vec<u8>, u32)>,
@@ -1470,7 +1424,6 @@ mod tests {
             span_slots: Vec::new(),
             summed: Vec::new(),
             bound_slots: Vec::new(),
-            separated: false,
         }
     }
 
@@ -1588,16 +1541,17 @@ mod tests {
     #[test]
     fn a_top_a_page_and_a_page_map_come_back_as_written() {
         let h = head();
-        let entries = vec![block(1, 3892, 40), block(2, 7, 41)];
+        let mut entries = vec![block(1, 3892, 40), block(2, 7, 41)];
+        separate(&mut entries, &h.level_text, None, None);
         let mut o = Out::default();
-        entries[0].encode(&mut o, false);
+        entries[0].encode(&mut o);
         assert_eq!(entries[0].size(), o.0.len());
         assert_eq!(
             decode_top(&encode_top(&h, &entries)).unwrap(),
             (h.clone(), entries.clone())
         );
         assert_eq!(
-            decode_page(&encode_page(&entries, false), &h, (&[], false)).unwrap(),
+            decode_page(&encode_page(&entries), &h, entries[1].bound()).unwrap(),
             entries
         );
         let map = PageMap {
@@ -1638,8 +1592,10 @@ mod tests {
         u32s(&mut before, &h.month_slots);
         u32s(&mut before, &h.text_slots);
         u32s(&mut before, &h.level_text);
-        before.u32(h.height);
-        before.0.extend_from_slice(&encode_page(&entries, false));
+        before.u32(h.height | HEAD_SEPARATED);
+        keys_out(&mut before, &entries[0].last);
+        before.u8(0);
+        before.0.extend_from_slice(&encode_page(&entries));
         assert_eq!(encode_top(&h, &entries), before.0);
         // A uuid level and a uuid column held beside an integer.
         let wide = Head {
@@ -1653,7 +1609,6 @@ mod tests {
             span_slots: Vec::new(),
             summed: Vec::new(),
             bound_slots: Vec::new(),
-            separated: false,
         };
         let key = |k: i128| vec![KeyValue::Wide(k)];
         let e = Entry {
@@ -1691,7 +1646,7 @@ mod tests {
             },
         };
         let mut o = Out::default();
-        e.encode(&mut o, false);
+        e.encode(&mut o);
         assert_eq!(e.size(), o.0.len());
         assert_eq!(
             decode_top(&encode_top(&wide, std::slice::from_ref(&e))).unwrap(),
@@ -1710,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn a_key_holding_a_null_comes_back_as_written_and_one_holding_none_as_format_eight_wrote_it() {
+    fn a_key_holding_a_null_comes_back_as_written_and_one_holding_none_as_before() {
         let text = |s: &str| KeyValue::Text(s.into());
         let (first, last) = (
             KeyValue::Null { first: true },
@@ -1727,14 +1682,14 @@ mod tests {
             assert_eq!(o.0.len(), 4 + keys_len(&key), "{key:?}");
             assert_eq!(keys_in(&mut In::new(&o.0), &[0, 0, 1]).unwrap(), key);
         }
-        // A key holding no NULL: its count, then each value, as format 8 wrote it.
+        // A key holding no NULL: its count, then each value, as before.
         let mut o = Out::default();
         keys_out(&mut o, &[KeyValue::Int(5), text("x")]);
-        let mut eight = 2u32.to_le_bytes().to_vec();
-        eight.extend(5i64.to_le_bytes());
-        eight.extend(1u32.to_le_bytes());
-        eight.push(b'x');
-        assert_eq!(o.0, eight);
+        let mut plain = 2u32.to_le_bytes().to_vec();
+        plain.extend(5i64.to_le_bytes());
+        plain.extend(1u32.to_le_bytes());
+        plain.push(b'x');
+        assert_eq!(o.0, plain);
     }
 
     #[test]
@@ -1782,10 +1737,10 @@ mod tests {
         assert_eq!((run.pages(), at), (2, MAP_HEAD));
         let buf = reader.read_extent(run).unwrap();
         assert_eq!((maps_held(&buf, at), &buf[at..]), (1, wide.as_slice()));
-        // Unpacked, as format 7 lays them, each map begins a run of its own.
-        let mut seven = MapPages::new(false);
-        let (child, data) = seven.place(&mut w, 1000, 2, true).unwrap();
-        seven.write(&mut w, child, &small[0]).unwrap();
+        // Not packed, each map begins a run of its own.
+        let mut apart = MapPages::new(false);
+        let (child, data) = apart.place(&mut w, 1000, 2, true).unwrap();
+        apart.write(&mut w, child, &small[0]).unwrap();
         assert_eq!((entry(child).map_run().1, data), (0, child.start + 1));
     }
 
@@ -1866,10 +1821,11 @@ mod tests {
 
     #[test]
     fn entries_pack_whole_into_pages_and_levels_rise_until_one_page_holds_the_top() {
-        // Entries of 192 bytes: 21 to a page. 1,000 of them make 48 pages, which make 3 above them, and
-        // those fit the top.
-        let blocks: Vec<Entry> = (0..1000).map(|i| block(i, 1000, i as u64)).collect();
-        assert_eq!(blocks[0].size(), 192);
+        // Entries of 164 bytes past the first's 172: 24 to a page. 1,000 of them make 42 pages, which
+        // make 2 above them, and those 2 are the top.
+        let mut blocks: Vec<Entry> = (0..1000).map(|i| block(i, 1000, i as u64)).collect();
+        separate(&mut blocks, &head().level_text, None, None);
+        assert_eq!((blocks[0].size(), blocks[1].size()), (172, 164));
         let mut pages: Vec<Vec<u8>> = Vec::new();
         let mut next = 100u64;
         let (top, below) = build(head(), blocks.clone(), &mut |bytes| {
@@ -1883,16 +1839,19 @@ mod tests {
         })
         .unwrap();
         assert!(top.len() <= PAGE && pages.iter().all(|p| p.len() <= PAGE));
-        assert_eq!(pages.len(), 48 + 3);
-        assert_eq!(below, 51);
+        assert_eq!(pages.len(), 42 + 2);
+        assert_eq!(below, 44);
         let (h, entries) = decode_top(&top).unwrap();
-        assert_eq!((h.height, entries.len()), (3, 3));
+        assert_eq!((h.height, entries.len()), (3, 2));
         assert_eq!(entries.iter().map(|e| e.rows).sum::<u32>(), 1_000_000);
-        // The leaves, read back in order, are the blocks as written.
-        let leaves: Vec<Entry> = pages[..48]
-            .iter()
-            .flat_map(|p| decode_page(p, &h, (&[], false)).unwrap())
-            .collect();
+        // The leaves, read back in order, are the blocks as written, each page's last bounded as
+        // the entry above it bounds it.
+        let mut leaves: Vec<Entry> = Vec::new();
+        for p in &pages[..42] {
+            let n = u32::from_le_bytes(p[..4].try_into().unwrap()) as usize;
+            let upper = blocks[leaves.len() + n - 1].bound();
+            leaves.extend(decode_page(p, &h, upper).unwrap());
+        }
         assert_eq!(leaves, blocks);
 
         // 30 entries take two pages, so they never sit in the top together.
@@ -1990,7 +1949,6 @@ mod tests {
             ]
         );
         let h = Head {
-            separated: true,
             level_text: level_text.to_vec(),
             ..head()
         };
@@ -1998,11 +1956,8 @@ mod tests {
         assert_eq!(decode_top(&top).unwrap(), (h, entries.clone()));
         // Each entry keeps one key, its separator less its dropped levels.
         let mut o = Out::default();
-        entries[1].encode(&mut o, true);
-        assert_eq!(
-            (entries[1].size_in(true), o.0.len()),
-            (entries[1].size() - 16, 164)
-        );
+        entries[1].encode(&mut o);
+        assert_eq!((entries[1].size(), o.0.len()), (164, 164));
     }
 
     /// Byte strings of every length to 11 over three bytes, sharing their first bytes so that the
@@ -2255,7 +2210,6 @@ mod tests {
         entries[0].columns[1].min = 5;
         entries[0].columns[1].max = 5;
         let h = Head {
-            separated: true,
             level_text: vec![1 | BITS_LEVEL],
             bound_slots: vec![1],
             cut_under: vec![String::new()],
@@ -2264,7 +2218,7 @@ mod tests {
         let (read, got) = decode_top(&encode_top(&h, &entries)).unwrap();
         assert_eq!((read, got), (h, entries.clone()));
         let mut o = Out::default();
-        entries[0].encode(&mut o, true);
-        assert_eq!(entries[0].size_in(true), o.0.len());
+        entries[0].encode(&mut o);
+        assert_eq!(entries[0].size(), o.0.len());
     }
 }

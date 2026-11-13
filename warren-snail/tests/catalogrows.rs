@@ -983,26 +983,4 @@ mod written {
             );
         }
     }
-
-    #[test]
-    fn a_snail_of_an_old_format_refuses_a_vector_and_a_row_type_by_name_with_the_way_across() {
-        for format in [7u32, 8] {
-            let path = tmp(&format!("old-{format}.snail"));
-            let plain = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.p (id integer PRIMARY KEY);").unwrap();
-            if format == 7 {
-                warren_snail::write::write_format_seven(&path, &plain, &[], weather::span()).unwrap();
-            } else {
-                warren_snail::write::write_format_eight(&path, &plain, &[], weather::span()).unwrap();
-            }
-            for (ty, name) in [("int2vector", "int2vector"), ("oidvector", "oidvector"), ("pg_class", "pg_class")] {
-                let mut w = Snail::open_writing(&path).unwrap();
-                let e = w
-                    .execute(&format!("CREATE TABLE s.t (id integer PRIMARY KEY, c {ty})"))
-                    .unwrap_err()
-                    .to_string();
-                assert!(e.contains(name), "{e}");
-                assert!(e.contains("`out`") && e.contains("`write`"), "{e}");
-            }
-        }
-    }
 }

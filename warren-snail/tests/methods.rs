@@ -290,45 +290,6 @@ fn aclitem_cid_and_xid_are_keyed_on_their_bytes_in_a_hash_strand() {
 }
 
 #[test]
-fn a_snail_of_format_eight_refuses_an_index_of_another_method_by_name() {
-    let path = tmp("eight-hash.snail");
-    let e = warren_snail::write::write_format_eight(
-        &path,
-        &Catalog::parse(
-            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a)); \
-             CREATE INDEX t_b ON s.t USING hash (b);",
-        )
-        .unwrap(),
-        &[],
-        weather::span(),
-    )
-    .err()
-    .unwrap()
-    .to_string();
-    assert!(
-        e.contains("s.t: the hash index t_b, which a snail of format 8") && e.contains("`out`"),
-        "{e}"
-    );
-    let e = warren_snail::write::write_format_eight(
-        &path,
-        &Catalog::parse(
-            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a)); \
-             CREATE INDEX t_b ON s.t (b) WHERE b > 0;",
-        )
-        .unwrap(),
-        &[],
-        weather::span(),
-    )
-    .err()
-    .unwrap()
-    .to_string();
-    assert!(
-        e.contains("s.t: the partial index t_b, which a snail of format 8") && e.contains("`out`"),
-        "{e}"
-    );
-}
-
-#[test]
 fn a_partial_index_s_predicate_is_read_as_a_question_s_where_or_refused_by_name() {
     let table = "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, a int, tags int[], gone timestamptz);";
     let got = outcomes(&format!(
@@ -972,7 +933,7 @@ fn a_writer_whose_value_conflicts_with_another_s_uncommitted_waits_and_is_refuse
 }
 
 #[test]
-fn write_and_a_snail_of_format_eight_refuse_an_exclude_by_name() {
+fn write_refuses_an_exclude_by_name() {
     let catalog = Catalog::parse(
         "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a), \
          CONSTRAINT t_b EXCLUDE (b WITH =));",
@@ -991,19 +952,6 @@ fn write_and_a_snail_of_format_eight_refuse_an_exclude_by_name() {
     .to_string();
     assert!(
         e.contains("write does not hold its rows to the EXCLUDE t_b: give them by INSERT"),
-        "{e}"
-    );
-    let e = warren_snail::write::write_format_eight(
-        &tmp("eight-exclude.snail"),
-        &catalog,
-        &[],
-        weather::span(),
-    )
-    .err()
-    .unwrap()
-    .to_string();
-    assert!(
-        e.contains("s.t: the EXCLUDE t_b, which a snail of format 8"),
         "{e}"
     );
 }

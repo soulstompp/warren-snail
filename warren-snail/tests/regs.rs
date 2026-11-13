@@ -6,9 +6,11 @@ mod weather;
 
 #[cfg(feature = "standalone")]
 use arrow::array::{Array, UInt32Array, UInt64Array};
+#[cfg(feature = "standalone")]
 use warren_snail::catalog::Catalog;
 #[cfg(feature = "standalone")]
 use warren_snail::read::Snail;
+#[cfg(feature = "standalone")]
 use weather::tmp;
 #[cfg(feature = "standalone")]
 use weather::{exact, ints64, texts};
@@ -352,21 +354,6 @@ fn the_file_records_each_money_column_s_lc_monetary() {
             .collect::<Vec<_>>(),
         ["s.r.m C", "s.q.a C", "s.q.b C"]
     );
-}
-
-#[test]
-fn a_snail_of_format_7_or_8_refuses_a_reg_type_and_oid8_by_name() {
-    for (ty, name) in [("regclass", "regclass"), ("oid8", "oid8")] {
-        let catalog = Catalog::parse(&format!(
-            "CREATE SCHEMA s; CREATE TABLE s.f (n integer NOT NULL, v {ty}, PRIMARY KEY (n));"
-        ))
-        .unwrap();
-        let path = tmp(&format!("regs-format-8-{ty}.snail"));
-        let e = warren_snail::write::write_format_eight(&path, &catalog, &[], weather::span())
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains(name) && e.contains("cannot hold"), "{e}");
-    }
 }
 
 #[cfg(feature = "standalone")]

@@ -14,260 +14,11 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 const MAGIC: [u8; 8] = *b"wsnail\0\x01";
-/// The format a snail is made in, and the two before it, each read and written as it is: format 8,
-/// 0.1.1's, and format 7, 0.1.0's, whose page maps each lie in pages of their own.
+/// The format a snail is made in, and the one this build opens.
 pub(crate) const FORMAT: u32 = 9;
-pub(crate) const FORMAT_EIGHT: u32 = 8;
-pub(crate) const FORMAT_SEVEN: u32 = 7;
-
-/// Whether this build reads and writes a snail of `format`.
-fn reads(format: u32) -> bool {
-    format == FORMAT || format == FORMAT_EIGHT || format == FORMAT_SEVEN
-}
-
-/// Refuses a table whose columns a snail of `format` cannot hold: formats 7 and 8 hold the types
-/// 0.1.x held, and no other.
-pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result<()> {
-    if format >= FORMAT {
-        return Ok(());
-    }
-    let way = format!(
-        "which a snail of format {format} cannot hold: put the snail `out` and `write` it afresh, in \
-         format {FORMAT}"
-    );
-    if let Some(c) = table
-        .columns
-        .iter()
-        .find(|c| c.default.is_some() || c.generated.is_some() || c.identity.is_some())
-    {
-        return Err(crate::Error::new(format!(
-            "{}.{} has a DEFAULT, a generation or an identity, {way}",
-            table.name, c.name
-        )));
-    }
-    if let Some(k) = table.checks.first() {
-        return Err(crate::Error::new(format!(
-            "{}: the CHECK {}, {way}",
-            table.name, k.name
-        )));
-    }
-    if let Some(o) = table.orders.iter().find(|o| o.without_overlaps()) {
-        return Err(crate::Error::new(format!(
-            "{}: the key WITHOUT OVERLAPS {}, {way}",
-            table.name, o.name
-        )));
-    }
-    if let Some(o) = table
-        .orders
-        .iter()
-        .find(|o| o.constraint.as_ref().is_some_and(|k| !k.primary))
-    {
-        return Err(crate::Error::new(format!(
-            "{}: the UNIQUE {}, {way}",
-            table.name, o.name
-        )));
-    }
-    // 0.1.x refuses a table whose DDL names no order in the DDL it reads.
-    if table.orders.iter().any(|o| o.given()) {
-        return Err(crate::Error::new(format!(
-            "{} names no key, and lies along every column it orders, {way}",
-            table.name
-        )));
-    }
-    // 0.1.x refuses any index but a B-tree in the DDL it reads.
-    if let Some(o) = table
-        .orders
-        .iter()
-        .find(|o| o.method != crate::catalog::Method::Btree)
-    {
-        return Err(crate::Error::new(format!(
-            "{}: the {} index {}, {way}",
-            table.name,
-            o.method.name(),
-            o.name
-        )));
-    }
-    if let Some(k) = table.element_keys.first() {
-        return Err(crate::Error::new(format!(
-            "{}: the {} index {}, {way}",
-            table.name,
-            k.method.name(),
-            k.index
-        )));
-    }
-    if let Some(b) = table.brins.first() {
-        return Err(crate::Error::new(format!(
-            "{}: the brin index {}, {way}",
-            table.name, b.name
-        )));
-    }
-    if let Some(o) = table.orders.iter().find(|o| o.predicate.is_some()) {
-        return Err(crate::Error::new(format!(
-            "{}: the partial index {}, {way}",
-            table.name, o.name
-        )));
-    }
-    if let Some(o) = table.orders.iter().find(|o| o.exclusion.is_some()) {
-        return Err(crate::Error::new(format!(
-            "{}: the EXCLUDE {}, {way}",
-            table.name, o.name
-        )));
-    }
-    // 0.1.x refuses a FOREIGN KEY in the DDL it reads.
-    if let Some(k) = table.foreign_keys.first() {
-        return Err(crate::Error::new(format!(
-            "{}: the FOREIGN KEY {}, {way}",
-            table.name, k.name
-        )));
-    }
-    // Formats 7 and 8 key a level by a number or text alone.
-    if let Some((o, c)) = table.orders.iter().find_map(|o| {
-        o.levels
-            .iter()
-            .map(|l| &table.columns[l.column()])
-            .find(|c| c.ty == crate::catalog::ColumnType::Bytes)
-            .map(|c| (o, c))
-    }) {
-        return Err(crate::Error::new(format!(
-            "{}: {} is a bytea level of {}, {way}",
-            table.name, c.name, o.name
-        )));
-    }
-    // Formats 7 and 8 compare text by its bytes alone.
-    if let Some(c) = table.columns.iter().find(|c| c.library.is_some()) {
-        return Err(crate::Error::new(format!(
-            "{}.{} is under the collation {}, {way}",
-            table.name,
-            c.name,
-            c.collation.as_deref().unwrap_or_default()
-        )));
-    }
-    // Formats 7 and 8 hold a column as one leaf.
-    if let Some(i) = (0..table.columns.len()).find(|&i| table.leaf_count(i) > 1) {
-        let c = &table.columns[i];
-        let leaves: Vec<String> = table
-            .column_leaves(i)
-            .iter()
-            .map(|l| l.name(&c.name))
-            .collect();
-        return Err(crate::Error::new(format!(
-            "{}.{} is {}, a group of {} leaves, {}, {way}",
-            table.name,
-            c.name,
-            c.ty.name(),
-            leaves.len(),
-            leaves.join(" and ")
-        )));
-    }
-    match table.columns.iter().find(|c| !c.ty.held_by_0_1()) {
-        Some(c) => Err(crate::Error::new(format!(
-            "{}.{} is {}, which a snail of format {format} cannot hold: put the snail `out` and \
-             `write` it afresh, in format {FORMAT}",
-            table.name,
-            c.name,
-            c.ty.name()
-        ))),
-        None => Ok(()),
-    }
-}
-
-/// Refuses a catalog's types, domains, sequences and collations in a snail of `format`: 0.1.x reads
-/// none, and a sequence's state lies in format 9's root. So too a statement 0.1.x does not read in
-/// the DDL the file keeps, which it reads again as it opens: CREATE SCHEMA and the DROPs.
-pub(crate) fn holds_catalog(format: u32, catalog: &crate::catalog::Catalog) -> crate::Result<()> {
-    if format >= FORMAT {
-        return Ok(());
-    }
-    let what = if let Some(s) = crate::ddl::past_first_formats(&catalog.ddl) {
-        format!("the statement {s}")
-    } else if let Some(t) = catalog.types.first() {
-        format!("the type {}", t.name)
-    } else if let Some(d) = catalog.domains.first() {
-        format!("the domain {}", d.name)
-    } else if let Some(s) = catalog.sequences.first() {
-        format!("the sequence {}", s.name)
-    } else if let Some(k) = catalog.collations.first() {
-        format!("the collation {}", k.name)
-    } else if let Some(v) = catalog.views.first() {
-        format!("the view {}", v.name)
-    } else if let Some((t, o)) = catalog.tables.iter().find_map(|t| {
-        t.orders
-            .iter()
-            .find(|o| {
-                o.levels
-                    .iter()
-                    .any(|l| matches!(l, crate::catalog::Level::Scaled(..)))
-            })
-            .map(|o| (t, o))
-    }) {
-        format!(
-            "{}'s {}, a level of a double precision's places",
-            t.name, o.name
-        )
-    } else {
-        return Ok(());
-    };
-    Err(crate::Error::new(format!(
-        "{what}, which a snail of format {format} cannot hold: put the snail `out` and `write` it \
-         afresh, in format {FORMAT}"
-    )))
-}
-
-/// Refuses a numeric column's NaN in a snail of `format`: 0.1.x would read the integer that stands
-/// for it as a number.
-pub(crate) fn holds_nan(
-    format: u32,
-    table: &crate::catalog::Table,
-    column: usize,
-) -> crate::Result<()> {
-    if format >= FORMAT {
-        return Ok(());
-    }
-    Err(crate::Error::new(format!(
-        "{}.{} holds NaN, which a snail of format {format} cannot hold: put the snail `out` and \
-         `write` it afresh, in format {FORMAT}",
-        table.name, table.columns[column].name
-    )))
-}
-
-/// Refuses a NULL on a level of `order` in a snail of `format`: no key of formats 7 and 8 holds one.
-pub(crate) fn keys_null(
-    format: u32,
-    table: &crate::catalog::Table,
-    order: &crate::catalog::Order,
-) -> crate::Result<()> {
-    if format >= FORMAT {
-        return Ok(());
-    }
-    Err(crate::Error::new(format!(
-        "{}: a level of {} holds NULL, which a snail of format {format} cannot hold: put the snail \
-         `out` and `write` it afresh, in format {FORMAT}",
-        table.name, order.name
-    )))
-}
-
-/// Refuses an infinite instant in column `column` of `table` in a snail of `format` where a level
-/// of an order holds the column or its month: no key of formats 7 and 8 holds one, nor their twelve
-/// counts of a month.
-pub(crate) fn instant_ends(
-    format: u32,
-    table: &crate::catalog::Table,
-    column: usize,
-) -> crate::Result<()> {
-    if format >= FORMAT
-        || !table
-            .orders
-            .iter()
-            .any(|o| o.levels.iter().any(|l| l.column() == column))
-    {
-        return Ok(());
-    }
-    Err(crate::Error::new(format!(
-        "{}.{} holds an infinite instant on a level, which a snail of format {format} cannot hold: \
-         put the snail `out` and `write` it afresh, in format {FORMAT}",
-        table.name, table.columns[column].name
-    )))
-}
+/// The formats warren-snail 0.1.0 and 0.1.1 made: a file of either is refused by name, with the way
+/// across.
+const MADE_BY_0_1: [u32; 2] = [7, 8];
 
 /// The pages a file holds before the next begins, unless the snail is made with another span: 1 GiB.
 pub const FILE_PAGES: u64 = 1 << 18;
@@ -401,54 +152,48 @@ pub struct Root {
     /// every run reused after generation `reused_from`.
     pub reused: Vec<(u64, u64, u64)>,
     pub reused_from: u64,
-    /// Where each sequence stands that has handed out a value since the DDL made or restarted it:
-    /// format 9 only.
+    /// Where each sequence stands that has handed out a value since the DDL made or restarted it.
     pub sequences: Extent,
-    /// The PostgreSQL release the file's OIDs came from: format 9 only, 19 in formats 7 and 8,
-    /// which hold no reg* value.
+    /// The PostgreSQL release the file's OIDs came from.
     pub release: u8,
-    /// Each money column's `lc_monetary`: its table, its column and the locale; format 9 only, as
-    /// formats 7 and 8 hold no money.
+    /// Each money column's `lc_monetary`: its table, its column and the locale.
     pub monetary: Vec<(String, String, String)>,
-    /// The file's own default collation, as a database's, which jsonb's strings sort under: format 9
-    /// only; libc C.UTF-8 where it names none.
+    /// The file's own default collation, as a database's, which jsonb's strings sort under; libc
+    /// C.UTF-8 where it names none.
     pub collation: String,
-    /// The file's `default_text_search_config`: format 9 only; `pg_catalog.simple` where it names
-    /// none.
+    /// The file's `default_text_search_config`; `pg_catalog.simple` where it names none.
     pub text_search: String,
     /// The transactions across snails this root's writes decided, each until a round across them
-    /// finds every other snail's root written: format 9 only.
+    /// finds every other snail's root written.
     pub decided: Vec<Decision>,
     /// Where this copy of the root was written before another snail's root decided its
-    /// transaction: it is taken only once a round across them finds that root written. Format 9
-    /// only.
+    /// transaction: it is taken only once a round across them finds that root written.
     pub pending: Option<Pending>,
     /// The tag of the host's transaction this root was written for, where its host tags them: it
     /// is taken only where the host says that transaction committed, or where a root of the next
-    /// generation lies beside it; a round with no host to ask reads the copy beside it. Format 9
-    /// only.
+    /// generation lies beside it; a round with no host to ask reads the copy beside it.
     pub host: Option<u64>,
     /// The source the snail is a replica of, where it is marked one: every writer but the applier
-    /// presenting that source is refused while the mark stands. Format 9 only.
+    /// presenting that source is refused while the mark stands.
     pub replica: Option<String>,
     /// The serializable transactions' records: each committed one's marks and edges, kept while a
-    /// round older than its commit runs. Format 9 only.
+    /// round older than its commit runs.
     pub serial: Extent,
     /// Where the last of them stands on the clock the records of snails opened together share, so that
-    /// commits have one order: format 9 only, 0 where none has been.
+    /// commits have one order: 0 where none has been.
     pub clock: u64,
     /// The next OID a writer of the file takes, where it is past where the catalog's text goes on:
-    /// a transaction's taken and not yet committed, or one's rolled back. Format 9 only, 0 where
-    /// the text's own is next.
+    /// a transaction's taken and not yet committed, or one's rolled back; 0 where the text's own is
+    /// next.
     pub next_oid: u32,
     /// The statements of the catalog's text whose OIDs depart from its order, each by its place and
-    /// its first OID (`oids::Record`): format 9 only, none where every statement's follow the text.
+    /// its first OID (`oids::Record`); none where every statement's follow the text.
     pub oids: Extent,
-    /// Where what grows with the schema lies once the root would not hold it: format 9 only.
+    /// Where what grows with the schema lies once the root would not hold it.
     pub(crate) cut: Option<Cut>,
 }
 
-/// What a format 9 root cut into pages once it would not hold it: the tables' orders and money
+/// What a root cut into pages once it would not hold it: the tables' orders and money
 /// columns, a list whose top the root holds; the catalog's text, a list whose top page `catalog`
 /// names; and the sequences, a list whose top page `sequences` names. A root once cut stays cut.
 #[derive(Clone, Debug, Default)]
@@ -483,15 +228,6 @@ fn listed_key(table: &str, kind: u8, name: &str) -> Vec<u8> {
     k.push(kind);
     k.extend_from_slice(name.as_bytes());
     k
-}
-
-/// What a snail of a format older than this build's says of a serializable transaction: its root
-/// holds no records of one.
-pub(crate) fn serial_refused(format: u32) -> Error {
-    Error::new(format!(
-        "a snail of format {format} runs no SERIALIZABLE transaction, its root holding no records of \
-         one: put the snail `out` and `write` it afresh, in format {FORMAT}"
-    ))
 }
 
 /// The default collation a file names where it names none: libc C.UTF-8, which orders text by its
@@ -674,31 +410,25 @@ pub(crate) fn decode_record(buf: &[u8]) -> Result<Vec<(u32, u32)>> {
     (0..i.u32()?).map(|_| Ok((i.u32()?, i.u32()?))).collect()
 }
 
-/// The free map as a snail of the current format holds it: its runs, then each page of packed page
-/// maps some of whose maps a commit has stopped naming, with how many. A snail of format 7 holds the
-/// runs alone.
-pub(crate) fn encode_free(runs: &[Run], spent: &[(u64, u32)], format: u32) -> Vec<u8> {
+/// The free map: its runs, then each page of packed page maps some of whose maps a commit has
+/// stopped naming, with how many.
+pub(crate) fn encode_free(runs: &[Run], spent: &[(u64, u32)]) -> Vec<u8> {
     let mut bytes = encode_runs(runs);
-    if format != FORMAT_SEVEN {
-        let mut o = Out::default();
-        o.u32(spent.len() as u32);
-        for &(page, n) in spent {
-            o.u64(page);
-            o.u32(n);
-        }
-        bytes.extend_from_slice(&o.0);
+    let mut o = Out::default();
+    o.u32(spent.len() as u32);
+    for &(page, n) in spent {
+        o.u64(page);
+        o.u32(n);
     }
+    bytes.extend_from_slice(&o.0);
     bytes
 }
 
 /// Each page of packed page maps some of whose maps a commit has stopped naming, with how many.
 pub(crate) type Spent = Vec<(u64, u32)>;
 
-pub(crate) fn decode_free(buf: &[u8], format: u32) -> Result<(Vec<Run>, Spent)> {
+pub(crate) fn decode_free(buf: &[u8]) -> Result<(Vec<Run>, Spent)> {
     let runs = decode_runs(buf)?;
-    if format == FORMAT_SEVEN {
-        return Ok((runs, Vec::new()));
-    }
     let mut i = In::new(&buf[4 + 24 * runs.len()..]);
     let spent = (0..i.u32()?)
         .map(|_| Ok((i.u64()?, i.u32()?)))
@@ -707,7 +437,7 @@ pub(crate) fn decode_free(buf: &[u8], format: u32) -> Result<(Vec<Run>, Spent)> 
 }
 
 impl Root {
-    pub(crate) fn encode(&self, format: u32) -> Result<Vec<u8>> {
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         if let Some(cut) = &self.cut {
             if cut.tables.read() && cut.tables.entries() != self.listed()? {
                 return Err(Error::new(
@@ -715,30 +445,24 @@ impl Root {
                 ));
             }
         }
-        let bytes = self.encoded(format, false, None)?;
+        let bytes = self.encoded(false, None)?;
         if bytes.len() > PAGE {
-            return Err(Error::new(match format >= FORMAT {
-                true => "the root does not fit one page".to_string(),
-                false => format!(
-                    "the root does not fit one page, which a snail of format {format} cannot cut: \
-                     put the snail `out` and `write` it afresh, in format {FORMAT}"
-                ),
-            }));
+            return Err(Error::new("the root does not fit one page"));
         }
         Ok(bytes)
     }
 
-    /// Whether a root of `format` not cut holds what grows with the schema, with its reused runs at
-    /// their most and room for what its commit adds after its pages.
-    pub(crate) fn fits_uncut(&self, format: u32) -> Result<bool> {
-        Ok(self.encoded(format, true, None)?.len() + MARGIN <= PAGE)
+    /// Whether a root not cut holds what grows with the schema, with its reused runs at their most
+    /// and room for what its commit adds after its pages.
+    pub(crate) fn fits_uncut(&self) -> Result<bool> {
+        Ok(self.encoded(true, None)?.len() + MARGIN <= PAGE)
     }
 
     /// The bytes a cut root has for the top of its tables' list, its reused runs at their most and
     /// room left for what its commit adds after its pages.
-    pub(crate) fn top_room(&self, format: u32) -> Result<usize> {
+    pub(crate) fn top_room(&self) -> Result<usize> {
         let empty = crate::listing::Node::default();
-        let rest = self.encoded(format, true, Some(&empty))?.len() - empty.bytes();
+        let rest = self.encoded(true, Some(&empty))?.len() - empty.bytes();
         Ok(PAGE.saturating_sub(rest + MARGIN))
     }
 
@@ -796,15 +520,10 @@ impl Root {
 
     /// The root's bytes: `full` with its reused runs at their most, and with `top` in place of its
     /// tables' list's top where it is cut.
-    fn encoded(
-        &self,
-        format: u32,
-        full: bool,
-        top: Option<&crate::listing::Node>,
-    ) -> Result<Vec<u8>> {
+    fn encoded(&self, full: bool, top: Option<&crate::listing::Node>) -> Result<Vec<u8>> {
         let mut o = Out::default();
         o.0.extend_from_slice(&MAGIC);
-        o.u32(format);
+        o.u32(FORMAT);
         o.u64(self.generation);
         o.u64(self.pages);
         o.u64(self.span);
@@ -817,11 +536,6 @@ impl Root {
                     o.str(n);
                     o.extent(*e);
                 }
-            }
-            Some(_) if format < FORMAT => {
-                return Err(Error::new(format!(
-                    "a snail of format {format} holds its tables in its root: `out`, then `write`"
-                )))
             }
             Some(cut) => {
                 o.u32(CUT);
@@ -844,120 +558,88 @@ impl Root {
             o.u64(s);
             o.u64(p);
         }
-        if format >= FORMAT {
-            o.extent(self.sequences);
-            o.u8(self.release);
-            let monetary: &[(String, String, String)] = match self.cut {
-                None => &self.monetary,
-                Some(_) => &[],
-            };
-            o.u32(monetary.len() as u32);
-            for (t, c, l) in monetary {
-                o.str(t);
-                o.str(c);
-                o.str(l);
+        o.extent(self.sequences);
+        o.u8(self.release);
+        let monetary: &[(String, String, String)] = match self.cut {
+            None => &self.monetary,
+            Some(_) => &[],
+        };
+        o.u32(monetary.len() as u32);
+        for (t, c, l) in monetary {
+            o.str(t);
+            o.str(c);
+            o.str(l);
+        }
+        o.str(self.collation());
+        o.u32(self.decided.len() as u32);
+        for d in &self.decided {
+            o.u64(d.at);
+            o.extent(d.carried);
+            o.u32(d.roots.len() as u32);
+            for w in &d.roots {
+                o.str(&w.holds);
+                o.u64(w.generation);
+                o.u32(w.crc);
             }
-            o.str(self.collation());
-            o.u32(self.decided.len() as u32);
-            for d in &self.decided {
-                o.u64(d.at);
-                o.extent(d.carried);
-                o.u32(d.roots.len() as u32);
-                for w in &d.roots {
-                    o.str(&w.holds);
-                    o.u64(w.generation);
-                    o.u32(w.crc);
+        }
+        // Whether a transaction across snails is pending, and whether the serializable
+        // transactions' records follow.
+        let searched = self.text_search() != TEXT_SEARCH;
+        let records = u8::from(self.serial.bytes > 0) * 2
+            + u8::from(self.clock > 0) * 4
+            + u8::from(searched) * 8
+            + u8::from(self.next_oid > 0) * 16
+            + u8::from(self.oids.bytes > 0) * 32;
+        match &self.pending {
+            None => o.u8(records),
+            Some(p) => {
+                o.u8(1 + records);
+                o.str(&p.decider);
+                o.u64(p.at);
+            }
+        }
+        if self.serial.bytes > 0 {
+            o.extent(self.serial);
+        }
+        if self.clock > 0 {
+            o.u64(self.clock);
+        }
+        if searched {
+            o.str(self.text_search());
+        }
+        if self.next_oid > 0 {
+            o.u32(self.next_oid);
+        }
+        if self.oids.bytes > 0 {
+            o.extent(self.oids);
+        }
+        // A root marked a replica carries its source, then whether its host tagged it.
+        match &self.replica {
+            None => {
+                if let Some(tag) = self.host {
+                    o.u64(tag);
                 }
             }
-            // Whether a transaction across snails is pending, and whether the serializable
-            // transactions' records follow.
-            let searched = self.text_search() != TEXT_SEARCH;
-            let records = u8::from(self.serial.bytes > 0) * 2
-                + u8::from(self.clock > 0) * 4
-                + u8::from(searched) * 8
-                + u8::from(self.next_oid > 0) * 16
-                + u8::from(self.oids.bytes > 0) * 32;
-            match &self.pending {
-                None => o.u8(records),
-                Some(p) => {
-                    o.u8(1 + records);
-                    o.str(&p.decider);
-                    o.u64(p.at);
-                }
-            }
-            if self.serial.bytes > 0 {
-                o.extent(self.serial);
-            }
-            if self.clock > 0 {
-                o.u64(self.clock);
-            }
-            if searched {
-                o.str(self.text_search());
-            }
-            if self.next_oid > 0 {
-                o.u32(self.next_oid);
-            }
-            if self.oids.bytes > 0 {
-                o.extent(self.oids);
-            }
-            // A root marked a replica carries its source, then whether its host tagged it.
-            match &self.replica {
-                None => {
-                    if let Some(tag) = self.host {
+            Some(source) => {
+                o.str(source);
+                match self.host {
+                    None => o.u8(0),
+                    Some(tag) => {
+                        o.u8(1);
                         o.u64(tag);
                     }
                 }
-                Some(source) => {
-                    o.str(source);
-                    match self.host {
-                        None => o.u8(0),
-                        Some(tag) => {
-                            o.u8(1);
-                            o.u64(tag);
-                        }
-                    }
-                }
             }
-        } else if self.text_search() != TEXT_SEARCH {
-            return Err(Error::new(format!(
-                "a snail of format {format} reads under default_text_search_config {TEXT_SEARCH} \
-                 and takes no other: `out`, then `write`"
-            )));
-        } else if self.replica.is_some() {
-            return Err(Error::new(format!(
-                "a snail of format {format} is marked a replica of no source: `out`, then `write`"
-            )));
-        } else if self.host.is_some() {
-            return Err(Error::new(format!(
-                "a snail of format {format} is written through no host that tags its roots: `out`, \
-                 then `write`"
-            )));
-        } else if !self.decided.is_empty() || self.pending.is_some() {
-            return Err(Error::new(format!(
-                "a snail of format {format} is written by no transaction across snails: `out`, \
-                 then `write`"
-            )));
-        } else if self.serial.bytes > 0 {
-            return Err(serial_refused(format));
-        } else if self.next_oid > 0 || self.oids.bytes > 0 {
-            return Err(Error::new(format!(
-                "a snail of format {format} gives its objects their OIDs in its text's order alone: \
-                 `out`, then `write`"
-            )));
         }
         let crc = crc32fast::hash(&o.0);
         o.u32(crc);
         Ok(o.0)
     }
 
-    /// A copy of the root and its format, where it is whole and of a format this build reads.
-    pub(crate) fn decode(page: &[u8]) -> Option<(Root, u32)> {
+    /// A copy of the root, where it is whole and of the format this build reads.
+    pub(crate) fn decode(page: &[u8]) -> Option<Root> {
         let mut i = In::new(page);
-        if i.take(8).ok()? != MAGIC {
-            return None;
-        }
-        let format = i.u32().ok()?;
-        if !reads(format) {
+        if i.take(8).ok()? != MAGIC || i.u32().ok()? != FORMAT {
             return None;
         }
         let generation = i.u64().ok()?;
@@ -967,7 +649,7 @@ impl Root {
         let n = i.u32().ok()?;
         let mut orders = Vec::new();
         let mut cut = None;
-        if n == CUT && format >= FORMAT {
+        if n == CUT {
             let catalog_at = i.u64().ok()?;
             let sequences_at = i.u64().ok()?;
             let top = crate::listing::Node::decode(&mut i).ok()?;
@@ -989,34 +671,27 @@ impl Root {
         for _ in 0..m {
             reused.push((i.u64().ok()?, i.u64().ok()?, i.u64().ok()?));
         }
-        let (sequences, release, monetary) = if format >= FORMAT {
-            let sequences = i.extent().ok()?;
-            let release = i.u8().ok()?;
-            let n = i.u32().ok()? as usize;
-            let mut monetary = Vec::with_capacity(n.min(256));
-            for _ in 0..n {
-                monetary.push((i.str().ok()?, i.str().ok()?, i.str().ok()?));
-            }
-            (sequences, release, monetary)
-        } else {
-            (Extent::default(), crate::regs::LATEST, Vec::new())
-        };
-        // A root written before format 9 named its default collation ends here, its CRC next; one
-        // written before it held decisions across snails ends after its collation.
+        let sequences = i.extent().ok()?;
+        let release = i.u8().ok()?;
+        let n = i.u32().ok()? as usize;
+        let mut monetary = Vec::with_capacity(n.min(256));
+        for _ in 0..n {
+            monetary.push((i.str().ok()?, i.str().ok()?, i.str().ok()?));
+        }
+        // A root written before roots named a default collation ends here, its CRC next; one
+        // written before they held decisions across snails ends after its collation.
         let ended_at = |at: usize| {
             page.get(at..at + 4).is_some_and(|c| {
                 u32::from_le_bytes(c.try_into().unwrap()) == crc32fast::hash(&page[..at])
             })
         };
         let ended = |i: &In| ended_at(i.at());
-        let collation = if format >= FORMAT && !ended(&i) {
+        let collation = if !ended(&i) {
             i.str().ok()?
         } else {
             String::new()
         };
-        let ((decided, pending, serial, clock, text_search), (next_oid, oids)) = if format >= FORMAT
-            && !ended(&i)
-        {
+        let ((decided, pending, serial, clock, text_search), (next_oid, oids)) = if !ended(&i) {
             let n = i.u32().ok()? as usize;
             let mut decided = Vec::with_capacity(n.min(256));
             for _ in 0..n {
@@ -1061,7 +736,10 @@ impl Root {
                 0 => Extent::default(),
                 _ => i.extent().ok()?,
             };
-            ((decided, pending, serial, clock, text_search), (next_oid, oids))
+            (
+                (decided, pending, serial, clock, text_search),
+                (next_oid, oids),
+            )
         } else {
             (
                 (Vec::new(), None, Extent::default(), 0, String::new()),
@@ -1070,7 +748,7 @@ impl Root {
         };
         // A root its host tagged carries the tag last; one marked a replica carries its source,
         // then whether its host tagged it.
-        let (replica, host) = if format < FORMAT || ended(&i) {
+        let (replica, host) = if ended(&i) {
             (None, None)
         } else if ended_at(i.at() + 8) {
             (None, Some(i.u64().ok()?))
@@ -1120,15 +798,15 @@ impl Root {
         {
             root.unlist(&entries).ok()?;
         }
-        Some((root, format))
+        Some(root)
     }
 
     /// The checksum a root's encoding ends with, as the root it stands for once taken: its pending
     /// mark left out.
-    pub(crate) fn crc(&self, format: u32) -> Result<u32> {
+    pub(crate) fn crc(&self) -> Result<u32> {
         let mut taken = self.clone();
         taken.pending = None;
-        let bytes = taken.encode(format)?;
+        let bytes = taken.encode()?;
         Ok(u32::from_le_bytes(
             bytes[bytes.len() - 4..].try_into().unwrap(),
         ))
@@ -1204,8 +882,6 @@ pub(crate) struct Files {
     pub(crate) first: File,
     rest: RefCell<Vec<Option<File>>>,
     pub(crate) span: Cell<u64>,
-    /// The format the root names, once read.
-    pub(crate) format: Cell<u32>,
     write: bool,
     /// The files written since they last reached the disk.
     dirty: RefCell<BTreeSet<u64>>,
@@ -1224,7 +900,6 @@ impl Files {
             first,
             rest: RefCell::new(Vec::new()),
             span: Cell::new(0),
-            format: Cell::new(FORMAT),
             write,
             dirty: RefCell::new(BTreeSet::new()),
         })
@@ -1610,14 +1285,12 @@ impl Reader {
         crate::lock::hold_generations_from(&self.files.first, from)?;
         let Copies {
             root,
-            format,
             pending,
             copy,
             waiting,
             unseen,
         } = self.copies()?;
         self.files.span.set(root.span);
-        self.files.format.set(format);
         crate::lock::keep_generation(&self.files.first, from, root.generation)?;
         self.unseen.set(unseen);
         self.round.set(Some(root.generation));
@@ -1636,14 +1309,12 @@ impl Reader {
     pub fn peek_root(&self) -> Result<Root> {
         let Copies {
             root,
-            format,
             pending,
             copy,
             waiting,
             ..
         } = self.copies()?;
         self.files.span.set(root.span);
-        self.files.format.set(format);
         self.forget_reused(&root);
         let root = self.expanded(root)?;
         *self.spare.borrow_mut() = pending.map(|p| self.expanded(p)).transpose()?;
@@ -1856,29 +1527,25 @@ impl Reader {
     }
 
     /// The commit's last step before its free map, at generation `at`: what grows with the schema
-    /// cut into pages where a root of `format` would hold it no longer, its catalog and sequences
-    /// moved out of their own pages; and each page of a cut root's tables' list whose entries
-    /// changed written afresh. The pages replaced are added to `gone`.
+    /// cut into pages where the root would hold it no longer, its catalog and sequences moved out
+    /// of their own pages; and each page of a cut root's tables' list whose entries changed written
+    /// afresh. The pages replaced are added to `gone`.
     pub(crate) fn settle(
         &self,
         root: &mut Root,
-        format: u32,
         at: u64,
         w: &mut dyn Place,
         gone: &mut Vec<Extent>,
     ) -> Result<()> {
-        if format < FORMAT {
-            return Ok(());
-        }
         if root.cut.is_none() {
-            if root.fits_uncut(format)? {
+            if root.fits_uncut()? {
                 return Ok(());
             }
             let text = self.read_extent(root.catalog)?;
             let states = self.sequence_states(root)?;
             cut_afresh(root, &text, &states, at, w, gone)?;
         }
-        settle_tables(root, format, at, w, gone)
+        settle_tables(root, at, w, gone)
     }
 }
 
@@ -1944,7 +1611,6 @@ fn sequence_entries(states: &[SequenceState]) -> Vec<crate::listing::Item> {
 /// `at`, levels standing above them until the root holds the top.
 pub(crate) fn settle_tables(
     root: &mut Root,
-    format: u32,
     at: u64,
     w: &mut dyn Place,
     gone: &mut Vec<Extent>,
@@ -1953,7 +1619,7 @@ pub(crate) fn settle_tables(
         return Ok(());
     }
     let entries = root.listed()?;
-    let room = root.top_room(format)?;
+    let room = root.top_room()?;
     let cut = root.cut.as_mut().unwrap();
     cut.tables = crate::listing::settle(
         &cut.tables,
@@ -2059,23 +1725,22 @@ impl Reader {
         &self.files.first
     }
 
-    /// The format the root last read names.
+    /// The format the root names: this build's, the one format it opens.
     pub fn format(&self) -> u32 {
-        self.files.format.get()
+        FORMAT
     }
 }
 
-/// The newer of the root's two copies, given as the file's first two pages, that is whole, and its
-/// format. A file whose root names a format this build does not read is refused by that format. A
-/// pending copy is never taken.
-pub(crate) fn newer(both: &[u8]) -> Result<(Root, u32)> {
-    copies(both, None).map(|c| (c.root, c.format))
+/// The newer of the root's two copies, given as the file's first two pages, that is whole. A file
+/// whose root names another format than this build's is refused by that format, one 0.1.x made
+/// with the way across. A pending copy is never taken.
+pub(crate) fn newer(both: &[u8]) -> Result<Root> {
+    copies(both, None).map(|c| c.root)
 }
 
 /// The root a round takes from the root's two copies, and what lies beside it.
 pub(crate) struct Copies {
     pub(crate) root: Root,
-    pub(crate) format: u32,
     /// The other copy, where it is a pending one written for the generation after the root.
     pub(crate) pending: Option<Root>,
     /// The copy, 0 or 1, the root lies in.
@@ -2098,7 +1763,7 @@ pub(crate) fn copies(both: &[u8], judge: Option<&dyn crate::carry::Judge>) -> Re
     let decoded = [Root::decode(&both[..PAGE]), Root::decode(&both[PAGE..])];
     let mut settled = [false; 2];
     for c in 0..2 {
-        let Some((r, _)) = &decoded[c] else {
+        let Some(r) = &decoded[c] else {
             continue;
         };
         settled[c] = match r.host {
@@ -2106,7 +1771,7 @@ pub(crate) fn copies(both: &[u8], judge: Option<&dyn crate::carry::Judge>) -> Re
             Some(tag) => {
                 decoded[1 - c]
                     .as_ref()
-                    .is_some_and(|(o, _)| o.host.is_some() && o.generation == r.generation + 1)
+                    .is_some_and(|o| o.host.is_some() && o.generation == r.generation + 1)
                     || match judge {
                         Some(j) => j.taken(tag)?,
                         None => false,
@@ -2118,28 +1783,26 @@ pub(crate) fn copies(both: &[u8], judge: Option<&dyn crate::carry::Judge>) -> Re
         .filter_map(|c| {
             decoded[c as usize]
                 .as_ref()
-                .filter(|(r, _)| r.pending.is_none() && settled[c as usize])
+                .filter(|r| r.pending.is_none() && settled[c as usize])
                 .map(|d| (c, d))
         })
-        .max_by_key(|(c, (r, _))| (r.generation, std::cmp::Reverse(*c)));
-    if let Some((copy, (root, format))) = taken {
+        .max_by_key(|(c, r)| (r.generation, std::cmp::Reverse(*c)));
+    if let Some((copy, root)) = taken {
         let pending = decoded
             .iter()
             .flatten()
-            .map(|(r, _)| r)
             .find(|r| r.pending.is_some() && r.generation == root.generation + 1)
             .cloned();
         let waiting = decoded[1 - copy as usize]
             .as_ref()
-            .filter(|(r, _)| r.generation == root.generation + 1)
-            .and_then(|(r, _)| r.host);
+            .filter(|r| r.generation == root.generation + 1)
+            .and_then(|r| r.host);
         // The root holds its own commit and its parent's: the tag of either the judge's round does
         // not see.
         let mut unseen = None;
         if let Some(j) = judge {
             let parent = decoded[1 - copy as usize]
                 .as_ref()
-                .map(|(r, _)| r)
                 .filter(|r| r.generation + 1 == root.generation);
             let tags = [Some(root), parent]
                 .into_iter()
@@ -2154,21 +1817,18 @@ pub(crate) fn copies(both: &[u8], judge: Option<&dyn crate::carry::Judge>) -> Re
         }
         return Ok(Copies {
             root: root.clone(),
-            format: *format,
             pending,
             copy,
             waiting,
             unseen,
         });
     }
-    if let Some((copy, (root, format))) =
-        (0..2u64).find_map(|c| decoded[c as usize].as_ref().map(|d| (c, d)))
+    if let Some((copy, root)) = (0..2u64).find_map(|c| decoded[c as usize].as_ref().map(|d| (c, d)))
     {
         let mut root = root.clone();
         root.pending = None;
         return Ok(Copies {
             root,
-            format: *format,
             pending: None,
             copy,
             waiting: None,
@@ -2178,9 +1838,15 @@ pub(crate) fn copies(both: &[u8], judge: Option<&dyn crate::carry::Judge>) -> Re
     for copy in [&both[..PAGE], &both[PAGE..]] {
         if copy[..8] == MAGIC {
             let format = u32::from_le_bytes(copy[8..12].try_into().unwrap());
-            if !reads(format) {
+            if MADE_BY_0_1.contains(&format) {
                 return Err(Error::new(format!(
-                    "the snail is of format {format}, and this warren-snail reads formats {FORMAT_SEVEN}, {FORMAT_EIGHT} and {FORMAT}"
+                    "the snail is of format {format}, made by 0.1.x: `out` it with 0.1.x and \
+                     `write` it afresh with 0.2.0"
+                )));
+            }
+            if format != FORMAT {
+                return Err(Error::new(format!(
+                    "the snail is of format {format}, and this warren-snail reads format {FORMAT}"
                 )));
             }
         }
@@ -2197,7 +1863,7 @@ pub(crate) fn handed(both: &[u8], page: &[u8]) -> Result<Copies> {
     }
     let mut page = page.to_vec();
     page.resize(PAGE, 0);
-    let (root, format) = Root::decode(&page).ok_or_else(whole)?;
+    let root = Root::decode(&page).ok_or_else(whole)?;
     let copy = (0..2usize)
         .find(|&c| both[c * PAGE..(c + 1) * PAGE] == page[..])
         .ok_or_else(|| {
@@ -2207,13 +1873,11 @@ pub(crate) fn handed(both: &[u8], page: &[u8]) -> Result<Copies> {
             ))
         })?;
     let other = Root::decode(&both[(1 - copy) * PAGE..(2 - copy) * PAGE])
-        .map(|(r, _)| r)
         .filter(|r| r.generation == root.generation + 1);
     Ok(Copies {
         pending: other.clone().filter(|r| r.pending.is_some()),
         waiting: other.and_then(|r| r.host),
         root,
-        format,
         copy: copy as u64,
         unseen: None,
     })
@@ -2285,9 +1949,8 @@ impl Writer {
         let files = Files::open(path, true, false)?;
         let mut both = vec![0u8; 2 * PAGE];
         files.first.read_exact_at(&mut both, 0)?;
-        let (root, format) = newer(&both)?;
+        let root = newer(&both)?;
         files.span.set(root.span);
-        files.format.set(format);
         Ok((
             Writer {
                 files,
@@ -2342,14 +2005,9 @@ impl Writer {
         &self.files.first
     }
 
-    /// The format the snail is written in: a new snail's, or the one its root names.
+    /// The format the snail is written in: this build's, the one format it writes.
     pub fn format(&self) -> u32 {
-        self.files.format.get()
-    }
-
-    /// Makes a new snail in another format this build writes.
-    pub(crate) fn set_format(&mut self, format: u32) {
-        self.files.format.set(format);
+        FORMAT
     }
 
     /// Whether `pages` pages from `at` lie in one file. A run longer than a file lies across files.
@@ -2504,7 +2162,7 @@ impl Writer {
         root.pages = self.next;
         root.span = self.files.span.get();
         self.files.sync()?;
-        root.encode(self.files.format.get())
+        root.encode()
     }
 
     /// A root's bytes written to `copy`, 0 or 1, of the root's two, and on the disk.
@@ -2520,28 +2178,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_root_names_its_configuration_only_where_it_is_another_and_format_nine_alone_takes_one() {
+    fn a_root_names_its_configuration_only_where_it_is_another() {
         let r = Root {
             text_search: "pg_catalog.english".into(),
             ..Default::default()
         };
-        let mut bytes = r.encode(FORMAT).unwrap();
+        let mut bytes = r.encode().unwrap();
         bytes.resize(PAGE, 0);
-        let (back, _) = Root::decode(&bytes).unwrap();
+        let back = Root::decode(&bytes).unwrap();
         assert_eq!(back.text_search(), "pg_catalog.english");
-        let plain = Root::default().encode(FORMAT).unwrap();
+        let plain = Root::default().encode().unwrap();
         let simple = Root {
             text_search: TEXT_SEARCH.into(),
             ..Default::default()
         };
-        assert_eq!(simple.encode(FORMAT).unwrap(), plain);
-        let e = r.encode(FORMAT_EIGHT).unwrap_err().to_string();
-        assert!(
-            e.contains("reads under default_text_search_config pg_catalog.simple")
-                && e.contains("takes no other"),
-            "{e}"
-        );
-        assert!(Root::default().encode(FORMAT_EIGHT).is_ok());
+        assert_eq!(simple.encode().unwrap(), plain);
     }
 
     #[test]
@@ -2577,28 +2228,27 @@ mod tests {
             collation: "und-x-icu".into(),
             ..Default::default()
         };
-        let mut a = r.encode(FORMAT).unwrap();
+        let mut a = r.encode().unwrap();
         a.resize(PAGE, 0);
-        let (back, format) = Root::decode(&a).unwrap();
-        assert_eq!(format, FORMAT);
+        let back = Root::decode(&a).unwrap();
         assert_eq!(back.collation(), "und-x-icu");
         // A root that names no default collation names C.UTF-8, and so does one written before
-        // format 9 named one, its CRC right after its money columns.
+        // roots named one, its CRC right after its money columns.
         let plain = Root {
             collation: String::new(),
             ..r.clone()
         };
-        let full = plain.encode(FORMAT).unwrap();
+        let full = plain.encode().unwrap();
         let mut p = full.clone();
         p.resize(PAGE, 0);
-        assert_eq!(Root::decode(&p).unwrap().0.collation(), COLLATION);
+        assert_eq!(Root::decode(&p).unwrap().collation(), COLLATION);
         // The decisions across snails come after the collation: no decision is a count and a flag.
         let none = 4 + 1;
         let mut old = full[..full.len() - 4 - none - (4 + COLLATION.len())].to_vec();
         let crc = crc32fast::hash(&old);
         old.extend_from_slice(&crc.to_le_bytes());
         old.resize(PAGE, 0);
-        let (was, _) = Root::decode(&old).unwrap();
+        let was = Root::decode(&old).unwrap();
         assert_eq!((was.collation.as_str(), was.collation()), ("", COLLATION));
         assert_eq!(was.monetary, r.monetary);
         // A root written before it held decisions across snails ends after its collation.
@@ -2606,7 +2256,7 @@ mod tests {
         let crc = crc32fast::hash(&old);
         old.extend_from_slice(&crc.to_le_bytes());
         old.resize(PAGE, 0);
-        let (was, _) = Root::decode(&old).unwrap();
+        let was = Root::decode(&old).unwrap();
         assert_eq!(
             (was.collation(), was.decided.len(), was.pending.is_none()),
             (COLLATION, 0, true)
@@ -2638,30 +2288,28 @@ mod tests {
         assert_eq!(decode_runs(&encode_runs(&runs)).unwrap(), runs);
         let spent = [(12, 2), (40, 1)];
         assert_eq!(
-            decode_free(&encode_free(&runs, &spent, FORMAT), FORMAT).unwrap(),
+            decode_free(&encode_free(&runs, &spent)).unwrap(),
             (runs.to_vec(), spent.to_vec())
         );
-        assert_eq!(
-            decode_free(&encode_free(&runs, &[], FORMAT_SEVEN), FORMAT_SEVEN).unwrap(),
-            (runs.to_vec(), Vec::new())
-        );
-        assert_eq!(
-            decode_free(&encode_free(&runs, &spent, FORMAT_EIGHT), FORMAT_EIGHT).unwrap(),
-            (runs.to_vec(), spent.to_vec())
-        );
-        // A root of format 7 or 8 is read as one; of another format, the file is refused by its
-        // format.
-        for old in [FORMAT_SEVEN, FORMAT_EIGHT] {
-            let mut page = r.encode(old).unwrap();
-            page.resize(PAGE, 0);
-            assert_eq!(Root::decode(&page).unwrap().1, old);
+        // A root of another format is no root this build reads: the file is refused by its format,
+        // one of 0.1.x's with the way across.
+        let way = "made by 0.1.x: `out` it with 0.1.x and `write` it afresh with 0.2.0";
+        for (other, says) in [
+            (7, way),
+            (8, way),
+            (10, "and this warren-snail reads format 9"),
+        ] {
+            let mut page = a.clone();
+            page[8..12].copy_from_slice(&u32::to_le_bytes(other));
+            assert!(Root::decode(&page).is_none());
+            let mut both = page.clone();
+            both.extend_from_slice(&page);
+            let e = newer(&both).unwrap_err().to_string();
+            assert!(
+                e.starts_with(&format!("the snail is of format {other}, ")) && e.ends_with(says),
+                "{e}"
+            );
         }
-        let mut ten = r.encode(10).unwrap();
-        ten.resize(PAGE, 0);
-        let mut both = ten.clone();
-        both.extend_from_slice(&ten);
-        let e = newer(&both).unwrap_err().to_string();
-        assert!(e.contains("format 10"), "{e}");
         a[20] ^= 1;
         assert!(Root::decode(&a).is_none());
     }
@@ -2675,7 +2323,7 @@ mod tests {
     #[test]
     fn a_pending_copy_of_the_root_is_never_taken_and_is_found_beside_the_root() {
         let page = |r: &Root| {
-            let mut p = r.encode(FORMAT).unwrap();
+            let mut p = r.encode().unwrap();
             p.resize(PAGE, 0);
             p
         };
@@ -2703,7 +2351,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (back, _) = Root::decode(&page(&pending)).unwrap();
+        let back = Root::decode(&page(&pending)).unwrap();
         assert_eq!(back.pending, pending.pending);
         // The copies lie at their generations' places: the pending one, newer, is not taken.
         let mut both = page(&root);
@@ -2734,9 +2382,9 @@ mod tests {
         // Taken, it is the root it was written for: its checksum leaves the mark out.
         let mut landed = pending.clone();
         landed.pending = None;
-        let bytes = landed.encode(FORMAT).unwrap();
+        let bytes = landed.encode().unwrap();
         assert_eq!(
-            pending.crc(FORMAT).unwrap().to_le_bytes(),
+            pending.crc().unwrap().to_le_bytes(),
             bytes[bytes.len() - 4..]
         );
         // Written over its parent, it is taken, and the pending copy beside it is no longer one.
@@ -2756,8 +2404,6 @@ mod tests {
         });
         both.extend_from_slice(&page(&pending));
         assert!(copies(&both, None).unwrap().pending.is_none());
-        // Formats 7 and 8 hold no decision.
-        assert!(root.encode(FORMAT_EIGHT).is_err());
     }
 
     /// A judge that takes the tags it is given.
@@ -2775,7 +2421,7 @@ mod tests {
             host,
             ..Default::default()
         }
-        .encode(FORMAT)
+        .encode()
         .unwrap();
         p.resize(PAGE, 0);
         p
@@ -2815,9 +2461,9 @@ mod tests {
 
     #[test]
     fn a_root_its_host_tagged_is_taken_only_where_its_host_says_it_committed() {
-        let (back, _) = Root::decode(&tagged(5, Some(1 << 40 | 7))).unwrap();
+        let back = Root::decode(&tagged(5, Some(1 << 40 | 7))).unwrap();
         assert_eq!(back.host, Some(1 << 40 | 7));
-        assert_eq!(Root::decode(&tagged(5, None)).unwrap().0.host, None);
+        assert_eq!(Root::decode(&tagged(5, None)).unwrap().host, None);
         let yes = Committed(vec![9]);
         let no = Committed(vec![]);
         // Generation 5 tagged 9 beside its parent: taken where the judge says 9 committed; a round
@@ -2856,13 +2502,6 @@ mod tests {
         let mut torn = tagged(6, None);
         torn[20] ^= 1;
         assert_eq!(taken_of(torn, tagged(5, Some(9)), None), (5, None));
-        // Formats 7 and 8 hold no tag.
-        assert!(Root {
-            host: Some(9),
-            ..Default::default()
-        }
-        .encode(FORMAT_EIGHT)
-        .is_err());
     }
 
     #[test]
@@ -2874,10 +2513,10 @@ mod tests {
                 replica: replica.map(str::to_string),
                 ..Default::default()
             }
-            .encode(FORMAT)
+            .encode()
             .unwrap();
             p.resize(PAGE, 0);
-            Root::decode(&p).map(|(r, _)| (r.replica, r.host))
+            Root::decode(&p).map(|r| (r.replica, r.host))
         };
         for host in [None, Some(0), Some(9), Some(1 << 40 | 7)] {
             for replica in [None, Some("mysql-1"), Some("a"), Some("primário 3306")] {
@@ -2896,7 +2535,7 @@ mod tests {
                 host,
                 ..Default::default()
             }
-            .encode(FORMAT)
+            .encode()
             .unwrap()
         };
         let (untagged, tagged_9) = (bare(None), bare(Some(9)));
@@ -2909,21 +2548,10 @@ mod tests {
             tagged_9[untagged.len() - 4..untagged.len() + 4],
             9u64.to_le_bytes()
         );
-        // Formats 7 and 8 hold no mark.
-        for format in [FORMAT_SEVEN, FORMAT_EIGHT] {
-            let e = Root {
-                replica: Some("mysql-1".into()),
-                ..Default::default()
-            }
-            .encode(format)
-            .unwrap_err()
-            .to_string();
-            assert!(e.contains("is marked a replica of no source"), "{e}");
-        }
     }
 
     #[test]
-    fn a_root_reads_back_its_oid_counter_and_record_and_formats_seven_and_eight_take_neither() {
+    fn a_root_reads_back_its_oid_counter_and_record() {
         let record = Extent {
             start: 40,
             bytes: 24,
@@ -2939,10 +2567,10 @@ mod tests {
                     replica: replica.map(str::to_string),
                     ..Default::default()
                 }
-                .encode(FORMAT)
+                .encode()
                 .unwrap();
                 p.resize(PAGE, 0);
-                let (r, _) = Root::decode(&p).unwrap();
+                let r = Root::decode(&p).unwrap();
                 assert_eq!(
                     (r.next_oid, r.oids, r.text_search.as_str(), r.replica.as_deref(), r.host),
                     (next_oid, oids, "pg_catalog.english", replica, host)
@@ -2950,18 +2578,12 @@ mod tests {
             }
         }
         // A root whose counter and record are the text's own is written as before them.
-        let plain = Root::default().encode(FORMAT).unwrap();
+        let plain = Root::default().encode().unwrap();
         let counted = Root {
             next_oid: 16400,
             ..Default::default()
         };
-        assert_eq!(counted.encode(FORMAT).unwrap().len(), plain.len() + 4);
-        for format in [FORMAT_SEVEN, FORMAT_EIGHT] {
-            for root in [counted.clone(), Root { oids: record, ..Default::default() }] {
-                let e = root.encode(format).unwrap_err().to_string();
-                assert!(e.contains("in its text's order alone"), "{e}");
-            }
-        }
+        assert_eq!(counted.encode().unwrap().len(), plain.len() + 4);
         let back = decode_record(&encode_record(&[(3, 16391), (7, 16384)])).unwrap();
         assert_eq!(back, [(3, 16391), (7, 16384)]);
     }

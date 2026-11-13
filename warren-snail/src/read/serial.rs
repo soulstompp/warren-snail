@@ -542,12 +542,9 @@ impl Snail {
         Ok(w.file().try_clone()?)
     }
 
-    /// Refuses SERIALIZABLE named on a snail that cannot run it: of an older format, with the way
-    /// across; or marked a replica, as PostgreSQL's hot standby refuses it.
+    /// Refuses SERIALIZABLE named on a snail that cannot run it: marked a replica, as PostgreSQL's
+    /// hot standby refuses it.
     pub(super) fn serial_allowed(&self, named_here: bool) -> Result<()> {
-        if self.reader.format() < crate::file::FORMAT {
-            return Err(crate::file::serial_refused(self.reader.format()));
-        }
         if named_here && self.root.replica.is_some() {
             return Err(Error::new(
                 "cannot use serializable mode in a hot standby\nHINT:  You can use REPEATABLE READ \

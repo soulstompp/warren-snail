@@ -1,7 +1,6 @@
 //! numeric past 18 digits: from 19 to 38 held as the integer of its smallest unit in 128 bits and cut
 //! by its decimal digits, any other held as its text and keyed on its class; NaN in a numeric(p, s)
-//! on a kind leaf beside its decimal; formats 7 and 8 holding its decimal alone and refusing what
-//! 0.1.x cannot read.
+//! on a kind leaf beside its decimal.
 
 mod weather;
 
@@ -537,100 +536,6 @@ fn a_sum_past_128_bits_is_held_whole() {
         texts(b.column(0).as_ref()),
         [Some(format!("12{}", "0".repeat(37)))]
     );
-}
-
-#[test]
-#[cfg(feature = "standalone")]
-fn a_snail_of_format_eight_refuses_a_numeric_past_18_digits_and_a_nan_by_name() {
-    for (ddl, column) in [
-        (
-            "CREATE TABLE s.k (id integer NOT NULL, v numeric(19,0), PRIMARY KEY (id));",
-            "s.k.v is numeric(19,0)",
-        ),
-        (
-            "CREATE TABLE s.k (id integer NOT NULL, v numeric, PRIMARY KEY (id));",
-            "s.k.v is numeric",
-        ),
-    ] {
-        let catalog = Catalog::parse(&format!("CREATE SCHEMA s; {ddl}")).unwrap();
-        let e = warren_snail::write::write_format_eight(
-            &tmp("numeric-eight.snail"),
-            &catalog,
-            &[],
-            weather::span(),
-        )
-        .err()
-        .unwrap()
-        .to_string();
-        assert!(
-            e.contains(&format!("{column}, which a snail of format 8 cannot hold")),
-            "{e}"
-        );
-    }
-    let catalog =
-        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.k (id integer NOT NULL, v numeric(5,2), PRIMARY KEY (id));")
-            .unwrap();
-    let rows = Rows {
-        columns: vec![
-            Values::Int(vec![Some(1), Some(2)]),
-            Values::Int(vec![Some(150), Some(100_000)]),
-        ],
-    };
-    let e = warren_snail::write::write_format_eight(
-        &tmp("numeric-eight-nan.snail"),
-        &catalog,
-        &[("s.k".into(), rows)],
-        weather::span(),
-    )
-    .err()
-    .unwrap()
-    .to_string();
-    assert!(
-        e.contains("s.k.v holds NaN, which a snail of format 8 cannot hold"),
-        "{e}"
-    );
-    // A NaN written into a snail of format 8 by a statement is refused alike.
-    let path = tmp("numeric-eight-insert.snail");
-    warren_snail::write::write_format_eight(&path, &catalog, &[], weather::span()).unwrap();
-    let mut w = Snail::open_writing(&path).unwrap();
-    w.execute("INSERT INTO s.k (id, v) VALUES (1, 1.5)")
-        .unwrap();
-    let e = w
-        .execute("INSERT INTO s.k (id, v) VALUES (2, 'NaN')")
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("holds NaN"), "{e}");
-    // A numeric(p, s) of format 8 is its decimal alone, one leaf, as 0.1.1 wrote it, before and
-    // after a write; out puts it out so.
-    w.execute("INSERT INTO s.k (id, v) VALUES (3, -2.25)")
-        .unwrap();
-    let leaves: Vec<String> = w
-        .blocks()
-        .unwrap()
-        .iter()
-        .map(|r| r.column.clone())
-        .collect();
-    assert_eq!(leaves, ["id", "v"]);
-    let (b, _) = w.ask("SELECT id, v FROM s.k ORDER BY id", None).unwrap();
-    assert_eq!(
-        decimals(b.column(1).as_ref()),
-        [Some(Some(150)), Some(Some(-225))]
-    );
-    let dir = tmp("numeric-eight-parquet");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = w.out(&dir).unwrap()[0].file.clone();
-    let reader =
-        parquet::file::reader::SerializedFileReader::new(std::fs::File::open(file).unwrap())
-            .unwrap();
-    let schema = parquet::file::reader::FileReader::metadata(&reader)
-        .file_metadata()
-        .schema_descr_ptr();
-    assert_eq!(schema.num_columns(), 2);
-    assert_eq!(schema.column(1).path().string(), "v");
-    drop(w);
-    let r = Snail::open(&path).unwrap();
-    assert_eq!(r.blocks().unwrap().len(), 2);
 }
 
 /// Each row's values as text: a decimal at its scale, text as it is.

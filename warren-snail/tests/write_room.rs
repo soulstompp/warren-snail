@@ -259,7 +259,6 @@ fn files_out_of_a_snail_come_back_past_the_room_by_their_pages_as_whole() {
             None,
             None,
             None,
-            None,
             room,
         )
         .unwrap();
@@ -333,7 +332,6 @@ fn a_reference_from_files_is_held_to_its_parent_as_from_rows_held() {
             &catalog,
             &[("s.p".into(), p), ("s.c".into(), c)],
             span(),
-            None,
             None,
             None,
             None,

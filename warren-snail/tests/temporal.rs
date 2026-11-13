@@ -7,7 +7,6 @@
 mod weather;
 
 use warren_snail::catalog::Catalog;
-use weather::tmp;
 
 /// Each statement's refusal, or None where it is taken; the schema's CREATE SCHEMA left out, which
 /// no test here is about.
@@ -219,22 +218,6 @@ fn a_foreign_key_with_period_is_read_as_postgresql_reads_it() {
             .unwrap_or_else(|| panic!("{key} was taken"));
         assert!(e.contains(why), "{key}: {e}");
     }
-}
-
-#[test]
-fn a_snail_of_format_eight_refuses_a_key_without_overlaps_by_name() {
-    let catalog = Catalog::parse(
-        "CREATE SCHEMA s; CREATE TABLE s.p (id int4range NOT NULL, valid daterange NOT NULL, PRIMARY KEY (id, valid WITHOUT OVERLAPS));",
-    )
-    .unwrap();
-    let path = tmp("temporal-format-8.snail");
-    let e = warren_snail::write::write_format_eight(&path, &catalog, &[], weather::span())
-        .unwrap_err()
-        .to_string();
-    assert!(
-        e.contains("the key WITHOUT OVERLAPS p_pkey") && e.contains("`out` and `write`"),
-        "{e}"
-    );
 }
 
 #[cfg(feature = "standalone")]

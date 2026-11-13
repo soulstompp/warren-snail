@@ -9,9 +9,7 @@ use crate::directory::{
     WIDE_LEVEL,
 };
 use crate::encode::{disk_pages, encode, leaf_descriptor, DataPage, Encoded, DICTIONARY_BYTES};
-use crate::file::{
-    encode_free, Extent, Place, Root, Run, Writer, FILE_PAGES, FORMAT_EIGHT, FORMAT_SEVEN,
-};
+use crate::file::{encode_free, Extent, Place, Root, Run, Writer, FILE_PAGES};
 use crate::places::{level_key, month_of, null_key, KeyValue, Keys, Sublevels};
 use crate::room::ROUND_BYTES;
 use crate::values::Values;
@@ -842,15 +840,13 @@ pub fn write_parquet(
         release,
         lc_monetary,
         None,
-        None,
         ROUND_BYTES,
     )
 }
 
-/// A new snail as `write_parquet` writes it, in format 7 or 8 where `format` names one, as
-/// warren-snail 0.1.0 or 0.1.1 made it: for the checks that hold this build to them. It holds the
-/// rows of one order of one table at a time, `room` bytes of them, the rest written once and read
-/// back once.
+/// A new snail as `write_parquet` writes it, under the `default_text_search_config` the files name or
+/// `text_search` gives. It holds the rows of one order of one table at a time, `room` bytes of them,
+/// the rest written once and read back once.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn write_parquet_in(
@@ -861,7 +857,6 @@ pub fn write_parquet_in(
     release: Option<u8>,
     lc_monetary: Option<&str>,
     text_search: Option<&str>,
-    format: Option<u32>,
     room: u64,
 ) -> Result<Vec<Written>> {
     let mut tables = Vec::new();
@@ -900,18 +895,12 @@ pub fn write_parquet_in(
             }
         }
     }
-    if let Some(f) = format.filter(|&f| f != FORMAT_SEVEN && f != FORMAT_EIGHT) {
-        return Err(Error::new(format!(
-            "--format takes {FORMAT_SEVEN} or {FORMAT_EIGHT}, a format before this build's, not {f}"
-        )));
-    }
     write_made(
         path,
         catalog,
         &tables,
         &sourced,
         span,
-        format,
         release,
         Some(&carried),
         room,
@@ -1023,7 +1012,6 @@ pub fn write_within(
         &held(tables),
         sources,
         span,
-        None,
         crate::regs::LATEST,
         None,
         room,
@@ -1054,7 +1042,6 @@ pub fn write_released(
         &held(tables),
         sources,
         span,
-        None,
         release,
         None,
         ROUND_BYTES,
@@ -1096,53 +1083,8 @@ pub fn write_carried(
         &held(tables),
         sources,
         span,
-        None,
         release,
         Some(carried),
-        ROUND_BYTES,
-    )
-}
-
-/// A new snail as warren-snail 0.1.0 made it, in format 7, each page map in pages of its own: for the
-/// tests that read and write such a snail.
-#[doc(hidden)]
-pub fn write_format_seven(
-    path: &Path,
-    catalog: &Catalog,
-    tables: &[(String, Rows)],
-    span: u64,
-) -> Result<Vec<Written>> {
-    write_made(
-        path,
-        catalog,
-        &held(tables),
-        &[],
-        span,
-        Some(FORMAT_SEVEN),
-        crate::regs::LATEST,
-        None,
-        ROUND_BYTES,
-    )
-}
-
-/// A new snail as warren-snail 0.1.1 made it, in format 8: for the tests that read and write such a
-/// snail.
-#[doc(hidden)]
-pub fn write_format_eight(
-    path: &Path,
-    catalog: &Catalog,
-    tables: &[(String, Rows)],
-    span: u64,
-) -> Result<Vec<Written>> {
-    write_made(
-        path,
-        catalog,
-        &held(tables),
-        &[],
-        span,
-        Some(FORMAT_EIGHT),
-        crate::regs::LATEST,
-        None,
         ROUND_BYTES,
     )
 }
@@ -1154,7 +1096,6 @@ fn write_made(
     tables: &[(String, Given)],
     sources: &[(String, Source)],
     span: u64,
-    format: Option<u32>,
     release: u8,
     carried: Option<&Carried>,
     room: u64,
@@ -1179,17 +1120,7 @@ fn write_made(
             .filter(|c| !c.is_empty())
             .unwrap_or(crate::file::TEXT_SEARCH),
     )?;
-    let mut w = Writer::create_spanned(path, span)?;
-    if let Some(f) = format {
-        w.set_format(f);
-        // The DDL kept as the format's version kept it, read again as it reads it as it opens.
-        let ddl = crate::ddl::as_first_formats(&named.ddl, f)?;
-        if ddl != named.ddl {
-            named.oids = Catalog::parse_kept(&ddl, usize::MAX)?.oids;
-            named.ddl = ddl;
-        }
-        crate::read::old_names(&mut named, f);
-    }
+    let w = Writer::create_spanned(path, span)?;
     let written = write_tables(w, &named, tables, sources, carried, room);
     if written.is_err() {
         // A write refused leaves no file of its own behind.
@@ -1223,20 +1154,10 @@ fn write_tables(
         replica: carried.and_then(|c| c.replica.clone()),
         ..Default::default()
     };
-    crate::file::holds_catalog(w.format(), catalog)?;
-    let out = if w.format() >= crate::file::FORMAT {
-        within_tables(&mut w, catalog, tables, sources, &mut root, room)?
-    } else {
-        // A snail of an older format is written from every table's rows whole.
-        let whole = tables
-            .iter()
-            .map(|(n, g)| Ok((n.clone(), g.whole(catalog)?)))
-            .collect::<Result<Vec<_>>>()?;
-        whole_tables(&mut w, catalog, &whole, sources, &mut root)?
-    };
+    let out = within_tables(&mut w, catalog, tables, sources, &mut root, room)?;
     // The OIDs its writers take next, and the statements whose OIDs depart from its text's order,
     // as the snail its rows came from had them.
-    if let Some(c) = carried.filter(|_| w.format() >= crate::file::FORMAT) {
+    if let Some(c) = carried {
         root.next_oid = c.next_oid;
         if !c.oids.is_empty() {
             root.oids = w.place(&crate::file::encode_record(&c.oids))?;
@@ -1245,7 +1166,7 @@ fn write_tables(
     // What grows with the schema lies in pages of its own where the root would not hold it.
     let mut gone = Vec::new();
     let states = carried.map_or(&[][..], |c| &c.sequences);
-    if w.format() >= crate::file::FORMAT && !root.fits_uncut(w.format())? {
+    if !root.fits_uncut()? {
         crate::file::cut_afresh(
             &mut root,
             catalog.ddl.as_bytes(),
@@ -1254,7 +1175,7 @@ fn write_tables(
             &mut w,
             &mut gone,
         )?;
-        crate::file::settle_tables(&mut root, w.format(), 1, &mut w, &mut gone)?;
+        crate::file::settle_tables(&mut root, 1, &mut w, &mut gone)?;
     } else {
         root.catalog = w.place(catalog.ddl.as_bytes())?;
         if !states.is_empty() {
@@ -1272,163 +1193,9 @@ fn write_tables(
         })
         .collect();
     if !passed.is_empty() {
-        root.free = w.place_end(&encode_free(&passed, &[], w.format()))?;
+        root.free = w.place_end(&encode_free(&passed, &[]))?;
     }
     w.commit(&mut root)?;
-    Ok(out)
-}
-
-/// Every table of the catalog written from its rows whole, each order laid out on them all.
-fn whole_tables(
-    w: &mut Writer,
-    catalog: &Catalog,
-    tables: &[(String, Rows)],
-    sources: &[(String, Source)],
-    root: &mut Root,
-) -> Result<Vec<Written>> {
-    crate::read::foreign::rows_held(catalog, tables)?;
-    let strands = crate::read::elements::strands_of(catalog, tables)?;
-    let mut out = Vec::new();
-    for table in &catalog.tables {
-        crate::file::holds(w.format(), table)?;
-        let Some(rows) = tables
-            .iter()
-            .chain(&strands)
-            .find(|(n, _)| *n == table.name)
-            .map(|(_, r)| r)
-        else {
-            for order in &table.orders {
-                let format = w.format();
-                let (extent, written) = empty_order(&mut *w, table, order, format)?;
-                root.orders
-                    .push((table.name.clone(), order.name.clone(), extent));
-                out.push(written);
-            }
-            continue;
-        };
-        // A table with no column of a B-tree lies as its rows are given: numbered from 1.
-        let numbered;
-        let rows = match table.arrival() {
-            Some(a) if rows.columns.len() == a => {
-                let n = rows.len() as i64;
-                numbered = Rows {
-                    columns: rows
-                        .columns
-                        .iter()
-                        .cloned()
-                        .chain(std::iter::once(Values::Int((1..=n).map(Some).collect())))
-                        .collect(),
-                };
-                &numbered
-            }
-            _ => rows,
-        };
-        for (ci, (c, values)) in table.columns.iter().zip(&rows.columns).enumerate() {
-            if values.len() != rows.len() {
-                return Err(Error::new(format!(
-                    "{}: its columns differ in length",
-                    table.name
-                )));
-            }
-            if let (ColumnType::Numeric { precision, .. }, Some(v)) = (c.ty, values.ints()) {
-                let nan = crate::numeric::nan_units(precision) as i64;
-                if v.contains(&Some(nan)) {
-                    crate::file::holds_nan(w.format(), table, ci)?;
-                }
-            }
-            if let ColumnType::Text(Some(n)) = c.ty {
-                let longest = values.longest();
-                if longest > n as usize {
-                    return Err(Error::new(format!(
-                        "{}.{} is varchar({n}) and a row holds {longest} characters",
-                        table.name, c.name
-                    )));
-                }
-            }
-        }
-        // Each row in turn meets its columns' domains, then the table's NOT NULLs and CHECKs, as
-        // PostgreSQL's COPY checks them.
-        let nulls = table
-            .columns
-            .iter()
-            .zip(&rows.columns)
-            .any(|(c, v)| c.not_null && v.nulls() > 0);
-        if nulls
-            || table.checks.iter().any(|k| k.enforced)
-            || table.columns.iter().any(|c| c.domain.is_some())
-        {
-            let _own = crate::read::own::holding(&catalog.functions, catalog.release);
-            for i in 0..rows.len() {
-                let row: crate::read::statement::Row = table
-                    .columns
-                    .iter()
-                    .zip(&rows.columns)
-                    .map(|(c, v)| row_value(c.ty, v, i))
-                    .collect();
-                crate::read::fill::check_domains(&catalog.domains, table, &row)?;
-                crate::read::fill::check(table, &row)?;
-            }
-        }
-        // An EXCLUDE, and a key WITHOUT OVERLAPS, are checked where a statement writes its rows.
-        if let Some(o) = table.orders.iter().find(|o| o.exclusion.is_some()) {
-            if !rows.is_empty() {
-                let what = if o.without_overlaps() {
-                    "key WITHOUT OVERLAPS"
-                } else {
-                    "EXCLUDE"
-                };
-                return Err(Error::new(format!(
-                    "{}: write does not hold its rows to the {what} {}: give them by INSERT",
-                    table.name, o.name
-                )));
-            }
-        }
-        let source = sources
-            .iter()
-            .find(|(n, _)| *n == table.name)
-            .map(|(_, s)| s);
-        for (c, col) in table.columns.iter().enumerate() {
-            if col.ty.is_timestamptz()
-                && rows.columns[c]
-                    .ints()
-                    .is_some_and(|v| v.iter().any(|x| matches!(x, Some(i64::MAX | i64::MIN))))
-            {
-                crate::file::instant_ends(w.format(), table, c)?;
-            }
-        }
-        for order in &table.orders {
-            // A partial strand holds the rows its predicate admits, encoded afresh.
-            let admitted = match crate::read::partial::Predicate::of(catalog, table, order)? {
-                Some(p) => {
-                    let kept: Vec<usize> = (0..rows.len())
-                        .filter(|&r| p.admits_at(table, rows, r))
-                        .collect();
-                    Some(Rows {
-                        columns: rows.columns.iter().map(|v| v.gather(&kept)).collect(),
-                    })
-                }
-                None => None,
-            };
-            let (rows, source) = match &admitted {
-                Some(r) => (r, None),
-                None => (rows, source),
-            };
-            if order
-                .levels
-                .iter()
-                .any(|l| rows.columns[l.column()].nulls() > 0)
-            {
-                crate::file::keys_null(w.format(), table, order)?;
-            }
-            let packed = w.format() != FORMAT_SEVEN;
-            let format = w.format();
-            let (extent, written) =
-                write_order(&mut *w, table, order, rows, source, packed, format)?;
-            root.orders
-                .push((table.name.clone(), order.name.clone(), extent));
-            out.push(written);
-        }
-    }
     Ok(out)
 }
 
@@ -1446,7 +1213,6 @@ fn within_tables(
     foreign_held(catalog, tables)?;
     let mut out = Vec::new();
     for table in &catalog.tables {
-        crate::file::holds(w.format(), table)?;
         let given = |name: &str| tables.iter().find(|(n, _)| n == name).map(|(_, g)| g);
         // An index's element strand is made from its table's rows as they come.
         let strand;
@@ -1471,8 +1237,7 @@ fn within_tables(
         };
         let Some(rows) = rows else {
             for order in &table.orders {
-                let format = w.format();
-                let (extent, written) = empty_order(&mut *w, table, order, format)?;
+                let (extent, written) = empty_order(&mut *w, table, order)?;
                 root.orders
                     .push((table.name.clone(), order.name.clone(), extent));
                 out.push(written);
@@ -1561,7 +1326,6 @@ fn within_order(
     mut checks: Option<Checks>,
     held: bool,
 ) -> Result<(Extent, Written)> {
-    let format = w.format();
     let predicate = crate::read::partial::Predicate::of(catalog, table, order);
     let collators = order
         .levels
@@ -1594,7 +1358,7 @@ fn within_order(
     let room = crate::room::Room::new(crate::room::Sizes::of(room));
     let back = |columns: Vec<Values>| keyed(table, order, columns, collators, None);
     let mut sorter = sorting::Sorter::new(room.clone(), table, stride, leaves, &back);
-    let mut kinds = level_kinds(table, order, format);
+    let mut kinds = level_kinds(table, order);
     let mut rows = 0usize;
     let mut totals = vec![0u64; leaves];
     let mut in_order = true;
@@ -1675,7 +1439,7 @@ fn within_order(
     let sub = Sublevels::new(order, table, &kinds);
     let mut closing = closing::Closing::new(&sub, stride, bits.clone());
     let source = source.filter(|_| in_order && predicate.is_none());
-    let mut blocks = Blocks::new(table, order, format, rows, &totals, &bits, source)?;
+    let mut blocks = Blocks::new(table, order, rows, &totals, &bits, source)?;
     let mut prev: Vec<KeyValue> = Vec::new();
     // Keys holding a NULL are each their own, unless the order says they are not distinct.
     let shared = |a: &[KeyValue], b: &[KeyValue]| {
@@ -1840,7 +1604,6 @@ fn foreign_held(catalog: &Catalog, tables: &[(String, Given)]) -> Result<()> {
 struct Blocks<'b> {
     table: &'b Table,
     order: &'b Order,
-    format: u32,
     rows: usize,
     /// Each leaf's plain bytes, or bits, over every row of the order, for its counting unit.
     totals: Widths,
@@ -1863,7 +1626,6 @@ impl<'b> Blocks<'b> {
     fn new(
         table: &'b Table,
         order: &'b Order,
-        format: u32,
         rows: usize,
         totals: &[u64],
         bits: &[bool],
@@ -1886,7 +1648,6 @@ impl<'b> Blocks<'b> {
         Ok(Blocks {
             table,
             order,
-            format,
             rows,
             totals,
             bits: bits.to_vec(),
@@ -1903,7 +1664,7 @@ impl<'b> Blocks<'b> {
             month_slots: month_slots.into_iter().map(|s| s as usize).collect(),
             text_slots: text_slots.into_iter().map(|s| s as usize).collect(),
             entries: Vec::new(),
-            maps: MapPages::new(format != FORMAT_SEVEN),
+            maps: MapPages::new(true),
             most: vec![0; bits.len()],
             counts: vec![[0; 4]; bits.len()],
             bytes: vec![0; bits.len()],
@@ -1972,7 +1733,6 @@ impl<'b> Blocks<'b> {
             &self.text_slots,
             &given,
             &mut self.maps,
-            true,
         )?;
         for (s, (c, e)) in self.counts.iter_mut().zip(&encoded).enumerate() {
             c[0] += moved[s] as usize;
@@ -2016,9 +1776,8 @@ impl<'b> Blocks<'b> {
             wide_slots: wide_slots(table, order),
             cut_under: cut_under_of(table, order),
             span_slots: crate::spans::slots(table, order),
-            bound_slots: bound_slots(table, order, self.format),
+            bound_slots: bound_slots(table, order),
             summed: crate::brin::slots(table, order),
-            separated: self.format >= crate::file::FORMAT,
         };
         let (top, below) = build(head, self.entries, &mut |bytes| w.place(bytes))?;
         let levels = decode_top(&top)?.0.height;
@@ -2085,14 +1844,13 @@ pub(crate) fn laid_out(
     order: &Order,
     rows: &Rows,
     given: Option<&[u32]>,
-    format: u32,
 ) -> Result<Laid> {
     let n = rows.len();
     let stride = order.levels.len();
     let mut unsorted: Vec<KeyValue> = Vec::with_capacity(n * stride);
     // For each level, the sublevels a text level is cut on: its longest value's bytes and one more;
     // at least one, as an empty order's, where it holds only NULLs.
-    let mut text_sublevels = level_kinds(table, order, format);
+    let mut text_sublevels = level_kinds(table, order);
     let fixed = given.is_some();
     if let Some(g) = given {
         text_sublevels = g.to_vec();
@@ -2364,15 +2122,15 @@ fn width(leaf: &crate::catalog::Leaf, values: &Values, perm: &[usize]) -> Width 
 }
 
 /// What each level of an order holds before any row is laid on it: a text level cut on one
-/// sublevel, a level keyed in 128 bits marked so, and a number 0; in a snail of format 9 a level keyed
-/// by its bytes or its text marked to be cut a bit a rung, or on its structure.
-pub(crate) fn level_kinds(table: &Table, order: &Order, format: u32) -> Vec<u32> {
+/// sublevel, a level keyed in 128 bits marked so, and a number 0; a level keyed by its bytes or its
+/// text, but a bit string's, marked to be cut a bit a rung, or on its structure.
+pub(crate) fn level_kinds(table: &Table, order: &Order) -> Vec<u32> {
     order
         .levels
         .iter()
         .map(|l| {
             let ty = table.columns[l.column()].ty;
-            let bits = if format >= crate::file::FORMAT && !ty.is_bits() {
+            let bits = if !ty.is_bits() {
                 crate::directory::BITS_LEVEL
             } else {
                 0
@@ -2557,7 +2315,7 @@ pub(crate) fn slots(table: &Table, order: &Order) -> (Vec<u32>, Vec<u32>) {
 
 /// The head of an order's directory for `n` rows laid out on it: each leaf's unit from its
 /// furthest-out place, the month and text leaves, and each text level's sublevels.
-pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize, format: u32) -> Head {
+pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize) -> Head {
     let most = largest_place(&laid.keys, &laid.blocks, order, table, &laid.widths);
     let (month_slots, text_slots) = slots(table, order);
     Head {
@@ -2571,18 +2329,14 @@ pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize, forma
         wide_slots: wide_slots(table, order),
         cut_under: cut_under_of(table, order),
         span_slots: crate::spans::slots(table, order),
-        bound_slots: bound_slots(table, order, format),
+        bound_slots: bound_slots(table, order),
         summed: crate::brin::slots(table, order),
-        separated: format >= crate::file::FORMAT,
     }
 }
 
 /// Which of an order's held leaves are the first of a column keyed by its bytes, whose least and
-/// greatest each entry keeps cut to 8 bytes in a snail of format 9.
-pub(crate) fn bound_slots(table: &Table, order: &Order, format: u32) -> Vec<u32> {
-    if format < crate::file::FORMAT {
-        return Vec::new();
-    }
+/// greatest each entry keeps cut to 8 bytes.
+pub(crate) fn bound_slots(table: &Table, order: &Order) -> Vec<u32> {
     order
         .columns
         .iter()
@@ -2615,20 +2369,19 @@ pub(crate) fn bounded(table: &Table, c: usize) -> bool {
 
 /// The head of an order that holds no row yet): a unit of one disk page, and each text level cut on
 /// its first byte, until rows come.
-pub(crate) fn empty_head(table: &Table, order: &Order, format: u32) -> Head {
+pub(crate) fn empty_head(table: &Table, order: &Order) -> Head {
     let (month_slots, text_slots) = slots(table, order);
     Head {
         units: vec![1; order.leaves(table).len()],
         month_slots,
         text_slots,
-        level_text: level_kinds(table, order, format),
+        level_text: level_kinds(table, order),
         height: 1,
         wide_slots: wide_slots(table, order),
         cut_under: cut_under_of(table, order),
         span_slots: crate::spans::slots(table, order),
-        bound_slots: bound_slots(table, order, format),
+        bound_slots: bound_slots(table, order),
         summed: crate::brin::slots(table, order),
-        separated: format >= crate::file::FORMAT,
     }
 }
 
@@ -2652,13 +2405,8 @@ fn leaves_written(table: &Table, order: &Order, units: &[usize]) -> Vec<ColumnWr
 }
 
 /// An order that holds no row yet: its top alone.
-fn empty_order(
-    w: &mut dyn Place,
-    table: &Table,
-    order: &Order,
-    format: u32,
-) -> Result<(Extent, Written)> {
-    let head = empty_head(table, order, format);
+fn empty_order(w: &mut dyn Place, table: &Table, order: &Order) -> Result<(Extent, Written)> {
+    let head = empty_head(table, order);
     let top = w.place(&encode_top(&head, &[]))?;
     let units: Vec<usize> = head.units.iter().map(|&k| k as usize).collect();
     let columns = leaves_written(table, order, &units);
@@ -2690,126 +2438,6 @@ pub(crate) fn leaf_descriptors(
             leaf_descriptor(&col.name, leaf, !col.not_null)
         })
         .collect()
-}
-
-fn write_order(
-    w: &mut dyn Place,
-    table: &Table,
-    order: &Order,
-    rows: &Rows,
-    source: Option<&Source>,
-    packed: bool,
-    format: u32,
-) -> Result<(Extent, Written)> {
-    let n = rows.len();
-    let Laid {
-        perm,
-        keys,
-        text_sublevels,
-        widths,
-        blocks,
-    } = laid_out(table, order, rows, None, format)?;
-    let most = largest_place(&keys, &blocks, order, table, &widths);
-    let units: Vec<usize> = (0..widths.0.len())
-        .map(|s| widths.unit(s, most[s], n))
-        .collect();
-    // In format 9 each block takes the unit of its own furthest-out place.
-    let kept = format >= crate::file::FORMAT;
-    let block_units: Vec<Vec<usize>> = if kept {
-        largest_places(&keys, &blocks, order, table, &widths)
-            .iter()
-            .map(|m| {
-                (0..widths.0.len())
-                    .map(|s| widths.unit(s, m[s], n))
-                    .collect()
-            })
-            .collect()
-    } else {
-        vec![units.clone(); blocks.len()]
-    };
-    let descs = leaf_descriptors(table, order)?;
-    let (month_slots, text_slots) = slots(table, order);
-    let month_slots: Vec<usize> = month_slots.into_iter().map(|s| s as usize).collect();
-    let text_slots: Vec<usize> = text_slots.into_iter().map(|s| s as usize).collect();
-
-    let mut entries = Vec::with_capacity(blocks.len());
-    let mut columns = leaves_written(table, order, &units);
-    let mut maps = MapPages::new(packed);
-    // The rows came in the order's order, so a row group can be one of its blocks.
-    let in_order = source.filter(|_| perm.iter().enumerate().all(|(i, &p)| i == p));
-    // Where each leaf the order holds lies among the table's, as a source's chunks lie.
-    let at: Vec<usize> = order
-        .columns
-        .iter()
-        .flat_map(|&c| {
-            let first = table.first_leaf(c);
-            first..first + table.leaf_count(c)
-        })
-        .collect();
-    for (bi, b) in blocks.iter().enumerate() {
-        let units = &block_units[bi];
-        let given = given_pages(in_order, &at, b.start, b.rows(), units)?;
-        let (entry, encoded, moved) = write_block(
-            w,
-            table,
-            order,
-            rows,
-            &perm,
-            &keys,
-            b,
-            &descs,
-            units,
-            &month_slots,
-            &text_slots,
-            &given,
-            &mut maps,
-            kept,
-        )?;
-        for (s, (cw, e)) in columns.iter_mut().zip(&encoded).enumerate() {
-            cw.moved_blocks += moved[s] as usize;
-            cw.dictionary_blocks += e.dictionary.is_some() as usize;
-            cw.data_pages += e.pages.len();
-            cw.disk_pages += e.disk_pages();
-        }
-        for (&s, &bytes) in text_slots.iter().zip(&entry.bytes) {
-            *columns[s].bytes.as_mut().unwrap() += bytes as u64;
-        }
-        entries.push(entry);
-    }
-    if kept {
-        crate::directory::separate(&mut entries, &text_sublevels, None, None);
-    }
-    maps.finish(w)?;
-    let map_pages = maps.pages;
-    let head = Head {
-        units: units.iter().map(|&k| k as u32).collect(),
-        month_slots: month_slots.iter().map(|&s| s as u32).collect(),
-        text_slots: text_slots.iter().map(|&s| s as u32).collect(),
-        level_text: text_sublevels.clone(),
-        height: 0,
-        wide_slots: wide_slots(table, order),
-        cut_under: cut_under_of(table, order),
-        span_slots: crate::spans::slots(table, order),
-        bound_slots: bound_slots(table, order, format),
-        summed: crate::brin::slots(table, order),
-        separated: format >= crate::file::FORMAT,
-    };
-    let (top, below) = build(head, entries, &mut |bytes| w.place(bytes))?;
-    let levels = decode_top(&top)?.0.height;
-    let extent = w.place(&top)?;
-    Ok((
-        extent,
-        Written {
-            table: table.name.clone(),
-            order: order.name.clone(),
-            rows: n,
-            blocks: blocks.len(),
-            index_pages: below + extent.pages(),
-            levels,
-            map_pages,
-            columns,
-        },
-    ))
 }
 
 /// Each leaf's pages of the row group that is the block of `rows` rows from `start`, where they can
@@ -2845,7 +2473,6 @@ pub(crate) fn write_block(
     text_slots: &[usize],
     given: &[Option<Encoded>],
     maps: &mut MapPages,
-    current: bool,
 ) -> Result<(Entry, Vec<Encoded>, Vec<bool>)> {
     let leaves = order.leaves(table);
     let mut summaries = Vec::with_capacity(leaves.len());
@@ -2907,34 +2534,32 @@ pub(crate) fn write_block(
             }
         }
     }
-    // In format 9, a column keyed by its bytes: its least and greatest key, the first 8 bytes in its
+    // A column keyed by its bytes: its least and greatest key, the first 8 bytes in its
     // first leaf's summary, as many past them as it takes the two to part in the entry's tail.
     let mut tails = Vec::new();
-    if current {
-        let slots = bound_slots(table, order, crate::file::FORMAT);
-        for &c in order.columns.iter().filter(|&&c| bounded(table, c)) {
-            let Ok(orderer) = table.columns[c].orderer() else {
-                continue;
-            };
-            let ty = table.columns[c].ty;
-            let bounds = perm[b.start..b.end]
-                .iter()
-                .filter_map(|&r| compared_key(ty, orderer, &rows.columns[c], r));
-            if let Some((lo, hi)) = bounds.fold(None, |m: Option<(Vec<u8>, Vec<u8>)>, v| {
-                Some(match m {
-                    None => (v.clone(), v),
-                    Some((lo, hi)) if v < lo => (v, hi),
-                    Some((lo, hi)) if v > hi => (lo, v),
-                    held => held.unwrap(),
-                })
-            }) {
-                let s = order.leaf_slot(table, c).unwrap();
-                let tail = crate::directory::bounds_of(&mut summaries[s], &lo, &hi);
-                if tail != Default::default() {
-                    let k = slots.iter().position(|&x| x as usize == s).unwrap();
-                    tails.resize(slots.len(), Default::default());
-                    tails[k] = tail;
-                }
+    let slots = bound_slots(table, order);
+    for &c in order.columns.iter().filter(|&&c| bounded(table, c)) {
+        let Ok(orderer) = table.columns[c].orderer() else {
+            continue;
+        };
+        let ty = table.columns[c].ty;
+        let bounds = perm[b.start..b.end]
+            .iter()
+            .filter_map(|&r| compared_key(ty, orderer, &rows.columns[c], r));
+        if let Some((lo, hi)) = bounds.fold(None, |m: Option<(Vec<u8>, Vec<u8>)>, v| {
+            Some(match m {
+                None => (v.clone(), v),
+                Some((lo, hi)) if v < lo => (v, hi),
+                Some((lo, hi)) if v > hi => (lo, v),
+                held => held.unwrap(),
+            })
+        }) {
+            let s = order.leaf_slot(table, c).unwrap();
+            let tail = crate::directory::bounds_of(&mut summaries[s], &lo, &hi);
+            if tail != Default::default() {
+                let k = slots.iter().position(|&x| x as usize == s).unwrap();
+                tails.resize(slots.len(), Default::default());
+                tails[k] = tail;
             }
         }
     }
@@ -2953,7 +2578,7 @@ pub(crate) fn write_block(
                 .iter()
                 .enumerate()
                 .map(|(s, e)| ColumnPages {
-                    unit: if current { units[s] as u32 } else { 0 },
+                    unit: units[s] as u32,
                     dictionary: e.dictionary.as_ref().map(|d| place(d.len())),
                     pages: e
                         .pages

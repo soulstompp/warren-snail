@@ -12,7 +12,7 @@ use warren_snail::oids::Object;
 use warren_snail::read::{Snail, Snails};
 use warren_snail::values::Values;
 use warren_snail::write::Rows;
-use weather::{span, tmp, write};
+use weather::{tmp, write};
 
 const DDL: &str = "CREATE TABLE t (id bigint PRIMARY KEY, n text); \
      CREATE SCHEMA s; CREATE TABLE s.u (id bigint PRIMARY KEY, t_id bigint REFERENCES t (id)); \
@@ -301,23 +301,6 @@ fn a_ctid_from_outside_the_statement_and_the_heaps_own_columns_are_refused_by_na
 }
 
 #[test]
-fn a_file_of_format_8_gives_each_row_its_ctid_as_format_9_does() {
-    // A block's first page is in its page map in every format.
-    let path = tmp("oids-format-8.snail");
-    let catalog = Catalog::parse("CREATE TABLE t (id bigint PRIMARY KEY, n text);").unwrap();
-    warren_snail::write::write_format_eight(
-        &path,
-        &catalog,
-        &[("t".into(), rows_of_t(20_000))],
-        span(),
-    )
-    .unwrap();
-    let mut snail = Snail::open(&path).unwrap();
-    let ctids = ctids_in_order(&mut snail);
-    assert_eq!(runs_of(&ctids), block_rows(&snail));
-}
-
-#[test]
 fn several_snails_name_none_of_their_objects_by_oid() {
     let a = written("oids-several-a", 10);
     let b = tmp("oids-several-b.snail");
@@ -394,25 +377,3 @@ fn recut_keeps_each_object_s_oid() {
     assert_eq!(r.catalog.oids.departures().len(), 2);
 }
 
-#[cfg(feature = "standalone")]
-#[test]
-fn a_snail_of_format_8_gives_oids_in_its_text_s_order() {
-    // Its root holds no counter (ledgers/w10-plan.md, reading 1): a transaction's own table takes
-    // its OIDs after another's committed since, as the text gives them, and nothing is recorded.
-    let path = tmp("oids-format-8-writers.snail");
-    let catalog = Catalog::parse("CREATE TABLE t (id bigint PRIMARY KEY, n text);").unwrap();
-    warren_snail::write::write_format_eight(&path, &catalog, &[], span()).unwrap();
-    let (mut a, mut b) = (Snail::open_writing(&path).unwrap(), Snail::open_writing(&path).unwrap());
-    run(&mut a, "BEGIN");
-    run(&mut a, "CREATE TABLE o1 (id bigint PRIMARY KEY)");
-    run(&mut b, "CREATE TABLE o2 (id bigint PRIMARY KEY)");
-    run(&mut a, "COMMIT");
-    drop((a, b));
-    let mut r = Snail::open(&path).unwrap();
-    let (x, _) = r
-        .ask("SELECT ('o2'::regclass::oid < 'o1'::regclass::oid)::text", None)
-        .unwrap();
-    assert_eq!(one_row(&x), ["true"]);
-    let root = warren_snail::file::Reader::open(&path).unwrap().root().unwrap();
-    assert_eq!((root.next_oid, root.oids.bytes), (0, 0));
-}

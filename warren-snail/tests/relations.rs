@@ -470,24 +470,6 @@ fn a_view_is_kept_in_the_catalog_and_read_as_a_step() {
 }
 
 #[test]
-fn a_snail_of_format_eight_refuses_a_view_by_name() {
-    let path = tmp("relations-eight.snail");
-    let e = warren_snail::write::write_format_eight(
-        &path,
-        &Catalog::parse(DDL).unwrap(),
-        &[],
-        weather::span(),
-    )
-    .err()
-    .unwrap()
-    .to_string();
-    assert!(
-        e.contains("the view a.tu, which a snail of format 8") && e.contains("`out`"),
-        "{e}"
-    );
-}
-
-#[test]
 #[cfg(feature = "standalone")]
 fn a_view_is_declared_through_a_writer_and_read_after() {
     let path = snail("declared");

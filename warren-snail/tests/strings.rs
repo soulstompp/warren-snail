@@ -206,25 +206,6 @@ fn a_bytea_level_goes_out_and_comes_back_by_its_pages() {
     assert_eq!(bytes(&b, 1), byteas());
 }
 
-#[test]
-fn a_bytea_level_is_refused_by_name_in_formats_seven_and_eight() {
-    let catalog = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (v bytea NOT NULL, PRIMARY KEY (v));").unwrap();
-    let rows = || Rows {
-        columns: vec![Values::Utf8(vec![Some(ByteArray::from(vec![1u8]))])],
-    };
-    for (name, eight) in [("bytea-seven.snail", false), ("bytea-eight.snail", true)] {
-        let path = tmp(name);
-        let tables = [("s.t".to_string(), rows())];
-        let made = if eight {
-            warren_snail::write::write_format_eight(&path, &catalog, &tables, weather::span())
-        } else {
-            warren_snail::write::write_format_seven(&path, &catalog, &tables, weather::span())
-        };
-        let e = made.unwrap_err().to_string();
-        assert!(e.contains("bytea level"), "{e}");
-    }
-}
-
 /// bpchar, unlimited and of three characters, each holding values equal but for their trailing
 /// blanks.
 const BPCHAR_DDL: &str =
