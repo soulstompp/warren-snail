@@ -286,13 +286,14 @@ fn a_star_reads_the_columns_it_names_and_no_others() {
         &["0,10,0,10", "1,11,1,11"],
     );
     // A star under a relation's name in a subquery is every column of that name's, where a query
-    // around it goes by it too.
+    // around it goes by it too; but an EXISTS's select list is never made, so none of them is read
+    // past those its WHERE reads.
     read(
         &path,
         "SELECT a.g + 1, b.v FROM s.a a JOIN s.b b ON b.a_id = a.id \
          WHERE a.g = 3 AND b.v < 500 AND EXISTS (SELECT b.* FROM s.c b WHERE b.id = 1)",
         &["4,135", "4,310", "4,388", "4,466", "4,57"],
-        30,
+        27,
     );
 }
 

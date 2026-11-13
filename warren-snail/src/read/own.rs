@@ -1400,10 +1400,16 @@ fn asked(g: &Own, text: &str, values: &[Value], frame: &Frame) -> Result<Value> 
             limit_by: Vec::new(),
         });
     }
-    super::folded::folded(catalog, &q.to_string(), Some(reads))?;
+    let text = q.to_string();
+    let shut = super::folded::folded(catalog, &text, Some(reads))?
+        && !crate::pgcatalog::names_catalog(&text);
     let q = super::pipeline::windows::written(&super::spelled::between_written(&q))?;
     let q = super::computed(catalog, &q)?.unwrap_or(q);
-    let row = super::relations::first_row(reads, &q)?;
+    // Where its one-time conditions shut out every row, it is read over tables holding none.
+    let row = match shut {
+        true => super::relations::first_row(&super::relations::Empty(catalog), &q)?,
+        false => super::relations::first_row(reads, &q)?,
+    };
     Ok(row.and_then(|r| r.into_iter().next()).unwrap_or(Value::Null))
 }
 

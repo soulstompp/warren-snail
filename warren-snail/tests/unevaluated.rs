@@ -1,7 +1,9 @@
 //! What PostgreSQL 18.6's plan never reaches is never evaluated over rows either: a subquery a
 //! constant AND, OR, CASE or COALESCE drops, read neither while its shape is found nor as a row
-//! asks; an EXISTS's select list; an argument an inlined function's body never names. Every answer
-//! and refusal was given by 18.6 over the same statements, in the same order.
+//! asks; an EXISTS's select list; an argument an inlined function's body never names; a level its
+//! one-time conditions shut, and what is below it; a WITH query nothing reads; a subquery's output
+//! nothing reads; a select list past the rows its LIMIT keeps. Every answer and refusal was given
+//! by 18.6 over the same statements, in the same order.
 #![cfg(feature = "standalone")]
 
 mod weather;
@@ -13,7 +15,8 @@ use weather::{tmp, write};
 const DDL: &str = "CREATE SCHEMA fo;
      CREATE TABLE fo.src (k integer NOT NULL, v integer, PRIMARY KEY (k));
      CREATE TABLE fo.none (k integer NOT NULL, v integer, PRIMARY KEY (k));
-     CREATE FUNCTION fo.fu(integer, integer) RETURNS integer LANGUAGE sql VOLATILE AS 'SELECT $1';";
+     CREATE FUNCTION fo.fu(integer, integer) RETURNS integer LANGUAGE sql VOLATILE AS 'SELECT $1';
+     CREATE FUNCTION fo.flim() RETURNS integer LANGUAGE sql VOLATILE AS 'SELECT 1/(k - 2) FROM fo.src';";
 
 /// A snail holding four rows in `fo.src` and none in `fo.none`, at a path of the test's name.
 fn snail(name: &str) -> Snail {
@@ -169,6 +172,265 @@ fn an_exists_reads_no_select_list() {
                 "SELECT EXISTS (SELECT nosuch)",
                 Err((Some("42703"), "column \"nosuch\" does not exist".into())),
             ),
+        ],
+    );
+}
+
+#[test]
+fn a_level_its_one_time_conditions_shut_reads_no_row() {
+    let mut w = snail("shut");
+    let none = || rows(&[]);
+    each(
+        &mut w,
+        &[
+            // A WHERE that folds FALSE or NULL: nothing below it runs.
+            ("SELECT 1 FROM (SELECT 1/0 AS x FROM fo.src) q WHERE false", none()),
+            ("SELECT x FROM (SELECT 1/0 AS x FROM fo.src LIMIT 1) q WHERE false", none()),
+            ("WITH c AS (SELECT 1/0 AS x) SELECT k FROM fo.src WHERE false", none()),
+            ("WITH c AS (SELECT 1/0 AS x FROM fo.src) SELECT 1 FROM c WHERE false", none()),
+            (
+                "WITH c AS (SELECT 1/0 AS x FROM fo.src) SELECT k FROM fo.src WHERE false AND EXISTS (SELECT x FROM c)",
+                none(),
+            ),
+            (
+                "SELECT 1 FROM (SELECT 1/0 AS x FROM fo.src WHERE k > 1 UNION ALL SELECT 1 FROM fo.src) u WHERE false",
+                none(),
+            ),
+            ("SELECT 1 FROM (SELECT 1/0 AS x FROM fo.src) q, fo.src s WHERE false", none()),
+            ("SELECT count(*) FROM (SELECT 1/0 AS x FROM fo.src) q WHERE false", rows(&["0"])),
+            ("SELECT k FROM fo.src WHERE k/(k - 1) > 0 AND false", none()),
+            ("SELECT k FROM fo.src WHERE NULL", none()),
+            ("SELECT x FROM (SELECT 1/(k - 1) AS x FROM fo.src WHERE false) q", none()),
+            ("SELECT * FROM (SELECT 1/(k - 1) AS x FROM fo.src) q JOIN fo.src s ON false", none()),
+            ("SELECT * FROM fo.src s, (SELECT 1/(k - 1) AS x FROM fo.src) q WHERE false", none()),
+            ("SELECT x FROM (SELECT 1/(k - 1) AS x FROM fo.src) q WHERE x > 0 AND false", none()),
+            ("WITH c AS (SELECT 1/(k - 1) AS x FROM fo.src) SELECT x FROM c WHERE false", none()),
+            ("SELECT k, (SELECT 1/(v - 10) FROM fo.src WHERE k = 1) FROM fo.src WHERE false", none()),
+            ("SELECT x, row_number() OVER () FROM (SELECT 1/(k - 1) AS x FROM fo.src) q WHERE false", none()),
+            ("SELECT k FROM fo.src WHERE false ORDER BY 1/(k - 1)", none()),
+            ("SELECT k FROM fo.src WHERE false GROUP BY k", none()),
+            ("SELECT generate_series(1, 2) FROM fo.src WHERE false", none()),
+            ("SELECT 1 WHERE false", none()),
+            ("SELECT count(*) WHERE false", rows(&["0"])),
+            ("SELECT sum(1/(k - 1)) FROM fo.src WHERE false", rows(&["NULL"])),
+            ("SELECT count(*) FROM (SELECT 1/(k - 1) FROM fo.src WHERE false) q", rows(&["0"])),
+            ("SELECT (SELECT count(*) FROM fo.src WHERE false)", rows(&["0"])),
+            (
+                "SELECT k, (SELECT 1/(s.k - 1) FROM fo.src s WHERE s.k = fo.src.k AND false) FROM fo.src ORDER BY 1",
+                rows(&["1|NULL", "2|NULL", "3|NULL", "4|NULL"]),
+            ),
+            ("SELECT max(k) FROM fo.src HAVING false", none()),
+            // A one-time condition that does not hold (W27), before any row or after another.
+            ("SELECT k FROM fo.src WHERE k/0 = 1 AND now() < '2000-01-01'::text::timestamptz", none()),
+            ("SELECT k FROM fo.src WHERE now() < '2000-01-01'::text::timestamptz AND k/0 = 1", none()),
+            ("SELECT count(*) FROM fo.src WHERE now() < '2000-01-01'::timestamptz", rows(&["0"])),
+            (
+                "SELECT x FROM (SELECT 1/(k - 1) AS x FROM fo.src) q WHERE now() < '2000-01-01'::timestamptz",
+                none(),
+            ),
+            (
+                "SELECT x FROM (SELECT 1/(k - 1) AS x FROM fo.src LIMIT 2) q WHERE now() < '2000-01-01'::timestamptz",
+                none(),
+            ),
+            ("SELECT 1/(k - 1) FROM fo.src WHERE k > 0 AND now() < '2000-01-01'::timestamptz", none()),
+            // Where rows are made all the same, what makes them is read.
+            ("SELECT count(*), (SELECT max(k) FROM fo.src) FROM fo.src WHERE false", rows(&["0|4"])),
+            ("SELECT 1/(k - 1) FROM fo.src WHERE false UNION ALL SELECT 2", rows(&["2"])),
+            (
+                "SELECT 1/(k - 1) FROM fo.src WHERE now() < '2000-01-01'::timestamptz UNION ALL SELECT 1/(k - 1) FROM fo.src WHERE k > 1",
+                rows(&["1", "0", "0"]),
+            ),
+            ("SELECT * FROM (SELECT 1/(k - 1) AS x FROM fo.src) q LEFT JOIN fo.src s ON false", zero()),
+            ("SELECT x FROM (SELECT 1/0 AS x FROM fo.src LIMIT 1) q, fo.src s WHERE false", zero()),
+            ("SELECT k FROM fo.src WHERE k = 1 OR now() < '2000-01-01'::timestamptz", rows(&["1"])),
+            ("SELECT k FROM fo.src WHERE now() > '2000-01-01'::timestamptz ORDER BY k", rows(&["1", "2", "3", "4"])),
+            ("SELECT k FROM fo.src WHERE (SELECT k FROM fo.src WHERE false) IS NULL ORDER BY 1", rows(&["1", "2", "3", "4"])),
+        ],
+    );
+}
+
+#[test]
+fn a_one_time_condition_holding_a_subquery_is_read_before_any_row() {
+    let mut w = snail("gated");
+    let zone = || {
+        Err((
+            Some("22007"),
+            "invalid input syntax for type timestamp with time zone: \"x\"".into(),
+        ))
+    };
+    each(
+        &mut w,
+        &[
+            ("SELECT k FROM fo.none WHERE (SELECT true) AND now() < 'x'::text::timestamptz", zone()),
+            ("SELECT k FROM fo.src WHERE (SELECT true) AND now() < 'x'::text::timestamptz", zone()),
+            ("SELECT k FROM fo.src WHERE (SELECT false) AND now() < 'x'::text::timestamptz", rows(&[])),
+            ("SELECT k FROM fo.src WHERE (SELECT k > 9 FROM fo.src LIMIT 1) AND k/0 = 1", rows(&[])),
+            ("SELECT k FROM fo.src WHERE EXISTS (SELECT 1 FROM fo.none) AND k/0 = 1", rows(&[])),
+            ("SELECT k FROM fo.src WHERE (SELECT NULL::boolean) AND k/0 = 1", rows(&[])),
+            ("SELECT k FROM fo.src WHERE (SELECT min(v) FROM fo.src) > 5 AND k/(k - 1) > 0", zero()),
+            ("SELECT k FROM fo.src WHERE (SELECT min(v) FROM fo.src) > 50 AND k/(k - 1) > 0", rows(&[])),
+            (
+                "SELECT k FROM fo.none WHERE (SELECT k FROM fo.src) > 0 AND now() < 'x'::text::timestamptz",
+                Err((
+                    Some("21000"),
+                    "more than one row returned by a subquery used as an expression".into(),
+                )),
+            ),
+            ("SELECT count(*) FROM fo.src WHERE (SELECT false) AND k/0 = 1", rows(&["0"])),
+            ("SELECT k FROM fo.src WHERE now() < 'x'::text::timestamptz AND (SELECT 1/0 > 0)", zero()),
+            ("SELECT k FROM fo.src WHERE (SELECT true) AND k > 2 ORDER BY 1", rows(&["3", "4"])),
+        ],
+    );
+}
+
+#[test]
+fn a_with_query_nothing_reads_is_never_made() {
+    let mut w = snail("withs");
+    let all = || rows(&["1", "2", "3", "4"]);
+    each(
+        &mut w,
+        &[
+            ("WITH c AS MATERIALIZED (SELECT 1/0 AS x FROM fo.src) SELECT k FROM fo.src ORDER BY 1", all()),
+            ("WITH c AS (SELECT 1/0 AS x FROM fo.src) SELECT k FROM fo.src ORDER BY 1", all()),
+            (
+                "WITH c AS (SELECT 1/0 AS x FROM fo.src), d AS (SELECT x FROM c) SELECT k FROM fo.src ORDER BY 1",
+                all(),
+            ),
+            ("WITH c AS (SELECT 1/(k - 1) AS x FROM fo.src) SELECT k FROM fo.src ORDER BY 1", all()),
+            (
+                "WITH c AS MATERIALIZED (SELECT 1/(k - 1) AS x FROM fo.src) SELECT k FROM fo.src ORDER BY 1",
+                all(),
+            ),
+            (
+                "WITH c AS (SELECT 1/(k - 1) AS x FROM fo.src), d AS (SELECT x FROM c) SELECT k FROM fo.src ORDER BY 1",
+                all(),
+            ),
+            (
+                "WITH c AS (SELECT 1/(k - 1) AS x FROM fo.src) SELECT s.k FROM fo.src s JOIN fo.src t ON t.k = s.k ORDER BY 1",
+                all(),
+            ),
+            (
+                "WITH c AS (SELECT 1/(k - 1) AS x FROM fo.src) SELECT k FROM fo.src WHERE k IN (SELECT k FROM fo.src) ORDER BY 1",
+                all(),
+            ),
+            ("WITH c AS MATERIALIZED (SELECT 1/0 AS x) SELECT k FROM fo.src WHERE false", rows(&[])),
+            (
+                "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3), c AS (SELECT 1/(k - 1) FROM fo.src) SELECT n FROM t ORDER BY 1",
+                rows(&["1", "2", "3"]),
+            ),
+            ("WITH c AS (SELECT k, 1/(k - 1) AS x FROM fo.src) SELECT count(*) FROM fo.src", rows(&["4"])),
+            (
+                "WITH c AS (SELECT k FROM fo.src UNION ALL SELECT 1/(k - 1) FROM fo.src) SELECT k FROM fo.src ORDER BY 1",
+                all(),
+            ),
+            // One read, or read by one read, is made; one nothing reads is read as PostgreSQL's
+            // parser reads it.
+            (
+                "WITH c AS (SELECT 1/(k - 1) AS x FROM fo.src) SELECT k FROM fo.src WHERE k IN (SELECT x FROM c) ORDER BY 1",
+                zero(),
+            ),
+            ("WITH c AS (SELECT 1/(k - 1) AS x FROM fo.src), d AS (SELECT x FROM c) SELECT x FROM d", zero()),
+            (
+                "WITH c AS (SELECT nosuch FROM fo.src) SELECT k FROM fo.src",
+                Err((Some("42703"), "column \"nosuch\" does not exist".into())),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn an_output_nothing_reads_is_never_made() {
+    let mut w = snail("outputs");
+    let all = || rows(&["1", "2", "3", "4"]);
+    each(
+        &mut w,
+        &[
+            ("SELECT q.k FROM (SELECT k, 1/0 AS x FROM fo.src) q ORDER BY 1", all()),
+            ("SELECT 1 FROM (SELECT k, 1/0 AS x FROM fo.src LIMIT 2) q", rows(&["1", "1"])),
+            ("WITH c AS (SELECT k, 1/0 AS x FROM fo.src) SELECT k FROM c ORDER BY 1", all()),
+            ("SELECT count(*) FROM (SELECT k, 1/0 AS x FROM fo.src) q", rows(&["4"])),
+            (
+                "SELECT s.k FROM fo.src s JOIN (SELECT k, 1/0 AS x FROM fo.src) q ON q.k = s.k ORDER BY 1",
+                all(),
+            ),
+            ("SELECT q.k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src) q ORDER BY 1", all()),
+            (
+                "SELECT q.k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src UNION ALL SELECT k, 1 FROM fo.src) q ORDER BY 1",
+                rows(&["1", "1", "2", "2", "3", "3", "4", "4"]),
+            ),
+            ("WITH c AS (SELECT k, 1/(k - 1) AS x FROM fo.src) SELECT k FROM c ORDER BY 1", all()),
+            (
+                "SELECT q.k FROM (SELECT DISTINCT ON (k) k, 1/(k - 1) AS x FROM fo.src ORDER BY k) q ORDER BY 1",
+                all(),
+            ),
+            ("SELECT q.k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src LIMIT 3) q ORDER BY 1", rows(&["1", "2", "3"])),
+            ("SELECT count(*) FROM (SELECT k, 1/(k - 1) AS x FROM fo.src) q", rows(&["4"])),
+            ("SELECT k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src) q WHERE k > 2 ORDER BY 1", rows(&["3", "4"])),
+            ("SELECT s.k FROM fo.src s JOIN (SELECT k, 1/(k - 1) AS x FROM fo.src) q USING (k) ORDER BY 1", all()),
+            ("SELECT a FROM (SELECT k, 1/(k - 1) AS x FROM fo.src) q(a, b) ORDER BY 1", all()),
+            ("SELECT k FROM (SELECT k, (SELECT 1/(k - 1)) AS x FROM fo.src) q ORDER BY 1", all()),
+            ("SELECT k FROM (SELECT k, x FROM (SELECT k, 1/(k - 1) AS x FROM fo.src) a) b ORDER BY 1", all()),
+            ("SELECT (SELECT max(q.k) FROM (SELECT k, 1/(k - 1) AS x FROM fo.src) q)", rows(&["4"])),
+            (
+                "SELECT k FROM (SELECT k, 1/(k - 1) AS x, row_number() OVER () AS r FROM fo.src) q ORDER BY 1",
+                all(),
+            ),
+            ("SELECT k FROM (SELECT k, 1/(k - 1) FROM fo.src) q ORDER BY 1", all()),
+            ("SELECT k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src OFFSET 1) q ORDER BY 1", rows(&["2", "3", "4"])),
+            (
+                "SELECT k, (SELECT count(*) FROM (SELECT n.k, 1/(n.k - 1) AS x FROM fo.src n WHERE n.k = s.k) q) FROM fo.src s ORDER BY 1",
+                rows(&["1|1", "2|1", "3|1", "4|1"]),
+            ),
+            ("SELECT x.k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src) x ORDER BY 1", all()),
+            // Where it is read, or its query or its readers keep it, it is made.
+            ("SELECT q.k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src UNION SELECT k, 1 FROM fo.src) q ORDER BY 1", zero()),
+            ("WITH c AS MATERIALIZED (SELECT k, 1/(k - 1) AS x FROM fo.src) SELECT k FROM c ORDER BY 1", zero()),
+            (
+                "WITH c AS (SELECT k, 1/(k - 1) AS x FROM fo.src) SELECT a.k FROM c a, c b WHERE a.k = b.k ORDER BY 1",
+                zero(),
+            ),
+            ("SELECT q.k FROM (SELECT DISTINCT k, 1/(k - 1) AS x FROM fo.src) q ORDER BY 1", zero()),
+            ("SELECT q.k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src ORDER BY 2) q ORDER BY 1", zero()),
+            ("SELECT q.k FROM (SELECT k, 1/(k - 1) + random() AS x FROM fo.src) q ORDER BY 1", zero()),
+            ("SELECT q FROM (SELECT k, 1/(k - 1) AS x FROM fo.src) q", zero()),
+            ("SELECT q.* FROM (SELECT k, 1/(k - 1) AS x FROM fo.src) q", zero()),
+            ("SELECT * FROM (SELECT k, 1/(k - 1) AS x FROM fo.src) q", zero()),
+            ("SELECT k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src) q WHERE x > 0 ORDER BY 1", zero()),
+            ("SELECT k FROM (SELECT k, generate_series(1, 1/(k - 1)) AS x FROM fo.src) q ORDER BY 1", zero()),
+            ("SELECT k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src GROUP BY k, 1/(k - 1)) q ORDER BY 1", zero()),
+        ],
+    );
+}
+
+#[test]
+fn a_select_list_is_made_only_for_the_rows_its_limit_keeps() {
+    let mut w = snail("limit");
+    each(
+        &mut w,
+        &[
+            ("SELECT 1/(k - 2) FROM fo.src LIMIT 1", rows(&["-1"])),
+            ("SELECT (SELECT 1/(k - 2) FROM fo.src LIMIT 1)", rows(&["-1"])),
+            ("SELECT k, 1/(k - 2) FROM fo.src ORDER BY k LIMIT 1", rows(&["1|-1"])),
+            ("SELECT fo.flim()", rows(&["-1"])),
+            ("SELECT 1/(k - 2) FROM fo.src LIMIT 0", rows(&[])),
+            ("SELECT EXISTS (SELECT 1/(k - 1) FROM fo.src LIMIT 0)", rows(&["f"])),
+            ("SELECT 1/(k - 3) FROM fo.src LIMIT 2", rows(&["0", "-1"])),
+            ("SELECT 1/(k - 3) FROM fo.src WHERE k > 0 LIMIT 2", rows(&["0", "-1"])),
+            ("SELECT 1/(k - 2), generate_series(1, 2) FROM fo.src LIMIT 2", rows(&["-1|1", "-1|2"])),
+            ("SELECT 1/(k - 2) FROM fo.src FETCH FIRST 1 ROW ONLY", rows(&["-1"])),
+            (
+                "SELECT (SELECT 1/(n.k - 2) FROM fo.src n WHERE n.k >= s.k LIMIT 1) FROM fo.src s WHERE s.k = 1",
+                rows(&["-1"]),
+            ),
+            ("SELECT 1/(k - 2) FROM fo.src WHERE k < 5 LIMIT 1", rows(&["-1"])),
+            ("SELECT k FROM fo.src WHERE 1/(k - 3) > -5 LIMIT 1", rows(&["1"])),
+            ("SELECT k FROM fo.src WHERE 1/(k - 3) > -5 ORDER BY k LIMIT 1", rows(&["1"])),
+            ("SELECT k, 1/(k - 2) FROM fo.src WHERE k > 0 ORDER BY k LIMIT 1", rows(&["1|-1"])),
+            // The rows its OFFSET passes over are made, and what the LIMIT reaches.
+            ("SELECT 1/(k - 2) FROM fo.src OFFSET 2 LIMIT 1", zero()),
+            ("SELECT 1/(k - 3) FROM fo.src LIMIT 3", zero()),
+            ("SELECT DISTINCT 1/(k - 2) FROM fo.src LIMIT 1", zero()),
+            ("SELECT k FROM fo.src WHERE 1/(k - 1) > -5 LIMIT 1", zero()),
         ],
     );
 }

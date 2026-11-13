@@ -5044,6 +5044,13 @@ fn answered(
     let inlined = super::sysviews::inlined_calls(catalog, q)?
         .map(|q| super::spelled::between_written(&q));
     let q = inlined.as_ref().unwrap_or(q);
+    // Each output of its subqueries nothing reads left unmade.
+    let dropped = super::outputs::holds_subqueries(q).then(|| {
+        let mut q = q.clone();
+        super::outputs::dropped(&mut q, catalog.release);
+        q
+    });
+    let q = dropped.as_ref().unwrap_or(q);
     let (last, held) = made_by(asked, q, &before, &casings, None, &accrued)?;
     Ok((last, held, accrued))
 }
@@ -5068,6 +5075,7 @@ pub(super) fn made_by(
             kept_arms(a, &mut arms);
         }
     }
+    let empty = Empty(catalog);
     let mut making = Making {
         asked,
         made: before.clone(),
@@ -5112,6 +5120,22 @@ pub(super) fn made_by(
             readers.insert(s.name.clone(), n);
         }
     }
+    // A step that neither writes nor is read by what the question reads is laid out over tables
+    // holding none, never made of the file's rows, as PostgreSQL plans no WITH query nothing reads.
+    let mut needed = vec![true; steps.len()];
+    for j in (0..steps.len()).rev() {
+        let name = &steps[j].name;
+        let reads_it = |k: usize| {
+            read[k].contains(name)
+                || steps[k]
+                    .recursion
+                    .as_ref()
+                    .is_some_and(|r| step_words_of_arm(&r.left).contains(name))
+        };
+        needed[j] = name.is_empty()
+            || writes(&steps[j].query)
+            || (j + 1..steps.len()).any(|k| needed[k] && !theirs.contains(&k) && reads_it(k));
+    }
     for i in 0..steps.len() {
         if theirs.contains(&i) {
             continue;
@@ -5123,13 +5147,21 @@ pub(super) fn made_by(
                 }
             }
         }
-        if steps[i].recursion.is_some() {
-            let (before, rest) = steps.split_at_mut(i);
-            let m = recursive::make(&mut making, &rest[0], before)?;
-            making.keep(&rest[0], m)?;
-        } else {
-            making.make(&mut steps[i])?;
+        let held = making.asked;
+        if !needed[i] {
+            making.asked = Asked {
+                reads: &empty,
+                ..held
+            };
         }
+        let made = if steps[i].recursion.is_some() {
+            let (before, rest) = steps.split_at_mut(i);
+            recursive::make(&mut making, &rest[0], before).and_then(|m| making.keep(&rest[0], m))
+        } else {
+            making.make(&mut steps[i])
+        };
+        making.asked = held;
+        made?;
         making.read_by(&mut readers, &steps[i].name, &read[i]);
     }
     let last = making
@@ -5170,6 +5202,17 @@ fn step_words(step: &Step) -> Vec<String> {
         text.push_str(&q.to_string());
     }
     let mut ws = words(&text);
+    if let Some(a) = &step.set {
+        ws.extend(step_words_of_arm(a));
+    }
+    if let Some(r) = &step.recursion {
+        ws.extend(step_words_of_arm(&r.right));
+    }
+    ws
+}
+
+/// The steps an arm of a set operation reads, by their names.
+fn step_words_of_arm(a: &Arm) -> Vec<String> {
     fn leaves(a: &Arm, out: &mut Vec<String>) {
         match a {
             Arm::Leaf { name, .. } => out.push(name.clone()),
@@ -5179,13 +5222,9 @@ fn step_words(step: &Step) -> Vec<String> {
             }
         }
     }
-    if let Some(a) = &step.set {
-        leaves(a, &mut ws);
-    }
-    if let Some(r) = &step.recursion {
-        leaves(&r.right, &mut ws);
-    }
-    ws
+    let mut out = Vec::new();
+    leaves(a, &mut out);
+    out
 }
 
 /// Each INTERSECT and EXCEPT of two steps in an arm: its second step by its first.

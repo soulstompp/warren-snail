@@ -4029,7 +4029,7 @@ pub(crate) fn float_integer(f: f64, base: &str) -> Result<Value> {
 }
 
 /// Text read as a boolean, as PostgreSQL's boolean input reads it.
-fn boolean_of(t: &str) -> Result<Value> {
+pub(super) fn boolean_of(t: &str) -> Result<Value> {
     super::question::truth(t)
         .map(Value::Bool)
         .ok_or_else(|| Error::new(format!("invalid input syntax for type boolean: \"{t}\"")))
@@ -9474,9 +9474,14 @@ impl<'q> StepRun<'q> {
         // A WHERE that draws is read a row at a time, each row it keeps made before the next is
         // read, as PostgreSQL's scan reads its condition and then makes the row; where nothing
         // sorts between, each row is handed on as it is made, and none is read past the last the
-        // LIMIT keeps.
+        // LIMIT keeps. So is any WHERE under a LIMIT where nothing sorts between.
+        let cut = self.p.limit.is_some()
+            && !self.p.distinct
+            && self.p.distinct_on.is_none()
+            && !self.going.sorts
+            && self.p.below_exprs.is_empty();
         let by_row = self.p.selection.filter(|w| {
-            draws(w) && !self.p.grouped && self.p.calls.windows.is_empty()
+            (draws(w) || cut) && !self.p.grouped && self.p.calls.windows.is_empty()
         });
         if let Some(w) = self.p.selection.filter(|_| by_row.is_none()) {
             let mut kept = Vec::with_capacity(rel.rows.len());
@@ -9564,13 +9569,20 @@ impl<'q> StepRun<'q> {
             return Ok(None);
         }
         let per_row = windows(&self.p.calls.windows, &rel, &frame, &mut self.running)?;
-        let handed = by_row.is_some() && !self.going.sorts;
+        // Rows its LIMIT cuts, coming in their order with nothing sorting between, are made one
+        // at a time and none past the last it keeps, as PostgreSQL's Limit asks the node beneath
+        // it for no row more.
+        let handed = (by_row.is_some() || cut) && !self.going.sorts;
+        // Its LIMIT and OFFSET are read as it starts, before any row comes.
+        if handed {
+            self.going.ended(&self.p, &frame)?;
+        }
         let mut rows = Vec::with_capacity(rel.rows.len());
         for (row, w) in rel.rows.iter().zip(per_row) {
+            if handed && self.going.ended(&self.p, &frame)? {
+                break;
+            }
             if let Some(sel) = by_row {
-                if handed && self.going.ended(&self.p, &frame)? {
-                    break;
-                }
                 if holds(sel, row, &frame, &none)? != Some(true) {
                     continue;
                 }
@@ -10078,6 +10090,14 @@ impl<'q> Stream<'q> {
             }
         }
         queries.push((String::new(), q));
+        // A step nothing the question reads reads is laid out and never made, as PostgreSQL plans
+        // no WITH query nothing reads.
+        let mut needed: std::collections::HashSet<String> = [String::new()].into();
+        for (name, query) in queries.iter().rev() {
+            if needed.contains(name) {
+                needed.extend(reads(query).unwrap_or_default());
+            }
+        }
         // One clock the whole statement reads: its transaction's.
         let now = crate::scalars::transaction_clock();
         let mut typed: HashMap<String, (Vec<String>, Vec<Option<ColumnType>>)> = HashMap::new();
@@ -10200,7 +10220,10 @@ impl<'q> Stream<'q> {
                 _ => Vec::new(),
             };
             p.carried = s.casings.add_step(&name, &p, &carried)?;
-            let kind = if after {
+            let read = needed.contains(&name);
+            let kind = if !read {
+                Kind::Fixed
+            } else if after {
                 for n in streamed {
                     s.kept.entry(n).or_insert_with(|| Relation {
                         names: Vec::new(),
@@ -10225,7 +10248,7 @@ impl<'q> Stream<'q> {
                 Kind::Fixed
             };
             let mut p = Some(p);
-            if kind == Kind::Fixed {
+            if kind == Kind::Fixed && read {
                 let r = select(
                     p.take().unwrap(),
                     &s.view,

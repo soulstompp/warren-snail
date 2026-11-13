@@ -37,6 +37,7 @@ mod ops;
 pub(crate) mod own;
 mod ordering;
 mod out;
+mod outputs;
 pub(crate) mod partial;
 pub(crate) mod pipeline;
 mod point;
@@ -1776,20 +1777,23 @@ impl Snail {
         self.wasted.borrow_mut().clear();
         // Its constants folded before any row is read, as PostgreSQL's planner folds them; its
         // parameters' values among them, as a statement bound to them is planned.
-        match params.is_empty() {
+        let shut = match params.is_empty() {
             true => folded::folded(&self.catalog, sql, Some(&*self))?,
-            false => {
-                if let Ok(bound) = statement::with_params(sql, params) {
-                    folded::folded(&self.catalog, &bound, Some(&*self))?;
-                }
-            }
-        }
+            false => match statement::with_params(sql, params) {
+                Ok(bound) => folded::folded(&self.catalog, &bound, Some(&*self))?,
+                Err(_) => false,
+            },
+        };
+        // One whose one-time conditions shut out every row its plan reads is answered as it is
+        // over tables holding none, but where it reads the catalog, whose rows are no table's.
+        let shut = shut && order.is_none() && !crate::pgcatalog::names_catalog(sql);
         // A question that calls the sequence functions is asked on a tab, and again over what its
         // calls came to wherever a run owed the file, drawing again from where it began.
         let began = self.drawing.stands();
         let (batch, mut round) = match self.sequence_runs(sql)? {
             None => match locking::clauses(sql)? {
                 Some(l) => self.ask_locking(l, order, params)?,
+                None if shut => self.answer_over_none(sql, params)?,
                 None => self.answer_with(sql, order, params)?,
             },
             Some(mut runs) => loop {
@@ -1819,6 +1823,24 @@ impl Snail {
             (round.blocks_pruned, round.pages_written) = self.round_wasted(wasted)?;
         }
         Ok((batch, round))
+    }
+
+    /// A question whose one-time conditions shut out every row its plan reads, answered as it is
+    /// over tables holding none.
+    fn answer_over_none(&self, sql: &str, params: &[String]) -> Result<(RecordBatch, Round)> {
+        let sql = &*spelled::scanned(sql, self.catalog.release)?;
+        question::unlocked_words(sql)?;
+        relations::unread_clauses(sql)?;
+        let sql = &*spelled::spelled(sql)?;
+        let parsed = image::parse_sql(sql)?;
+        let [sqlparser::ast::Statement::Query(q)] = parsed.as_slice() else {
+            return self.answer_with(sql, None, params);
+        };
+        question::unlocked(q)?;
+        let _rows = handed::rows_of(&self.catalog);
+        let q = pipeline::windows::written(&spelled::between_written(q))?;
+        let q = computed(&self.catalog, &q)?.unwrap_or(q);
+        relations::answer(&relations::Empty(&self.catalog), &q, params)
     }
 
     /// A question answered on the file as this round reads it.
@@ -1961,7 +1983,10 @@ impl Snail {
         params: &[String],
     ) -> Result<(RecordBatch, Round)> {
         let _rows = handed::rows_of(&self.catalog);
-        let q = &pipeline::windows::written(&spelled::between_written(q))?;
+        let mut q = pipeline::windows::written(&spelled::between_written(q))?;
+        // Each output of its subqueries nothing reads left unmade.
+        outputs::dropped(&mut q, self.catalog.release);
+        let q = &q;
         // A question naming a system column reads it where each table holds it past its own.
         let names_system = {
             let t = q.to_string().to_lowercase();

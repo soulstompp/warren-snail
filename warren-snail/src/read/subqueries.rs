@@ -1024,12 +1024,22 @@ impl<'a, 'q> Subs<'a, 'q> {
             if let Some(r) = plan.once.borrow().as_ref() {
                 return Ok(r.clone());
             }
-            // Its one-time conditions first, as its plan starts.
-            super::folded::gated(
+            // Its one-time conditions first, as its plan starts: where they shut out every row, it
+            // is read over tables holding none.
+            let text = plan.query.to_string();
+            let shut = super::folded::gated(
                 self.asked.reads.catalog(),
-                &plan.query.to_string(),
+                &text,
                 Some(self.asked.reads),
-            )?;
+            )? && !crate::pgcatalog::names_catalog(&text);
+            let empty = relations::Empty(self.asked.reads.catalog());
+            let asked = match shut {
+                true => Asked {
+                    reads: &empty,
+                    ..asked
+                },
+                false => asked,
+            };
             let (m, _) = relations::made_by(
                 asked,
                 &plan.query,

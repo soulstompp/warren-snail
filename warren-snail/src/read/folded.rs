@@ -44,22 +44,24 @@ use std::ops::ControlFlow;
 use std::rc::Rc;
 
 /// A statement's constants folded: the first failure among them, in the planner's order, where
-/// one fails; then its one-time conditions.
+/// one fails; then its one-time conditions. Whether its plan reads no row its one-time conditions
+/// shut out, and answers as it does over tables holding none.
 pub(super) fn folded(
     catalog: &Catalog,
     sql: &str,
     reads: Option<&dyn super::relations::Reads>,
-) -> Result<()> {
+) -> Result<bool> {
     read(catalog, sql, reads, true)
 }
 
 /// A query's one-time conditions alone, its constants folded with the statement it stands in: a
-/// subquery reading nothing of the query around it, as a row first asks for it.
+/// subquery reading nothing of the query around it, as a row first asks for it. Whether it reads
+/// no row they shut out, as `folded` says it.
 pub(super) fn gated(
     catalog: &Catalog,
     sql: &str,
     reads: Option<&dyn super::relations::Reads>,
-) -> Result<()> {
+) -> Result<bool> {
     read(catalog, sql, reads, false)
 }
 
@@ -68,16 +70,20 @@ fn read(
     sql: &str,
     reads: Option<&dyn super::relations::Reads>,
     fold: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let bound = crate::grammar::bound(sql);
     let Ok(parsed) = super::image::parse_sql(bound.as_deref().unwrap_or(sql)) else {
-        return Ok(());
+        return Ok(false);
     };
     let [st] = parsed.as_slice() else {
-        return Ok(());
+        return Ok(false);
     };
-    if !computes_a_constant(st) && !super::own::calls_in(catalog, st) && !types_a_literal(st) {
-        return Ok(());
+    if !computes_a_constant(st)
+        && !super::own::calls_in(catalog, st)
+        && !types_a_literal(st)
+        && !shuts_a_level(st)
+    {
+        return Ok(false);
     }
     // A row type a literal is read into is the one of the file's release.
     let _release = super::handed::releasing(catalog);
@@ -88,7 +94,7 @@ fn read(
     let q = match crate::deparse::query::statement(&cat, st) {
         Ok(q) => q,
         Err(e) if analyzed_refusal(&e) && !super::spelled::three_ats(sql) => return Err(e),
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(false),
     };
     // The file's functions held, so that a call of one is evaluated as a row's call is.
     let _own = super::own::holding(&catalog.functions, catalog.release);
@@ -106,20 +112,61 @@ fn read(
     }
     // Then, as the plan starts and before any row, its one-time conditions.
     match folding.gate(&q, &[])? {
-        Some(g) => folding.passes(&g),
-        None => Ok(()),
+        Some(g) => Ok(folding.passes(&g)?.is_some()),
+        None => Ok(false),
     }
 }
 
 /// What 18.6 evaluates once as a level's plan starts, before it reads a row (a gating Result's
 /// one-time filter): each condition of the level's WHERE, and of the ON of a join over its whole
 /// FROM, that reads no column and calls nothing volatile, in order; where each is TRUE, what the
-/// level below starts.
+/// level below starts. A level whose WHERE folded FALSE or NULL is shut before it starts. Each
+/// says whether it makes a row of none (it folds with no GROUP BY) and whether it reads a relation
+/// beyond its FROM (a subquery, or a call of the file's functions, outside it).
 enum Gate {
     Level {
         conds: Vec<Node>,
         then: Option<Box<Gate>>,
+        folds: bool,
+        reads: bool,
     },
+    Shut {
+        folds: bool,
+        reads: bool,
+    },
+}
+
+/// Whether a statement holds a WHERE or a join's ON one of whose conditions is a written FALSE or
+/// NULL, which shuts its level.
+fn shuts_a_level(st: &Statement) -> bool {
+    struct Shuts(bool);
+    impl sqlparser::ast::Visitor for Shuts {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &sqlparser::ast::Query) -> ControlFlow<()> {
+            let sqlparser::ast::SetExpr::Select(s) = q.body.as_ref() else {
+                return ControlFlow::Continue(());
+            };
+            let ons = s.from.iter().flat_map(|f| &f.joins).filter_map(|j| {
+                super::relations::join_on(&j.join_operator)
+            });
+            let mut conds = Vec::new();
+            for w in s.selection.iter().chain(ons) {
+                super::relations::conjuncts(w, &mut conds);
+            }
+            let written = |e: &Expr| {
+                pipeline::written_truth(e) == Some(false)
+                    || matches!(e, Expr::Value(v) if v.value == sqlparser::ast::Value::Null)
+            };
+            if conds.into_iter().any(written) {
+                self.0 = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut shuts = Shuts(false);
+    let _ = sqlparser::ast::Visit::visit(st, &mut shuts);
+    shuts.0
 }
 
 /// Whether a statement holds a quoted literal or a cast, which its analysis types.
@@ -219,10 +266,14 @@ impl Shape<'_> {
         matches!(self, Shape::Const(Node::Const { text: None, .. }))
     }
 
-    /// A boolean constant's truth: None for NULL.
+    /// A boolean constant's truth, its text read as the boolean's input reads it: None for NULL.
     fn truth(&self) -> Option<Option<bool>> {
         match self {
-            Shape::Const(Node::Const { text, .. }) => Some(text.as_deref().map(|t| t == "t")),
+            Shape::Const(Node::Const { text: None, .. }) => Some(None),
+            Shape::Const(Node::Const { text: Some(t), .. }) => match pipeline::boolean_of(t) {
+                Ok(pipeline::Value::Bool(b)) => Some(Some(b)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1298,14 +1349,42 @@ impl<'c, 'a> Folding<'c, 'a> {
         if !q.recursive {
             visible.extend(&q.ctes);
         }
+        // A set operation's first arm starts first; its other arms make rows of their own.
         if let Some(t) = &q.setop {
             let mut leaves = Vec::new();
             setop_leaves(t, &mut leaves);
-            return match leaves.first().map(|&i| &q.rtable[i - 1].kind) {
-                Some(RteKind::Subquery(s)) => self.gate(s, &visible),
-                _ => Ok(None),
+            let arm = match leaves.first().map(|&i| &q.rtable[i - 1].kind) {
+                Some(RteKind::Subquery(s)) => self.gate(s, &visible)?,
+                _ => None,
             };
+            return Ok(arm.map(|g| Gate::Level {
+                conds: Vec::new(),
+                then: Some(Box::new(g)),
+                folds: true,
+                reads: true,
+            }));
         }
+        let folds = q.group.is_empty()
+            && q.grouping_sets.is_empty()
+            && (q.having.is_some()
+                || q.targets
+                    .iter()
+                    .any(|t| any_node(&t.expr, &mut |x| matches!(x, Node::Agg { .. }))));
+        let reads = q
+            .targets
+            .iter()
+            .map(|t| &t.expr)
+            .chain(&q.quals)
+            .chain(&q.having)
+            .any(|n| {
+                any_node(n, &mut |x| match x {
+                    Node::SubLink { .. } => true,
+                    Node::Func { oid, .. } => {
+                        crate::deparse::function_of(self.cat.catalog, *oid).is_some()
+                    }
+                    _ => false,
+                })
+            });
         // A join's ON over the whole FROM is read with the WHERE, before it.
         let on = match q.from.as_slice() {
             [Jt::Join(j)] if j.kind == JoinKind::Inner => j.quals.as_ref(),
@@ -1313,7 +1392,7 @@ impl<'c, 'a> Folding<'c, 'a> {
         };
         for w in on.into_iter().chain(&q.quals) {
             if matches!(self.node(w, &at)?.truth(), Some(Some(false) | None)) {
-                return Ok(None);
+                return Ok(Some(Gate::Shut { folds, reads }));
             }
         }
         let mut conds = Vec::new();
@@ -1323,12 +1402,32 @@ impl<'c, 'a> Folding<'c, 'a> {
             if !read.is_empty() || self.volatile(c) {
                 continue;
             }
-            if any_node(c, &mut |x| matches!(x, Node::SubLink { .. })) {
-                return Ok(Some(Gate::Level { conds, then: None }));
+            // One holding a subquery is evaluated through the snail the statement reads.
+            if self.reads.is_none() && any_node(c, &mut |x| matches!(x, Node::SubLink { .. })) {
+                return Ok(Some(Gate::Level {
+                    conds,
+                    then: None,
+                    folds,
+                    reads,
+                }));
             }
             if self.node(c, &at)?.constant().is_none() {
                 conds.push(c.clone());
             }
+        }
+        // One holding a subquery is evaluated here only before another it lets the plan reach;
+        // the level reads the last of them, and what is below it, as its rows ask.
+        let linked = |c: &Node| any_node(c, &mut |x| matches!(x, Node::SubLink { .. }));
+        if conds.last().is_some_and(linked) {
+            while conds.last().is_some_and(linked) {
+                conds.pop();
+            }
+            return Ok(Some(Gate::Level {
+                conds,
+                then: None,
+                folds,
+                reads,
+            }));
         }
         let one = match q.from.as_slice() {
             [Jt::Ref(i)] => q.rtable.get(*i - 1),
@@ -1349,6 +1448,8 @@ impl<'c, 'a> Folding<'c, 'a> {
         Ok(Some(Gate::Level {
             conds,
             then: then.map(Box::new),
+            folds,
+            reads,
         }))
     }
 
@@ -1372,23 +1473,42 @@ impl<'c, 'a> Folding<'c, 'a> {
 
     /// The one-time conditions evaluated in order as the plan starts: a failure of class 22 the
     /// statement's. Past one FALSE or NULL, or one the snail does not evaluate here, what it
-    /// gates is left to the rows.
-    fn passes(&self, g: &Gate) -> Result<()> {
-        let Gate::Level { conds, then } = g;
+    /// gates is left to the rows. Where one FALSE or NULL shuts the level, or the level below
+    /// it, whether the level makes a row of none; none where it reads rows, or where its rows
+    /// would read a relation, so that it does not answer as it does over tables holding none.
+    fn passes(&self, g: &Gate) -> Result<Option<bool>> {
+        let shut = |folds: bool, reads: bool, below: bool| {
+            let rows = folds || below;
+            (!(rows && reads)).then_some(rows)
+        };
+        let (conds, then, folds, reads) = match g {
+            Gate::Shut { folds, reads } => return Ok(shut(*folds, *reads, false)),
+            Gate::Level {
+                conds,
+                then,
+                folds,
+                reads,
+            } => (conds, then, *folds, *reads),
+        };
         for c in conds {
-            if self.once(c)? != Some(true) {
-                return Ok(());
+            // One holding a subquery that does not hold shuts the level as the level reads it.
+            let linked = any_node(c, &mut |x| matches!(x, Node::SubLink { .. }));
+            match self.once(c)? {
+                Some(Some(true)) => {}
+                Some(_) if linked => return Ok(None),
+                Some(_) => return Ok(shut(folds, reads, false)),
+                None => return Ok(None),
             }
         }
         match then {
-            Some(t) => self.passes(t),
-            None => Ok(()),
+            Some(t) => Ok(self.passes(t)?.and_then(|below| shut(folds, reads, below))),
+            None => Ok(None),
         }
     }
 
     /// A condition reading no column evaluated once over no row, as the pipeline evaluates its
-    /// printed text.
-    fn once(&self, n: &Node) -> Result<Option<bool>> {
+    /// printed text: its truth, None for NULL; none where the snail does not evaluate it here.
+    fn once(&self, n: &Node) -> Result<Option<Option<bool>>> {
         let mut p = Printer {
             cat: self.cat,
             paren: false,
@@ -1401,6 +1521,29 @@ impl<'c, 'a> Folding<'c, 'a> {
         if p.expr(n, true).is_err() {
             return Ok(None);
         }
+        // One holding a subquery is read as a question of its own through the snail the statement
+        // reads, as its plan reads it once before any row.
+        if any_node(n, &mut |x| matches!(x, Node::SubLink { .. })) {
+            let Some(reads) = self.reads else {
+                return Ok(None);
+            };
+            let Ok(parsed) = super::image::parse_sql(&format!("SELECT {}", p.buf)) else {
+                return Ok(None);
+            };
+            let [Statement::Query(q)] = parsed.as_slice() else {
+                return Ok(None);
+            };
+            return match super::relations::first_row(reads, q) {
+                Ok(Some(row)) => Ok(match row.first() {
+                    Some(pipeline::Value::Bool(b)) => Some(Some(*b)),
+                    Some(pipeline::Value::Null) => Some(None),
+                    _ => None,
+                }),
+                Ok(None) => Ok(None),
+                Err(e) if e.sqlstate().is_some_and(|s| s.starts_with("22")) => Err(e),
+                Err(_) => Ok(None),
+            };
+        }
         let Ok(e) = super::image::parse_expr(&p.buf) else {
             return Ok(None);
         };
@@ -1408,7 +1551,8 @@ impl<'c, 'a> Folding<'c, 'a> {
             return Ok(None);
         };
         match pipeline::eval_typed(&e, Vec::new(), &[], self.release, &self.casings, &types) {
-            Ok(pipeline::Value::Bool(b)) => Ok(Some(b)),
+            Ok(pipeline::Value::Bool(b)) => Ok(Some(Some(b))),
+            Ok(pipeline::Value::Null) => Ok(Some(None)),
             Ok(_) => Ok(None),
             Err(e) if e.sqlstate().is_some_and(|s| s.starts_with("22")) => Err(e),
             Err(_) => Ok(None),
