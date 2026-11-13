@@ -6069,6 +6069,8 @@ fn a_row_s_expansion_is_its_fields_in_a_list_of_values() {
             // is the field.
             ("SELECT (c).* FROM cp.c c ORDER BY id", &["1|(1,x)|10", "2|(2,y)|20", "3|NULL|30", "4|(,z)|40"]),
             ("SELECT (c.*).* FROM cp.c c WHERE id = 1", &["1|(1,x)|10"]),
+            ("SELECT y FROM (SELECT (c).* FROM cp.c AS c(x, y, z) WHERE x = 1) s", &["(1,x)"]),
+            ("SELECT y FROM (SELECT (c.*).* FROM cp.c AS c(x, y, z) WHERE x = 1) s", &["(1,x)"]),
             ("SELECT (s).* FROM (SELECT c FROM cp.c c WHERE id = 2) s", &["(2,\"(2,y)\",20)"]),
             ("SELECT (s.c).* FROM (SELECT c FROM cp.c c WHERE id = 2) s", &["2|(2,y)|20"]),
             ("SELECT (x).n FROM cp.n ORDER BY id", &["6", "NULL"]),
