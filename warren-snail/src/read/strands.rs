@@ -263,6 +263,105 @@ pub(super) fn backward(q: &Query, table: &Table) -> bool {
     })
 }
 
+/// Whether a SELECT over one table has its windows' rows come in the order the windows read them
+/// with no sort, as 18.6's plan reads the table beneath its WindowAgg: every window sharing one
+/// PARTITION BY and ORDER BY, its keys (each PARTITION BY key ascending) the columns of one of the
+/// table's B-trees in its levels' turn, read forward or backward; windows that order nothing take
+/// the query's ORDER BY, and with none the rows come as the FROM gives them. An ORDER BY of the
+/// query beside windows that order their rows is theirs alone, partitioned by nothing.
+pub(super) fn gives_windows(q: &Query, table: &Table) -> bool {
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return false;
+    };
+    if q.with.is_some() || s.from.len() != 1 || !s.from[0].joins.is_empty() {
+        return false;
+    }
+    let mut specs = Vec::new();
+    for item in &s.projection {
+        let e = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => continue,
+        };
+        match e {
+            Expr::Function(f) if f.over.is_some() => match &f.over {
+                Some(WindowType::WindowSpec(spec)) if spec.window_name.is_none() => specs.push(spec),
+                _ => return false,
+            },
+            e if e.to_string().to_uppercase().contains(" OVER ") => return false,
+            _ => {}
+        }
+    }
+    let Some(&first) = specs.first() else {
+        return false;
+    };
+    let parts = |s: &sqlparser::ast::WindowSpec| -> Vec<String> {
+        s.partition_by.iter().map(|e| e.to_string()).collect()
+    };
+    let orders = |os: &[OrderByExpr]| -> Vec<String> { os.iter().map(|o| o.to_string()).collect() };
+    if specs
+        .iter()
+        .any(|s| parts(s) != parts(first) || orders(&s.order_by) != orders(&first.order_by))
+    {
+        return false;
+    }
+    let query: &[OrderByExpr] = match q.order_by.as_ref().map(|o| &o.kind) {
+        None => &[],
+        Some(OrderByKind::Expressions(os)) => os,
+        Some(_) => return false,
+    };
+    let ordered = !first.partition_by.is_empty() || !first.order_by.is_empty();
+    if ordered
+        && !query.is_empty()
+        && (!first.partition_by.is_empty() || orders(query) != orders(&first.order_by))
+    {
+        return false;
+    }
+    // A name an item takes as its alias reads that item, not the column.
+    let aliased = |n: &str| {
+        s.projection.iter().any(|i| match i {
+            SelectItem::ExprWithAlias { alias, .. } => crate::catalog::ident(alias) == n,
+            _ => false,
+        })
+    };
+    let column = |e: &Expr| -> Option<usize> {
+        let (_, n) = super::pipeline::column_of(e)?;
+        if aliased(&n) {
+            return None;
+        }
+        table.columns.iter().position(|c| c.name == n)
+    };
+    let key = |o: &OrderByExpr| -> Option<(usize, bool, bool)> {
+        let desc = super::ordering::descends(&o.options);
+        Some((column(&o.expr)?, desc, o.options.nulls_first.unwrap_or(desc)))
+    };
+    let keys: Option<Vec<(usize, bool, bool)>> = match ordered {
+        true => first
+            .partition_by
+            .iter()
+            .map(|e| Some((column(e)?, false, false)))
+            .chain(first.order_by.iter().map(key))
+            .collect(),
+        false => query.iter().map(key).collect(),
+    };
+    let Some(keys) = keys else {
+        return false;
+    };
+    keys.is_empty()
+        || table.orders.iter().any(|o| {
+            o.method == Method::Btree
+                && o.predicate.is_none()
+                && o.levels.len() >= keys.len()
+                && [false, true].into_iter().any(|back| {
+                    keys.iter().enumerate().all(|(i, &(c, desc, first))| {
+                        o.levels[i] == Level::Column(c)
+                            && (desc != o.desc[i]) == back
+                            && (first != o.nulls_first[i]) == back
+                            && !table.columns[c].collated()
+                    })
+                })
+        })
+}
+
 /// The strand a question on one table may read along, the places among the columns the table stores
 /// of the columns its levels lead with, and what its rows coming so do for it.
 pub(super) fn of_step(

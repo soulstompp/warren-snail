@@ -9830,6 +9830,8 @@ pub(super) struct StepRun<'q> {
     pub(super) one_at_a_time: bool,
     /// Set by its reader once it reads no row more: no row is made past it.
     pub(super) stop: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+    /// Whether its rows come in the order its windows read them, as a B-tree of its table gives it.
+    windows_given: bool,
     /// The columns the step's FROM reads, as the last chunk gave them.
     columns: Columns,
     /// What answers its subqueries, where it has any.
@@ -9877,6 +9879,7 @@ impl<'q> StepRun<'q> {
             hands_on: false,
             one_at_a_time: false,
             stop: None,
+            windows_given: false,
             columns: Vec::new(),
             subqueries: None,
             reads: None,
@@ -9937,6 +9940,57 @@ impl<'q> StepRun<'q> {
         !self.p.calls.sets.is_empty()
     }
 
+    /// Reads its rows as coming in the order its windows read them, as 18.6's plan reads a B-tree
+    /// of its table beneath its WindowAgg (`strands::gives_windows`).
+    pub(super) fn windows_given(&mut self) {
+        self.windows_given = true;
+    }
+
+    /// Where windows read whole, sharing one ORDER BY and partitioning nothing, stand under a LIMIT
+    /// with no WITH TIES, nothing grouping, returning each row once or making a set: the order its
+    /// rows are handed on in, the windows' ORDER BY; where they order nothing, the query's ORDER BY
+    /// where the table gives it, or with none the order the FROM gives them. None for any other.
+    fn window_order(&self) -> Option<Vec<sqlparser::ast::OrderByExpr>> {
+        use sqlparser::ast::OrderByExpr;
+        let p = &self.p;
+        if p.calls.windows.is_empty()
+            || !p.limit.as_ref().is_some_and(|l| !l.ties)
+            || p.grouped
+            || p.having.is_some()
+            || p.distinct
+            || p.distinct_on.is_some()
+            || !p.calls.sets.is_empty()
+            || !p.below_exprs.is_empty()
+            || self.along_partitions
+        {
+            return None;
+        }
+        let spec = windows::shared_spec(&p.calls.windows)?;
+        if !spec.partition_by.is_empty() {
+            return None;
+        }
+        let query: &[OrderByExpr] = match p.order_by.map(|o| &o.kind) {
+            None => &[],
+            Some(OrderByKind::Expressions(os)) => os,
+            Some(_) => return None,
+        };
+        let text = |os: &[OrderByExpr]| os.iter().map(|o| o.to_string()).collect::<Vec<_>>();
+        match (spec.order_by.is_empty(), query.is_empty()) {
+            (_, true) => Some(spec.order_by.clone()),
+            (false, false) if text(query) == text(&spec.order_by) => Some(spec.order_by.clone()),
+            (true, false) if self.windows_given => Some(query.to_vec()),
+            _ => None,
+        }
+    }
+
+    /// Whether its windows take their rows as its cut asks for them, its WHERE read on each as it
+    /// comes: each reads no row past the current one, and the table gives their order.
+    fn pulls(&self) -> bool {
+        self.windows_given
+            && windows::reads_no_row_ahead(&self.p.calls.windows)
+            && self.window_order().is_some()
+    }
+
     /// Whether it makes no row more: its LIMIT keeps none past those it has, its rows coming in
     /// their order, or its reader reads none.
     pub(super) fn ended(&self) -> bool {
@@ -9955,6 +10009,12 @@ impl<'q> StepRun<'q> {
         casings: &Casings,
         mut each: Option<&mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>>,
     ) -> Result<Option<Relation>> {
+        // Windows that take their rows as the cut asks for them hold the rows whole, their WHERE
+        // read only on the rows the cut reaches.
+        let pulled = self.pulls();
+        if pulled {
+            self.p.whole_windows = true;
+        }
         let frame = Frame {
             columns,
             params,
@@ -9983,7 +10043,11 @@ impl<'q> StepRun<'q> {
                 && !self.p.grouped
                 && self.p.calls.windows.is_empty()
         });
-        if let Some(w) = self.p.selection.filter(|_| by_row.is_none() && !self.p.late_where) {
+        if let Some(w) = self
+            .p
+            .selection
+            .filter(|_| by_row.is_none() && !self.p.late_where && !pulled)
+        {
             let mut kept = Vec::with_capacity(rel.rows.len());
             for row in std::mem::take(&mut rel.rows) {
                 if holds(w, &row, &frame, &none)? == Some(true) {
@@ -10190,6 +10254,7 @@ impl<'q> StepRun<'q> {
         let names = self.names();
         let width = self.p.items.len();
         let mut order_out = None;
+        let (window_order, pulled) = (self.window_order(), self.pulls());
         let frame = Frame {
             columns: std::mem::take(&mut self.columns),
             params,
@@ -10275,6 +10340,62 @@ impl<'q> StepRun<'q> {
             fold_partition(p, rows, &frame, &mut made)?;
             self.partition_held = crate::room::holding(0);
             emit(made, going)?;
+        } else if let Some(items) = window_order.filter(|_| p.whole_windows) {
+            // Rows its LIMIT cuts, windows sharing one ORDER BY and partitioning nothing: handed on
+            // in the windows' order, each row's select list made only for the rows the LIMIT
+            // reaches, as PostgreSQL's WindowAgg makes each row its Limit asks for. Where they take
+            // their rows as the cut asks, the WHERE is read a row at a time in that order, none
+            // past the rows the LIMIT reaches, and the windows made over those alone.
+            let held = std::mem::replace(&mut self.held, parted::Parted::new());
+            let by = windows::shared_partition(&p.calls.windows);
+            let reach = match &p.limit {
+                Some(l) => sorted::Cut::of(l, &frame)?.reached(),
+                None => None,
+            };
+            let none = computed_none();
+            let (one_at_a_time, stop) = (self.one_at_a_time, self.stop.clone());
+            held.finish(&|r| parted::partition_hash(by, r, &frame), &mut |rel| {
+                let rows = windows::sorted_on(rel.rows, &items, &frame)?;
+                let rows = match (pulled, p.selection) {
+                    (true, w) => {
+                        let mut kept = Vec::new();
+                        for row in rows {
+                            if reach.is_some_and(|n| kept.len() as u64 >= n) {
+                                break;
+                            }
+                            let keeps = match w {
+                                Some(w) => holds(w, &row, &frame, &none)? == Some(true),
+                                None => true,
+                            };
+                            if keeps {
+                                kept.push(row);
+                            }
+                        }
+                        kept
+                    }
+                    (false, _) => rows,
+                };
+                let rel = Relation {
+                    names: Vec::new(),
+                    rows,
+                    order: None,
+                };
+                let per_row = windows::values(&p.calls.windows, &rel, &frame, None)?;
+                for (n, (row, w)) in rel.rows.iter().zip(per_row).enumerate() {
+                    if reach.is_some_and(|r| n as u64 >= r)
+                        || one_at_a_time && stop.as_ref().is_some_and(|s| s.get())
+                    {
+                        break;
+                    }
+                    let computed = Computed {
+                        calls: w,
+                        bound: None,
+                        _q: std::marker::PhantomData,
+                    };
+                    emit(p.project(row, &frame, computed)?, going)?;
+                }
+                Ok(())
+            })?;
         } else if p.whole_windows {
             let held = std::mem::replace(&mut self.held, parted::Parted::new());
             let by = windows::shared_partition(&p.calls.windows);
@@ -10876,6 +10997,14 @@ impl<'q> Stream<'q> {
     pub(super) fn backward(&mut self) {
         if let Some(Some(r)) = self.runs.last_mut() {
             r.backward();
+        }
+    }
+
+    /// Its question's own step reads its rows in the order its windows read them
+    /// (`StepRun::windows_given`).
+    pub(super) fn windows_given(&mut self) {
+        if let Some(Some(r)) = self.runs.last_mut() {
+            r.windows_given();
         }
     }
 

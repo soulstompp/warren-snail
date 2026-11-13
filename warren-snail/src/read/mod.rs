@@ -2069,6 +2069,9 @@ impl Snail {
         if strands::backward(q, table) {
             stream.backward();
         }
+        if strands::gives_windows(q, table) {
+            stream.windows_given();
+        }
         let sorted_at = strand.as_ref().map(|(_, at, _)| at.clone());
         // Each block's rows go to the pipeline as the scan reads them, in the order, none past the
         // block where its cut has its rows.

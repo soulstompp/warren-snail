@@ -532,6 +532,87 @@ pub(super) fn shared_partition<'q>(calls: &[&'q Expr]) -> &'q [Expr] {
     }
 }
 
+/// The PARTITION BY and ORDER BY every window a step calls shares, where all share one.
+pub(super) fn shared_spec<'q>(calls: &[&'q Expr]) -> Option<&'q WindowSpec> {
+    let spec = |call: &'q Expr| -> Option<&'q WindowSpec> {
+        let Expr::Function(f) = call else {
+            return None;
+        };
+        match &f.over {
+            Some(WindowType::WindowSpec(s)) if s.window_name.is_none() => Some(s),
+            _ => None,
+        }
+    };
+    let first = spec(calls.first()?)?;
+    let text = |s: &WindowSpec| {
+        (
+            s.partition_by.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+            s.order_by.iter().map(|o| o.to_string()).collect::<Vec<_>>(),
+        )
+    };
+    calls
+        .iter()
+        .all(|c| spec(c).is_some_and(|s| text(s) == text(first)))
+        .then_some(first)
+}
+
+/// Whether every window call reads no row past the current one, as PostgreSQL's WindowAgg makes it
+/// as the row comes: row_number, rank and dense_rank, lag of one argument, first_value over the
+/// frame it is given when none is written.
+pub(super) fn reads_no_row_ahead(calls: &[&Expr]) -> bool {
+    calls.iter().all(|c| match c {
+        Expr::Function(f) if f.filter.is_none() => {
+            let n = args(f).map_or(usize::MAX, |a| a.len());
+            let framed = matches!(&f.over, Some(WindowType::WindowSpec(s)) if s.window_frame.is_some());
+            match function_name(f).as_str() {
+                "row_number" | "rank" | "dense_rank" => n == 0,
+                "lag" => n == 1,
+                "first_value" => n == 1 && !framed,
+                _ => false,
+            }
+        }
+        _ => false,
+    })
+}
+
+/// Rows sorted on `items` as a window's ORDER BY sorts them, ties in the order they came.
+pub(super) fn sorted_on(
+    rows: Vec<Vec<Value>>,
+    items: &[OrderByExpr],
+    frame: &Frame,
+) -> Result<Vec<Vec<Value>>> {
+    if items.is_empty() {
+        return Ok(rows);
+    }
+    let none = computed_none();
+    let under = items
+        .iter()
+        .map(|o| frame.casings.keyed(&o.expr))
+        .collect::<Result<Vec<_>>>()?;
+    let mut keyed = rows
+        .into_iter()
+        .map(|r| {
+            let k = items
+                .iter()
+                .zip(&under)
+                .map(|(o, &u)| sort_key(eval(&o.expr, &r, frame, &none)?, u))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((k, r))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut failed = None;
+    keyed.sort_by(|a, b| {
+        ordered(&a.0, &b.0, items).unwrap_or_else(|e| {
+            failed.get_or_insert(e);
+            Ordering::Equal
+        })
+    });
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    Ok(keyed.into_iter().map(|(_, r)| r).collect())
+}
+
 /// Whether the windows fold along the order a relation's rows come in.
 pub(super) fn along(calls: &[&Expr], rel: &Relation, frame: &Frame) -> bool {
     along_by(calls, rel.order, |q, n| frame.find(q, n).ok())

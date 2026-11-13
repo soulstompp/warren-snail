@@ -7192,6 +7192,9 @@ impl<'s> Ready<'s> {
                 if super::strands::backward(&step.query, table) {
                     run.backward();
                 }
+                if super::strands::gives_windows(&step.query, table) {
+                    run.windows_given();
+                }
             }
         }
         let rows_known: std::cell::Cell<Option<u64>> = std::cell::Cell::new(None);

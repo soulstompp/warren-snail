@@ -2,8 +2,9 @@
 //! constant AND, OR, CASE or COALESCE drops, read neither while its shape is found nor as a row
 //! asks; an EXISTS's select list; an argument an inlined function's body never names; a level its
 //! one-time conditions shut, and what is below it; a WITH query nothing reads; a subquery's output
-//! nothing reads; a select list past the rows its LIMIT keeps. Every answer and refusal was given
-//! by 18.6 over the same statements, in the same order.
+//! nothing reads; a select list past the rows its LIMIT keeps; a WHERE past the rows a window that
+//! reads no row ahead of its current one takes under a LIMIT. Every answer and refusal was given by
+//! 18.6 over the same statements, in the same order.
 #![cfg(feature = "standalone")]
 
 mod weather;
@@ -591,11 +592,51 @@ fn an_order_read_backward_under_a_limit_makes_only_the_rows_it_reaches() {
             // A window read whole makes its select list only for the rows its LIMIT reaches.
             ("SELECT k, 1/(k - 2), row_number() OVER () FROM fo.src LIMIT 1", rows(&["1|-1|1"])),
             ("SELECT k, 1/(k - 2), sum(k) OVER () FROM fo.src LIMIT 1", rows(&["1|-1|10"])),
-            // The snail's own: a window that orders its rows, beside a backward sort, or over a
-            // WHERE read row by row, makes every row (18.6 answers `4|0|1`, `4|0|1` and `1|1`).
-            ("SELECT k, 1/(k - 2), rank() OVER (ORDER BY k DESC) FROM fo.src LIMIT 1", zero()),
-            ("SELECT k, 1/(k - 2), row_number() OVER () FROM fo.src ORDER BY k DESC LIMIT 1", zero()),
-            ("SELECT k, row_number() OVER () FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1", zero()),
+            // In the windows' order: their own, or beside a backward sort the sort's; over a WHERE
+            // read row by row where they read no row past the current one.
+            ("SELECT k, 1/(k - 2), rank() OVER (ORDER BY k DESC) FROM fo.src LIMIT 1", rows(&["4|0|1"])),
+            ("SELECT k, 1/(k - 2), row_number() OVER () FROM fo.src ORDER BY k DESC LIMIT 1", rows(&["4|0|1"])),
+            ("SELECT k, row_number() OVER () FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1", rows(&["1|1"])),
+        ],
+    );
+}
+
+#[test]
+fn a_window_that_reads_no_row_past_the_current_one_takes_its_rows_as_its_cut_asks() {
+    let mut w = snail("pulled");
+    each(
+        &mut w,
+        &[
+            // Each row's WHERE read as the cut asks for the row, in the windows' order.
+            ("SELECT k, rank() OVER () FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1", rows(&["1|1"])),
+            ("SELECT k, dense_rank() OVER (ORDER BY k) FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1", rows(&["1|1"])),
+            ("SELECT k, row_number() OVER (ORDER BY k) FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1", rows(&["1|1"])),
+            ("SELECT k, lag(k) OVER () FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1", rows(&["1|NULL"])),
+            ("SELECT k, first_value(k) OVER () FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1", rows(&["1|1"])),
+            ("SELECT k, row_number() OVER () FROM fo.src WHERE 1/(k - 2) > -5 ORDER BY k DESC LIMIT 1", rows(&["4|1"])),
+            ("SELECT k, rank() OVER (ORDER BY k DESC) FROM fo.src WHERE 1/(k - 3) > -5 LIMIT 1", rows(&["4|1"])),
+            // Each row's select list made only for the rows the cut keeps, in the windows' order.
+            ("SELECT k, 1/(k - 2), dense_rank() OVER (ORDER BY k DESC) FROM fo.src LIMIT 1", rows(&["4|0|1"])),
+            ("SELECT k, 1/(k - 2), row_number() OVER (ORDER BY k DESC) FROM fo.src LIMIT 2", rows(&["4|0|1", "3|1|2"])),
+            ("SELECT k, 1/(k - 2), rank() OVER (ORDER BY k) FROM fo.src LIMIT 1", rows(&["1|-1|1"])),
+            ("SELECT k, 1/(k - 2), row_number() OVER (ORDER BY v DESC) FROM fo.src LIMIT 1", rows(&["4|0|1"])),
+            ("SELECT k, 1/(k - 2), sum(k) OVER (ORDER BY k DESC) FROM fo.src LIMIT 1", rows(&["4|0|4"])),
+            ("SELECT k, 1/(k - 2), row_number() OVER () FROM fo.src ORDER BY k LIMIT 1", rows(&["1|-1|1"])),
+            ("SELECT k, 1/(k - 2), rank() OVER (ORDER BY k DESC) FROM fo.src ORDER BY k DESC LIMIT 1", rows(&["4|0|1"])),
+            ("SELECT k, 1/(k - 2), row_number() OVER (ORDER BY k DESC) FROM fo.src ORDER BY k DESC LIMIT 1", rows(&["4|0|1"])),
+            // A window that reads a row past the current one, or one no B-tree orders, reads every
+            // row's WHERE first; so does an OFFSET that passes a failing row over.
+            ("SELECT k, lead(k) OVER () FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1", zero()),
+            ("SELECT k, count(*) OVER () FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1", zero()),
+            ("SELECT k, sum(v) OVER (ORDER BY k) FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1", zero()),
+            (
+                "SELECT k, sum(v) OVER (ORDER BY k ROWS UNBOUNDED PRECEDING) FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1",
+                zero(),
+            ),
+            ("SELECT k, ntile(2) OVER () FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1", zero()),
+            ("SELECT k, rank() OVER (ORDER BY v) FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1", zero()),
+            ("SELECT k, row_number() OVER () FROM fo.src WHERE 1/(k - 2) > -5 OFFSET 1 LIMIT 1", zero()),
+            ("SELECT k, percent_rank() OVER (ORDER BY k) FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1", zero()),
         ],
     );
 }
