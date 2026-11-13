@@ -5,7 +5,7 @@
 //! follower begins as a byte copy of the leader's file.
 
 use crate::cut::PAGE;
-use crate::file::{decode_free, newer, path_of, Files, In, Out, Reader, Root, Run, Stop};
+use crate::file::{copies, decode_free, path_of, Files, In, Out, Reader, Root, Run, Stop};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -258,24 +258,13 @@ fn land(path: &Path, commit: &Commit, stop: Option<Stop>) -> Result<()> {
 fn land_at_turn(files: &Files, commit: &Commit, stop: Option<Stop>) -> Result<()> {
     let mut both = vec![0u8; 2 * PAGE];
     files.first.read_exact_at(&mut both, 0)?;
-    let root = newer(&both)?;
+    let taken = copies(&both, None)?;
+    let root = taken.root;
     files.span.set(root.span);
     let mut page = commit.root.clone();
     page.resize(PAGE, 0);
-    let theirs = Root::decode(&page)
-        .filter(|r| {
-            commit.root.len() <= PAGE
-                && r.generation == commit.generation
-                && commit.parent + 1 == commit.generation
-        })
-        .ok_or_else(|| {
-            Error::new(format!(
-                "the commit of generation {} holds no whole root of its generation",
-                commit.generation
-            ))
-        })?;
-    let copy = (commit.generation % 2) as usize * PAGE;
-    if root.generation == commit.generation && both[copy..copy + PAGE] == page[..] {
+    let theirs = whole_root(commit, &page)?;
+    if lies_in(&both, &page) {
         return Ok(());
     }
     if root.generation != commit.parent {
@@ -284,6 +273,8 @@ fn land_at_turn(files: &Files, commit: &Commit, stop: Option<Stop>) -> Result<()
             commit.parent, root.generation
         )));
     }
+    // The root goes into the copy that does not hold the follower's.
+    let copy = (1 - taken.copy) as usize * PAGE;
     if theirs.span != root.span {
         return Err(Error::new(format!(
             "the commit is in files of {} pages, and the follower in files of {}",
@@ -404,27 +395,24 @@ fn replay_at_turn(
     files.first.read_exact_at(&mut both, 0)?;
     let mut page = commit.root.clone();
     page.resize(PAGE, 0);
-    let theirs = Root::decode(&page)
-        .filter(|r| {
-            commit.root.len() <= PAGE
-                && r.generation == commit.generation
-                && commit.parent + 1 == commit.generation
-        })
-        .ok_or_else(|| {
-            Error::new(format!(
-                "the commit of generation {} holds no whole root of its generation",
-                commit.generation
-            ))
-        })?;
-    let c = (commit.generation % 2) as usize;
-    if both[c * PAGE..(c + 1) * PAGE] == page[..] {
+    let theirs = whole_root(commit, &page)?;
+    if lies_in(&both, &page) {
         return Ok(Replayed::Already);
     }
     let decoded = [Root::decode(&both[..PAGE]), Root::decode(&both[PAGE..])];
     let newest = decoded.iter().flatten().map(|r| r.generation).max();
-    let root = match (&decoded[1 - c], newest) {
+    // The parent: the newer copy of the commit's parent generation, a take's root after its commit
+    // among them. The root goes into the other copy.
+    let parent = (0..2usize)
+        .filter(|&c| {
+            decoded[c]
+                .as_ref()
+                .is_some_and(|r| r.generation == commit.parent)
+        })
+        .max_by_key(|&c| decoded[c].as_ref().map(|r| r.turn));
+    let (c, root) = match (parent, newest) {
         (_, Some(n)) if n > commit.generation => return Ok(Replayed::Passed),
-        (Some(r), _) if r.generation == commit.parent => r.clone(),
+        (Some(p), _) => (1 - p, decoded[p].clone().unwrap()),
         (None, Some(n)) if n == commit.generation => return Ok(Replayed::Passed),
         _ => {
             return Err(Error::new(format!(
@@ -453,6 +441,27 @@ fn replay_at_turn(
     files.first.write_all_at(&page, (c * PAGE) as u64)?;
     files.first.sync_data()?;
     Ok(Replayed::Landed)
+}
+
+/// The commit's root, refused where it is not whole or not of the commit's generation.
+fn whole_root(commit: &Commit, page: &[u8]) -> Result<Root> {
+    Root::decode(page)
+        .filter(|r| {
+            commit.root.len() <= PAGE
+                && r.generation == commit.generation
+                && commit.parent + 1 == commit.generation
+        })
+        .ok_or_else(|| {
+            Error::new(format!(
+                "the commit of generation {} holds no whole root of its generation",
+                commit.generation
+            ))
+        })
+}
+
+/// Whether a root's page lies in either copy of the root.
+fn lies_in(both: &[u8], page: &[u8]) -> bool {
+    both[..PAGE] == page[..] || both[PAGE..] == page[..]
 }
 
 /// The newest tag of the runs a commit frees: those its parent's free map holds waiting on a tag the
@@ -510,11 +519,11 @@ pub fn copy(leader: &Path, to: &Path) -> Result<u64> {
     let first = OpenOptions::new().read(true).write(true).open(to)?;
     let mut both = vec![0u8; 2 * PAGE];
     first.read_exact_at(&mut both, 0)?;
-    let at = (root.generation % 2) as usize * PAGE;
+    let at = reader.root_copy() as usize * PAGE;
     let other = PAGE - at;
     let mut ours = root.encode()?;
     ours.resize(PAGE, 0);
-    if !Root::decode(&both[other..other + PAGE]).is_some_and(|r| r.generation < root.generation) {
+    if !Root::decode(&both[other..other + PAGE]).is_some_and(|r| r.turn < root.turn) {
         both[other..other + PAGE].fill(0);
     }
     both[at..at + PAGE].copy_from_slice(&ours);

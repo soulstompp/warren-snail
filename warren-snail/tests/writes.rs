@@ -754,5 +754,5 @@ fn exec_going_on_counts_the_pages_a_refused_statement_s_draws_wrote() {
         .unwrap();
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{said} {}", String::from_utf8_lossy(&out.stderr));
-    assert!(said.contains("2 statements, 3 pages written"), "{said}");
+    assert!(said.contains("2 statements, 4 pages written"), "{said}");
 }

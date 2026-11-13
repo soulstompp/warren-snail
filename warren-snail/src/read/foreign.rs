@@ -382,7 +382,7 @@ impl Snail {
             return Ok(());
         }
         loop {
-            let generation = self.root.generation;
+            let turn = self.root.turn;
             if self.keys_checked(&due)? {
                 return Ok(());
             }
@@ -391,7 +391,7 @@ impl Snail {
                 return Err(super::beside::concurrent_update());
             }
             self.renew_in_transaction()?;
-            if self.root.generation == generation {
+            if self.root.turn == turn {
                 return Err(Error::new(
                     "a block a foreign key reads was written by another writer, and the newest \
                      root does not hold it",
@@ -799,7 +799,7 @@ impl Snail {
                 (oi, Some(blocks))
             }
             None => {
-                if self.reader.peek_root()?.generation != self.root.generation {
+                if self.reader.peek_root()?.turn != self.root.turn {
                     self.stale = true;
                     return Ok(None);
                 }
@@ -1148,7 +1148,7 @@ impl Snail {
                 self.lock_byte(b, Waiting::Wait)?;
                 self.locks.insert(b);
                 // Another writer of the strand committed while it waited: run again on the newest root.
-                if !self.held && self.root.generation != self.reader.peek_root()?.generation {
+                if !self.held && self.root.turn != self.reader.peek_root()?.turn {
                     self.stale = true;
                     return Ok(false);
                 }

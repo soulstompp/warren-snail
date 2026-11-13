@@ -1077,13 +1077,13 @@ fn a_catalog_whose_last_statement_lacks_a_semicolon_takes_a_declaration() {
 #[test]
 fn a_transaction_declares_again_on_a_catalog_written_before_another_s_commit_moved() {
     // A file written before, its catalog's text as the DDL gave it, its root within a byte of its
-    // page: 53 tables and a key whose name is 32 letters long (33 cut it).
+    // page: 53 tables and a key whose name is 24 letters long (25 cut it).
     let tables: String = (0..53)
         .map(|i| format!("CREATE TABLE ac.f_{i:03} (id integer PRIMARY KEY);\n"))
         .collect();
     let ddl = format!(
         "CREATE SCHEMA ac;\n{tables}CREATE TABLE ac.t1 (id integer, CONSTRAINT {} PRIMARY KEY (id))",
-        "k".repeat(32)
+        "k".repeat(24)
     );
     let path = made("unended-moved", &ddl);
     kept_unended(&path, &format!("{ddl};\n"));

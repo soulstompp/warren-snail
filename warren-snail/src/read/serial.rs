@@ -421,7 +421,7 @@ pub(super) fn snapshot_taken(snails: &mut [&mut Snail], begun: bool) -> Result<(
                         s.renew()?;
                     }
                     order = order.max(s.root.clock);
-                    parts.push(s.root.generation);
+                    parts.push(s.root.turn);
                     if read_only {
                         for (slot, other) in lock::serials(file)? {
                             if other != id
@@ -1499,7 +1499,7 @@ impl Snail {
         if !active {
             return Ok(());
         }
-        let generation = self.reader.peek_root()?.generation + 1;
+        let generation = self.reader.peek_root()?.turn + 1;
         self.serial_commit_tested(generation)
     }
 

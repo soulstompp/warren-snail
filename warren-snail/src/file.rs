@@ -138,7 +138,16 @@ impl<'a> In<'a> {
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct Root {
+    /// The generation: one more at each commit of a text, and none at a take.
     pub generation: u64,
+    /// The root's turn: every root written takes the next, a commit's or a take's, and the newest
+    /// whole copy is the root.
+    pub turn: u64,
+    /// The roots written since the generation's commit, each a take; none on a commit's root.
+    pub takes: u64,
+    /// The runs of pages the takes since the generation's commit wrote, which its next commit
+    /// carries with its own.
+    pub owed: Extent,
     pub pages: u64,
     /// The pages each file holds.
     pub span: u64,
@@ -286,12 +295,12 @@ pub(crate) fn decode_carried(buf: &[u8]) -> Result<Vec<Vec<u8>>> {
 }
 
 /// One snail's root a transaction across snails wrote: a table the snail holds, which names it
-/// among the snails opened together, and the root's generation and checksum.
+/// among the snails opened together, and the root's turn and checksum.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Written {
     pub holds: String,
-    pub generation: u64,
+    pub turn: u64,
     pub crc: u32,
 }
 
@@ -525,6 +534,7 @@ impl Root {
         o.0.extend_from_slice(&MAGIC);
         o.u32(FORMAT);
         o.u64(self.generation);
+        o.u64(self.turn);
         o.u64(self.pages);
         o.u64(self.span);
         o.extent(self.catalog);
@@ -578,7 +588,7 @@ impl Root {
             o.u32(d.roots.len() as u32);
             for w in &d.roots {
                 o.str(&w.holds);
-                o.u64(w.generation);
+                o.u64(w.turn);
                 o.u32(w.crc);
             }
         }
@@ -589,7 +599,8 @@ impl Root {
             + u8::from(self.clock > 0) * 4
             + u8::from(searched) * 8
             + u8::from(self.next_oid > 0) * 16
-            + u8::from(self.oids.bytes > 0) * 32;
+            + u8::from(self.oids.bytes > 0) * 32
+            + u8::from(self.takes > 0) * 64;
         match &self.pending {
             None => o.u8(records),
             Some(p) => {
@@ -612,6 +623,10 @@ impl Root {
         }
         if self.oids.bytes > 0 {
             o.extent(self.oids);
+        }
+        if self.takes > 0 {
+            o.u64(self.takes);
+            o.extent(self.owed);
         }
         // A root marked a replica carries its source, then whether its host tagged it.
         match &self.replica {
@@ -643,6 +658,7 @@ impl Root {
             return None;
         }
         let generation = i.u64().ok()?;
+        let turn = i.u64().ok()?;
         let pages = i.u64().ok()?;
         let span = i.u64().ok()?;
         let catalog = i.extent().ok()?;
@@ -691,7 +707,7 @@ impl Root {
         } else {
             String::new()
         };
-        let ((decided, pending, serial, clock, text_search), (next_oid, oids)) = if !ended(&i) {
+        let ((decided, pending, serial, clock, text_search), (next_oid, oids, takes, owed)) = if !ended(&i) {
             let n = i.u32().ok()? as usize;
             let mut decided = Vec::with_capacity(n.min(256));
             for _ in 0..n {
@@ -702,7 +718,7 @@ impl Root {
                 for _ in 0..m {
                     roots.push(Written {
                         holds: i.str().ok()?,
-                        generation: i.u64().ok()?,
+                        turn: i.u64().ok()?,
                         crc: i.u32().ok()?,
                     });
                 }
@@ -736,14 +752,18 @@ impl Root {
                 0 => Extent::default(),
                 _ => i.extent().ok()?,
             };
+            let (takes, owed) = match marks & 64 {
+                0 => (0, Extent::default()),
+                _ => (i.u64().ok()?, i.extent().ok()?),
+            };
             (
                 (decided, pending, serial, clock, text_search),
-                (next_oid, oids),
+                (next_oid, oids, takes, owed),
             )
         } else {
             (
                 (Vec::new(), None, Extent::default(), 0, String::new()),
-                (0, Extent::default()),
+                (0, Extent::default(), 0, Extent::default()),
             )
         };
         // A root its host tagged carries the tag last; one marked a replica carries its source,
@@ -767,6 +787,9 @@ impl Root {
         }
         let mut root = Root {
             generation,
+            turn,
+            takes,
+            owed,
             pages,
             span,
             catalog,
@@ -1009,8 +1032,8 @@ pub(crate) fn path_of(path: &Path, n: u64) -> PathBuf {
 pub struct Reader {
     files: Files,
     pages: Cell<u64>,
-    /// The generation of the root last read, which the reader's round holds.
-    generation: Cell<u64>,
+    /// The turn of the root last read, which the reader's round holds.
+    turn: Cell<u64>,
     round: Cell<Option<u64>>,
     staged: Rc<RefCell<Staged>>,
     /// The pending copy of the root the reader last found beside it, written before another
@@ -1059,7 +1082,7 @@ impl Reader {
         Ok(Reader {
             files: Files::open(path, false, false)?,
             pages: Cell::new(0),
-            generation: Cell::new(0),
+            turn: Cell::new(0),
             round: Cell::new(None),
             staged: Default::default(),
             spare: RefCell::new(None),
@@ -1291,11 +1314,11 @@ impl Reader {
             unseen,
         } = self.copies()?;
         self.files.span.set(root.span);
-        crate::lock::keep_generation(&self.files.first, from, root.generation)?;
+        crate::lock::keep_generation(&self.files.first, from, root.turn)?;
         self.unseen.set(unseen);
-        self.round.set(Some(root.generation));
+        self.round.set(Some(root.turn));
         self.forget_reused(&root);
-        self.generation.set(root.generation);
+        self.turn.set(root.turn);
         let root = self.expanded(root)?;
         *self.spare.borrow_mut() = pending.map(|p| self.expanded(p)).transpose()?;
         self.copy.set(copy);
@@ -1681,13 +1704,13 @@ impl Reader {
     /// one the round holds: the pages held that it reused are dropped.
     pub(crate) fn adopt(&self, root: &Root) {
         self.forget_reused(root);
-        self.generation.set(root.generation);
+        self.turn.set(root.turn);
     }
 
     fn forget_reused(&self, root: &Root) {
         #[cfg(feature = "standalone")]
         {
-            let last = self.generation.get();
+            let last = self.turn.get();
             let mut held = self.held.borrow_mut();
             if last < root.reused_from {
                 held.clear();
@@ -1699,7 +1722,7 @@ impl Reader {
                 }
             }
         }
-        let last = self.generation.get();
+        let last = self.turn.get();
         let room = self.room.borrow();
         if last < root.reused_from {
             room.forget_file(self.id);
@@ -1771,7 +1794,7 @@ pub(crate) fn copies(both: &[u8], judge: Option<&dyn crate::carry::Judge>) -> Re
             Some(tag) => {
                 decoded[1 - c]
                     .as_ref()
-                    .is_some_and(|o| o.host.is_some() && o.generation == r.generation + 1)
+                    .is_some_and(|o| o.host.is_some() && o.turn == r.turn + 1)
                     || match judge {
                         Some(j) => j.taken(tag)?,
                         None => false,
@@ -1786,16 +1809,16 @@ pub(crate) fn copies(both: &[u8], judge: Option<&dyn crate::carry::Judge>) -> Re
                 .filter(|r| r.pending.is_none() && settled[c as usize])
                 .map(|d| (c, d))
         })
-        .max_by_key(|(c, r)| (r.generation, std::cmp::Reverse(*c)));
+        .max_by_key(|(c, r)| (r.turn, std::cmp::Reverse(*c)));
     if let Some((copy, root)) = taken {
         let pending = decoded
             .iter()
             .flatten()
-            .find(|r| r.pending.is_some() && r.generation == root.generation + 1)
+            .find(|r| r.pending.is_some() && r.turn == root.turn + 1)
             .cloned();
         let waiting = decoded[1 - copy as usize]
             .as_ref()
-            .filter(|r| r.generation == root.generation + 1)
+            .filter(|r| r.turn == root.turn + 1)
             .and_then(|r| r.host);
         // The root holds its own commit and its parent's: the tag of either the judge's round does
         // not see.
@@ -1803,7 +1826,7 @@ pub(crate) fn copies(both: &[u8], judge: Option<&dyn crate::carry::Judge>) -> Re
         if let Some(j) = judge {
             let parent = decoded[1 - copy as usize]
                 .as_ref()
-                .filter(|r| r.generation + 1 == root.generation);
+                .filter(|r| r.turn + 1 == root.turn);
             let tags = [Some(root), parent]
                 .into_iter()
                 .flatten()
@@ -1869,11 +1892,11 @@ pub(crate) fn handed(both: &[u8], page: &[u8]) -> Result<Copies> {
         .ok_or_else(|| {
             Error::new(format!(
                 "the root of generation {} the snail's host hands lies in neither copy of its root",
-                root.generation
+                root.turn
             ))
         })?;
     let other = Root::decode(&both[(1 - copy) * PAGE..(2 - copy) * PAGE])
-        .filter(|r| r.generation == root.generation + 1);
+        .filter(|r| r.turn == root.turn + 1);
     Ok(Copies {
         pending: other.clone().filter(|r| r.pending.is_some()),
         waiting: other.and_then(|r| r.host),
@@ -1905,6 +1928,8 @@ pub struct Writer {
     /// host that panics leaves the file at the commit's parent, its root never written.
     host: Option<std::panic::AssertUnwindSafe<Box<dyn crate::carry::Host>>>,
     carried: BTreeMap<u64, Vec<u8>>,
+    /// The runs of pages the commit under way has written, its root's copy aside.
+    runs: Vec<(u64, u64)>,
 }
 
 impl Writer {
@@ -1941,6 +1966,7 @@ impl Writer {
             taken: Vec::new(),
             host: None,
             carried: BTreeMap::new(),
+            runs: Vec::new(),
         })
     }
 
@@ -1961,6 +1987,7 @@ impl Writer {
                 taken: Vec::new(),
                 host: None,
                 carried: BTreeMap::new(),
+                runs: Vec::new(),
             },
             root,
         ))
@@ -1988,6 +2015,27 @@ impl Writer {
         self.free.clear();
         self.taken.clear();
         self.carried.clear();
+        self.runs.clear();
+    }
+
+    /// The runs of pages the commit under way has written, its root's copy aside.
+    pub(crate) fn runs_written(&self) -> Vec<(u64, u64)> {
+        self.runs.clone()
+    }
+
+    /// Pages a take wrote, carried with the commit under way where a host carries it: those it
+    /// writes itself stand.
+    pub(crate) fn carries_also(&mut self, pages: impl IntoIterator<Item = (u64, Vec<u8>)>) {
+        if self.host.is_some() {
+            for (n, bytes) in pages {
+                self.carried.entry(n).or_insert(bytes);
+            }
+        }
+    }
+
+    /// Whether a host carries the commits.
+    pub(crate) fn is_carried(&self) -> bool {
+        self.host.is_some()
     }
 
     /// Carries each commit from now on by the host.
@@ -2110,6 +2158,9 @@ impl Place for Writer {
         buf.resize(bytes.len().div_ceil(PAGE).max(1) * PAGE, 0);
         self.files.write_at(&buf, start)?;
         self.written += (buf.len() / PAGE) as u64;
+        if start >= ROOT_PAGES {
+            self.runs.push((start, (buf.len() / PAGE) as u64));
+        }
         if self.host.is_some() {
             for (i, page) in buf.chunks(PAGE).enumerate() {
                 self.carried.insert(start + i as u64, page.to_vec());
@@ -2124,14 +2175,15 @@ impl Writer {
     /// names. Where a host carries the commits, the commit is handed to it once its pages are on
     /// the disk, and its root is written only once the host returns.
     pub fn commit(&mut self, root: &mut Root) -> Result<()> {
-        self.commit_into(root, root.generation % 2)
+        self.commit_into(root, root.turn % 2)
     }
 
     /// The commit, its root written to `copy`, 0 or 1, of the root's two: the one that does not
     /// hold the root it begins from.
     pub(crate) fn commit_into(&mut self, root: &mut Root, copy: u64) -> Result<()> {
         let bytes = self.prepare(root)?;
-        if let Some(host) = self.host.as_mut() {
+        // A take's root is no commit: its pages go to the host with the next commit's.
+        if let Some(host) = self.host.as_mut().filter(|_| root.takes == 0) {
             let pages = std::mem::take(&mut self.carried);
             host.carry(&crate::carry::Commit::of(
                 root.generation,
@@ -2198,7 +2250,7 @@ mod tests {
     #[test]
     fn the_newer_whole_root_is_read_and_a_torn_one_is_not() {
         let r = Root {
-            generation: 7,
+            turn: 7,
             pages: 9,
             span: 64,
             catalog: Extent {
@@ -2261,7 +2313,7 @@ mod tests {
             (was.collation(), was.decided.len(), was.pending.is_none()),
             (COLLATION, 0, true)
         );
-        assert_eq!((back.generation, back.span), (7, 64));
+        assert_eq!((back.turn, back.span), (7, 64));
         assert_eq!((back.release, &back.monetary), (16, &r.monetary));
         assert_eq!(back.orders[0].2.pages(), 2);
         assert_eq!(
@@ -2328,12 +2380,12 @@ mod tests {
             p
         };
         let root = Root {
-            generation: 4,
+            turn: 4,
             decided: vec![Decision {
                 at: 4,
                 roots: vec![Written {
                     holds: "b.t".into(),
-                    generation: 9,
+                    turn: 9,
                     crc: 77,
                 }],
                 carried: Extent {
@@ -2344,7 +2396,7 @@ mod tests {
             ..Default::default()
         };
         let pending = Root {
-            generation: 5,
+            turn: 5,
             pending: Some(Pending {
                 decider: "a.t".into(),
                 at: 12,
@@ -2362,8 +2414,8 @@ mod tests {
             copy,
             ..
         } = copies(&both, None).unwrap();
-        assert_eq!((taken.generation, &taken.decided), (4, &root.decided));
-        assert_eq!((spare.map(|s| s.generation), copy), (Some(5), 0));
+        assert_eq!((taken.turn, &taken.decided), (4, &root.decided));
+        assert_eq!((spare.map(|s| s.turn), copy), (Some(5), 0));
         // Its root, written over its parent after its transaction is decided, torn: the pending
         // copy is the root, taken.
         let mut torn = page(&landed_of(&pending));
@@ -2376,7 +2428,7 @@ mod tests {
             ..
         } = copies(&torn, None).unwrap();
         assert_eq!(
-            (taken.generation, taken.pending, spare.is_none(), copy),
+            (taken.turn, taken.pending, spare.is_none(), copy),
             (5, None, true, 1)
         );
         // Taken, it is the root it was written for: its checksum leaves the mark out.
@@ -2396,10 +2448,10 @@ mod tests {
             copy,
             ..
         } = copies(&both, None).unwrap();
-        assert_eq!((taken.generation, spare.is_none(), copy), (5, true, 0));
+        assert_eq!((taken.turn, spare.is_none(), copy), (5, true, 0));
         // A copy pending beside an older root than its own parent is no pending copy of it.
         let mut both = page(&Root {
-            generation: 3,
+            turn: 3,
             ..Default::default()
         });
         both.extend_from_slice(&page(&pending));
@@ -2415,9 +2467,9 @@ mod tests {
         }
     }
 
-    fn tagged(generation: u64, host: Option<u64>) -> Vec<u8> {
+    fn tagged(turn: u64, host: Option<u64>) -> Vec<u8> {
         let mut p = Root {
-            generation,
+            turn,
             host,
             ..Default::default()
         }
@@ -2437,7 +2489,7 @@ mod tests {
         let mut both = a;
         both.extend_from_slice(&b);
         let c = copies(&both, judge).unwrap();
-        (c.root.generation, c.waiting)
+        (c.root.turn, c.waiting)
     }
 
     #[test]
@@ -2508,7 +2560,7 @@ mod tests {
     fn a_root_marked_a_replica_reads_back_its_source_with_its_tag_or_none() {
         let marked = |replica: Option<&str>, host: Option<u64>| {
             let mut p = Root {
-                generation: 5,
+                turn: 5,
                 host,
                 replica: replica.map(str::to_string),
                 ..Default::default()
@@ -2531,7 +2583,7 @@ mod tests {
         // last before its checksum.
         let bare = |host: Option<u64>| {
             Root {
-                generation: 5,
+                turn: 5,
                 host,
                 ..Default::default()
             }
@@ -2551,6 +2603,55 @@ mod tests {
     }
 
     #[test]
+    fn a_root_reads_back_its_turn_apart_from_its_generation_and_a_take_s_owed_pages() {
+        let owed = Extent {
+            start: 60,
+            bytes: 52,
+        };
+        for (takes, owed) in [(0, Extent::default()), (3, owed)] {
+            for (replica, host) in [(None, None), (Some("mysql-1"), Some(9)), (None, Some(7))] {
+                let mut p = Root {
+                    generation: 4,
+                    turn: 9,
+                    takes,
+                    owed,
+                    next_oid: 16400,
+                    host,
+                    replica: replica.map(str::to_string),
+                    ..Default::default()
+                }
+                .encode()
+                .unwrap();
+                p.resize(PAGE, 0);
+                let r = Root::decode(&p).unwrap();
+                assert_eq!(
+                    (r.generation, r.turn, r.takes, r.owed, r.next_oid, r.replica.as_deref(), r.host),
+                    (4, 9, takes, owed, 16400, replica, host)
+                );
+            }
+        }
+        // Of two copies, the newer turn is the root, whatever their generations.
+        let take = Root {
+            generation: 4,
+            turn: 9,
+            takes: 1,
+            ..Default::default()
+        };
+        let commit = Root {
+            generation: 4,
+            turn: 8,
+            ..Default::default()
+        };
+        let mut both = vec![0u8; 2 * PAGE];
+        for (c, r) in [(1, &take), (0, &commit)] {
+            let b = r.encode().unwrap();
+            both[c * PAGE..c * PAGE + b.len()].copy_from_slice(&b);
+        }
+        let c = copies(&both, None).unwrap();
+        assert_eq!((c.copy, c.root.turn, c.root.takes), (1, 9, 1));
+    }
+
+    #[test]
     fn a_root_reads_back_its_oid_counter_and_record() {
         let record = Extent {
             start: 40,
@@ -2559,7 +2660,7 @@ mod tests {
         for (next_oid, oids) in [(0, Extent::default()), (16400, Extent::default()), (0, record), (16400, record)] {
             for (replica, host) in [(None, None), (Some("mysql-1"), Some(9)), (None, Some(7))] {
                 let mut p = Root {
-                    generation: 5,
+                    turn: 5,
                     text_search: "pg_catalog.english".into(),
                     next_oid,
                     oids,
@@ -2613,7 +2714,7 @@ mod tests {
         assert_eq!(w.reserve(2), 4);
         assert_eq!(w.left_free(), [(3, 1)]);
         w.commit(&mut Root {
-            generation: 1,
+            turn: 1,
             ..Default::default()
         })
         .unwrap();
@@ -2644,7 +2745,7 @@ mod tests {
         let mut w = Writer::create(&path).unwrap();
         let e = w.place(&[1u8; 10]).unwrap();
         w.commit(&mut Root {
-            generation: 1,
+            turn: 1,
             ..Default::default()
         })
         .unwrap();
@@ -2660,11 +2761,11 @@ mod tests {
         // A later generation writes a page of its own, and the page held stays held.
         let (mut w, mut root) = Writer::open(&path).unwrap();
         let f = w.place(&[2u8; 10]).unwrap();
-        root.generation += 1;
+        root.turn += 1;
         w.commit(&mut root).unwrap();
         assert_eq!(w.pages_written(), 2);
         r.begin_round().unwrap();
-        assert_eq!(r.root().unwrap().generation, 2);
+        assert_eq!(r.root().unwrap().turn, 2);
         assert_eq!(r.read_extent(e).unwrap(), [1u8; 10]);
         assert_eq!(r.read_extent(f).unwrap(), [2u8; 10]);
         assert_eq!(r.pages_held(), 2);

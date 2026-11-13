@@ -280,7 +280,7 @@ impl Snail {
         }
         let from = self.own_from.as_ref().unwrap_or(&self.root);
         let newest = self.reader.peek_root()?;
-        if newest.generation == from.generation {
+        if newest.turn == from.turn {
             return Ok(Since::Same);
         }
         let table = &self.catalog.tables[ti];

@@ -161,10 +161,11 @@ fn a_sequences_advance_inside_a_host_lands_at_once() {
     drop(w);
     let carried = log.lock().unwrap().clone();
     let kinds: Vec<(u64, Option<u64>)> = carried.iter().map(|c| (c.generation, c.host())).collect();
-    assert_eq!(kinds, [(g + 1, Some(carry::AT_ONCE)), (g + 2, Some(7))]);
+    // The advance is no commit: the host is handed the transaction's alone, which carries it.
+    assert_eq!(kinds, [(g + 1, Some(7))]);
     // Transaction 7 never committed: its row is not there, the sequence's advance is.
     let s = Snail::open(&path).unwrap();
-    assert_eq!(s.generation(), g + 1);
+    assert_eq!(s.generation(), g);
     let advanced = s.sequences().unwrap();
     assert_eq!(advanced.len(), 1);
     assert!(advanced[0].2, "{advanced:?}");
@@ -177,7 +178,7 @@ fn a_sequences_advance_inside_a_host_lands_at_once() {
             s.generation(),
             count(&mut s, "SELECT count(*) FROM shop.orders")
         ),
-        (g + 2, 1)
+        (g + 1, 1)
     );
 }
 
@@ -212,7 +213,7 @@ fn a_writer_with_no_host_to_ask_refuses_a_snail_written_through_a_host() {
     w.execute("BEGIN").unwrap();
     w.execute("INSERT INTO shop.orders (v) VALUES (1)").unwrap();
     drop(w);
-    assert_eq!(Snail::open(&sequenced).unwrap().generation(), g + 1);
+    assert_eq!(Snail::open(&sequenced).unwrap().generation(), g);
     let mut plain = Snail::open_writing(&sequenced).unwrap();
     let e = plain
         .execute("INSERT INTO shop.orders (id, v) VALUES (5, 1)")
@@ -510,8 +511,8 @@ fn a_root_holding_a_commit_its_judges_round_does_not_see_names_that_commit() {
     w.execute("BEGIN").unwrap();
     w.execute("INSERT INTO shop.orders (v) VALUES (2)").unwrap();
     drop(w);
-    assert_eq!(taken_as(&sequenced, as_of(&[], &[7])), (g + 3, Some(7)));
-    assert_eq!(taken_as(&sequenced, as_of(&[7], &[])), (g + 3, None));
+    assert_eq!(taken_as(&sequenced, as_of(&[], &[7])), (g + 1, Some(7)));
+    assert_eq!(taken_as(&sequenced, as_of(&[7], &[])), (g + 1, None));
 }
 
 /// A judge that hands the root its host takes, and says no word on a copy.

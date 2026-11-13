@@ -589,6 +589,50 @@ fn a_new_follower_is_a_byte_copy_of_the_leader_under_a_generation_it_holds() {
     assert!(e.contains("where no file lies"), "{e}");
 }
 
+/// Where the snail at `path` holds its sequences, and the rows of `s.drawn`, opened afresh.
+#[cfg(feature = "standalone")]
+fn drawn(path: &Path) -> (Vec<(String, i64, bool)>, i64) {
+    let mut s = Snail::open(path).unwrap();
+    let (b, _) = s.ask("SELECT count(*) FROM s.drawn", None).unwrap();
+    (s.sequences().unwrap(), one(&b))
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_follower_stopped_before_a_commit_carrying_takes_stands_at_its_parent() {
+    // A setval frees the pages the sequence lay in at the last commit, and the draw after it writes
+    // the sequence afresh: those pages wait for a commit, so the commit carrying both writes none
+    // its parent names.
+    let leader = removed(&tmp("carry-takes-leader.snail"));
+    let follower = removed(&tmp("carry-takes-follower.snail"));
+    let ddl = "CREATE SCHEMA s; CREATE SEQUENCE s.ids;
+         CREATE TABLE s.drawn (id bigint NOT NULL DEFAULT nextval('s.ids'), name text NOT NULL,
+             PRIMARY KEY (id));";
+    write(&leader, &warren_snail::catalog::Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    carry::copy(&leader, &follower).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut w = Snail::open_writing(&leader).unwrap();
+    w.carried_by(Box::new(Sent(tx))).unwrap();
+    w.execute("INSERT INTO s.drawn (name) VALUES ('first')").unwrap();
+    w.execute("SELECT setval('s.ids', 100)").unwrap();
+    w.execute("INSERT INTO s.drawn (name) VALUES ('second')").unwrap();
+    drop(w);
+    let commits: Vec<Commit> = rx.try_iter().collect();
+    assert_eq!(commits.len(), 2);
+    carry::apply(&follower, &commits[0]).unwrap();
+    let first = (vec![("s.ids".to_string(), 1, true)], 1);
+    assert_eq!(drawn(&follower), first);
+    for stop in [Stop::BeforeRoot, Stop::HalfRoot] {
+        assert!(carry::apply_stopping(&follower, &commits[1], Some(stop)).is_err());
+        assert_eq!(drawn(&follower), first, "{stop:?}");
+        assert_eq!(generation(&follower), commits[0].generation, "{stop:?}");
+    }
+    carry::apply(&follower, &commits[1]).unwrap();
+    assert_eq!(drawn(&follower), (vec![("s.ids".to_string(), 101, true)], 2));
+    assert_eq!(drawn(&leader), drawn(&follower));
+    Snail::open(&follower).unwrap().census().unwrap();
+}
+
 #[test]
 #[cfg(feature = "standalone")]
 fn a_commit_across_a_huge_snails_files_names_each_page_by_its_file_and_lands_in_each() {

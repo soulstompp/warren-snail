@@ -558,8 +558,8 @@ mod written {
             }
             let twinned = other.execute("COMMIT").unwrap();
             drop(other);
-            // And the commit writes what one that never declared them writes, but for those
-            // generations and the counter its root keeps past the OIDs they took.
+            // And the commit writes what one that never declared them writes, its generation too,
+            // but for the counter its root keeps past the OIDs they took.
             let mut other = Snail::open_writing(&bare).unwrap();
             for st in ["BEGIN", &insert(1, 1001), &insert(2, 1)] {
                 other.execute(st).unwrap();
@@ -572,7 +572,7 @@ mod written {
             );
             assert_eq!(
                 (done.generation, done.pages_written, done.pages_reused),
-                (plain.generation + PAST as u64, plain.pages_written, plain.pages_reused)
+                (plain.generation, plain.pages_written, plain.pages_reused)
             );
             let counter = |p: &Path| Reader::open(p).unwrap().root().unwrap().next_oid;
             assert!(counter(&path) > 0 && counter(&bare) == 0);

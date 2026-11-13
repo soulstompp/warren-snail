@@ -531,6 +531,121 @@ fn a_read_alone_commits_nothing_and_its_prune_rides_the_writer_s_next_commit() {
     );
 }
 
+/// A host that applies each commit to a follower before it returns, and keeps it.
+struct Applied(
+    std::path::PathBuf,
+    std::sync::Arc<std::sync::Mutex<Vec<warren_snail::carry::Commit>>>,
+);
+
+impl warren_snail::carry::Host for Applied {
+    fn carry(&mut self, commit: &warren_snail::carry::Commit) -> warren_snail::Result<()> {
+        warren_snail::carry::apply(&self.0, commit)?;
+        self.1.lock().unwrap().push(commit.clone());
+        Ok(())
+    }
+}
+
+/// An answer's rows on the snail at `path` opened afresh, each value as `rows` writes it.
+fn rows_at(path: &std::path::Path, sql: &str) -> Vec<String> {
+    let mut s = Snail::open(path).unwrap();
+    let (b, _) = s.ask(sql, None).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    s.text_of(&b)
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            r.into_iter()
+                .map(|v| v.unwrap_or_else(|| "NULL".into()))
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
+/// Where the snail at `path` holds its one sequence, opened afresh.
+fn drawn_to(path: &std::path::Path) -> Vec<(String, i64, bool)> {
+    Snail::open(path).unwrap().sequences().unwrap()
+}
+
+#[test]
+fn a_take_writes_a_root_and_only_a_text_s_own_commit_moves_the_generation_and_reaches_the_host() {
+    let path = tmp("sling-takes.snail");
+    let follower = tmp("sling-takes-follower.snail");
+    let _ = std::fs::remove_file(&follower);
+    let ddl = "CREATE SCHEMA s; CREATE SEQUENCE s.ids;
+         CREATE TABLE s.drawn (id bigint NOT NULL DEFAULT nextval('s.ids'), name text NOT NULL,
+             PRIMARY KEY (id));";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    warren_snail::carry::copy(&path, &follower).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    w.carried_by(Box::new(Applied(follower.clone(), log.clone())))
+        .unwrap();
+    let commits = || log.lock().unwrap().len();
+    let at = |p: &std::path::Path| Snail::open(p).unwrap().generation();
+    let g = w.generation();
+    // A text making two tables and filling them, each table's OIDs taken at the root's turn: one
+    // commit, the one the host is handed.
+    for st in [
+        "BEGIN",
+        "CREATE TABLE s.a (k integer NOT NULL, PRIMARY KEY (k))",
+        "INSERT INTO s.a VALUES (1)",
+        "CREATE TABLE s.b (k integer NOT NULL, PRIMARY KEY (k))",
+        "INSERT INTO s.b VALUES (2)",
+        "COMMIT",
+    ] {
+        w.execute(st).unwrap();
+    }
+    assert_eq!((w.generation(), at(&path), at(&follower), commits()), (g + 1, g + 1, g + 1, 1));
+    let both = "SELECT (SELECT k FROM s.a), (SELECT k FROM s.b)";
+    assert_eq!(rows_at(&path, both), ["1|2"]);
+    assert_eq!(rows_at(&follower, both), ["1|2"]);
+    // One refused part-way, its table's OIDs taken: neither moves.
+    w.execute("BEGIN").unwrap();
+    w.execute("CREATE TABLE s.c (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    w.execute("INSERT INTO s.c VALUES (1)").unwrap();
+    let (state, _) = refused(&mut w, "INSERT INTO s.c VALUES (1)");
+    assert_eq!(state, Some("23505"));
+    assert_eq!(w.execute("COMMIT").unwrap().statement, "ROLLBACK");
+    assert_eq!((w.generation(), at(&path), commits()), (g + 1, g + 1, 1));
+    // Values drawn past the sequence's cache inside a text: one commit, which carries the draws.
+    for st in [
+        "BEGIN",
+        "INSERT INTO s.drawn (name) VALUES ('first')",
+        "INSERT INTO s.drawn (name) VALUES ('second')",
+        "COMMIT",
+    ] {
+        w.execute(st).unwrap();
+    }
+    assert_eq!((w.generation(), at(&path), at(&follower), commits()), (g + 2, g + 2, g + 2, 2));
+    assert_eq!(drawn_to(&follower), [("s.ids".to_string(), 2, true)]);
+    // A setval alone writes a root the file reads at once, and is no commit: the host has it with
+    // the next text's commit.
+    w.execute("SELECT setval('s.ids', 100)").unwrap();
+    assert_eq!((w.generation(), at(&path), commits()), (g + 2, g + 2, 2));
+    assert_eq!(drawn_to(&path), [("s.ids".to_string(), 100, true)]);
+    assert_eq!(drawn_to(&follower), [("s.ids".to_string(), 2, true)]);
+    w.execute("INSERT INTO s.drawn (name) VALUES ('third')")
+        .unwrap();
+    assert_eq!((w.generation(), at(&path), at(&follower), commits()), (g + 3, g + 3, g + 3, 3));
+    let drawn = "SELECT id, name FROM s.drawn ORDER BY id";
+    let want = ["1|first", "2|second", "101|third"];
+    assert_eq!(rows_at(&path, drawn), want);
+    assert_eq!(rows_at(&follower, drawn), want);
+    assert_eq!(drawn_to(&follower), [("s.ids".to_string(), 101, true)]);
+    // Each commit the host was handed began from the one before it.
+    let handed: Vec<(u64, u64)> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| (c.parent, c.generation))
+        .collect();
+    assert_eq!(handed, [(g, g + 1), (g + 1, g + 2), (g + 2, g + 3)]);
+    drop(w);
+    Snail::open(&path).unwrap().census().unwrap();
+    Snail::open(&follower).unwrap().census().unwrap();
+}
+
 /// A snail of the DDL given, its rows inserted, at a path of the test's name.
 fn declared(name: &str, ddl: &str, inserts: &[&str]) -> std::path::PathBuf {
     let path = tmp(&format!("sling-{name}.snail"));

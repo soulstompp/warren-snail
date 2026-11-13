@@ -17,7 +17,8 @@ use crate::directory::{
 };
 use crate::encode::{decode_leaf, tail_pages};
 use crate::file::{
-    decode_free, encode_free, Extent, Place, Root, Run, Writer, REUSED_KEPT, STAGED,
+    decode_free, decode_runs, encode_free, encode_runs, Extent, Place, Root, Run, Writer,
+    REUSED_KEPT, STAGED,
 };
 use crate::lock;
 
@@ -3215,7 +3216,7 @@ impl Snail {
     /// the blocks it changed. A transaction that declared reads the catalog as committed with its
     /// own statements declared on it (`declared_on`).
     pub(super) fn in_transaction_on(&mut self, mut root: Root) -> Result<()> {
-        if root.generation == self.root.generation {
+        if root.turn == self.root.turn {
             return Ok(());
         }
         if self.declared.is_some() {
@@ -3404,9 +3405,8 @@ impl Snail {
 
     /// The commit, at the root's turn: it begins from the newest root.
     pub(super) fn commit_with(&mut self, w: &mut Writer) -> Result<Root> {
-        // A transaction's root carries its host's tag; a sequence's advance, and OIDs taken, land
-        // at once.
-        let advance = self.advancing.is_some() || self.taking.is_some();
+        // A transaction's root carries its host's tag; a take lands at once.
+        let advance = self.is_take();
         let mut root = self.commit_pages(w, &[])?;
         root.host = match w.host_tag() {
             Some(_) if advance => Some(crate::carry::AT_ONCE),
@@ -3415,6 +3415,12 @@ impl Snail {
         // The root goes into the copy that does not hold the root it begins from.
         w.commit_into(&mut root, 1 - self.reader.root_copy())?;
         Ok(root)
+    }
+
+    /// Whether the root written now is a take, no commit: a sequence's move, OIDs taken, or the
+    /// transactions a rollback doomed.
+    fn is_take(&self) -> bool {
+        self.advancing.is_some() || self.taking.is_some() || self.ending.is_some()
     }
 
     /// The commit but its root, at the root's turn: every page written, and the root that names
@@ -3469,7 +3475,19 @@ impl Snail {
         }
         root.host = None;
         w.begin_commit(&root);
-        let generation = root.generation + 1;
+        let turn = root.turn + 1;
+        let take = self.is_take();
+        // A commit carries the pages the takes since the last wrote.
+        if !take && root.owed.bytes > 0 && w.is_carried() {
+            let mut pages = Vec::new();
+            for r in decode_runs(&self.reader.read_extent(root.owed)?)? {
+                let bytes = self.reader.read(r.start, r.pages)?;
+                for (i, page) in bytes.chunks(crate::cut::PAGE).enumerate() {
+                    pages.push((r.start + i as u64, page.to_vec()));
+                }
+            }
+            w.carries_also(pages);
+        }
         // The free map: its runs whose tag no older round still runs under are free now, and the
         // commit takes pages from the free runs first.
         let (mut runs, mut spent) = if root.free.bytes > 0 {
@@ -3491,9 +3509,11 @@ impl Snail {
         let mut tags: Vec<u64> = runs.iter().map(|r| r.tag).filter(|&t| t > 0).collect();
         tags.sort_unstable();
         tags.dedup();
+        // A run a take freed waits for a commit.
+        let committed = root.turn - root.takes;
         let mut freed = 0;
         for t in tags {
-            if lock::older_held(self.reader.file(), t)? {
+            if t > committed || lock::older_held(self.reader.file(), t)? {
                 break;
             }
             freed = t;
@@ -3541,13 +3561,13 @@ impl Snail {
         }
         if let Some(d) = self.declared.take() {
             self.reader
-                .put_catalog(&mut root, d.ddl.as_bytes(), generation, w, &mut gone)?;
+                .put_catalog(&mut root, d.ddl.as_bytes(), turn, w, &mut gone)?;
             root.monetary = crate::file::monetary_of(&self.catalog, &root.monetary);
             if !d.resets.is_empty() && root.sequences.bytes > 0 {
                 let mut states = self.reader.sequence_states(&root)?;
                 states.retain(|s| !d.resets.contains(&s.0));
                 self.reader
-                    .put_sequences(&mut root, &states, generation, w, &mut gone)?;
+                    .put_sequences(&mut root, &states, turn, w, &mut gone)?;
             }
             let touched: Vec<&String> = d.made.iter().map(|(t, _)| t).collect();
             let mut orders = Vec::new();
@@ -3577,21 +3597,21 @@ impl Snail {
         // The sequences a statement advanced, at the root's turn, each where it stands now.
         if let Some(states) = self.advancing.take() {
             self.reader
-                .put_sequences(&mut root, &states, generation, w, &mut gone)?;
+                .put_sequences(&mut root, &states, turn, w, &mut gone)?;
         }
         // A transaction across snails this commit decides: the roots it writes into the others,
         // carried.
         if let Some((roots, bytes)) = self.deciding.take() {
             let carried = w.place(&bytes)?;
             root.decided.push(crate::file::Decision {
-                at: generation,
+                at: turn,
                 roots,
                 carried,
             });
         }
         // The serializable transactions' records, and what the host's monitor is told of its cuts.
         self.tell_cuts()?;
-        self.records_at_commit(w, &mut root, generation, &mut gone)?;
+        self.records_at_commit(w, &mut root, turn, &mut gone)?;
         let rebased = std::mem::take(&mut self.rebased);
         for ((ti, oi), blocks) in rebased {
             let table = &self.catalog.tables[ti];
@@ -3679,7 +3699,32 @@ impl Snail {
             root.orders[at].2 = w.place(&bytes)?;
         }
         maps.finish(w)?;
-        self.reader.settle(&mut root, generation, w, &mut gone)?;
+        self.reader.settle(&mut root, turn, w, &mut gone)?;
+        // What the takes since the last commit wrote, for the next commit to carry.
+        if root.owed.bytes > 0 {
+            gone.push(root.owed);
+        }
+        if take {
+            let mut owed = if root.owed.bytes > 0 {
+                decode_runs(&self.reader.read_extent(root.owed)?)?
+            } else {
+                Vec::new()
+            };
+            owed.extend(w.runs_written().into_iter().map(|(start, pages)| Run {
+                start,
+                pages,
+                tag: 0,
+            }));
+            root.owed = match owed.is_empty() {
+                true => Extent::default(),
+                false => w.place(&encode_runs(&owed))?,
+            };
+            root.takes += 1;
+        } else {
+            root.owed = Extent::default();
+            root.takes = 0;
+            root.generation += 1;
+        }
         spent.sort_unstable();
         // The free map as it stands now: the runs left free, those still waiting, and the pages
         // this generation stops naming, tagged with it.
@@ -3695,7 +3740,7 @@ impl Snail {
             .chain(gone.iter().map(|e| Run {
                 start: e.start,
                 pages: e.pages().max(1),
-                tag: generation,
+                tag: turn,
             }))
             .collect();
         map.sort_by_key(|r| r.start);
@@ -3713,13 +3758,13 @@ impl Snail {
         };
         for (start, pages) in w.taken() {
             self.reused += pages;
-            root.reused.push((generation, start, pages));
+            root.reused.push((turn, start, pages));
         }
         while root.reused.len() > REUSED_KEPT {
             let (g, _, _) = root.reused.remove(0);
             root.reused_from = root.reused_from.max(g);
         }
-        root.generation = generation;
+        root.turn = turn;
         Ok(root)
     }
 

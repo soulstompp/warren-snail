@@ -302,12 +302,14 @@ fn a_sequences_advance_lands_ahead_of_the_transaction_that_marks_the_replica() {
     w.execute("BEGIN").unwrap();
     w.mark_replica(Some(SOURCE)).unwrap();
     w.execute("INSERT INTO s.q (v) VALUES (1)").unwrap();
-    // The advance landed at once, unmarked; rolled back, the mark never lands.
+    // The advance landed at once, unmarked, and no commit; rolled back, the mark never lands.
     let now = Snail::open(&path).unwrap();
-    assert_eq!((now.generation(), now.replica()), (g + 1, None));
+    assert_eq!((now.generation(), now.replica()), (g, None));
+    assert_eq!(now.sequences().unwrap(), [("s.ids".to_string(), 100, true)]);
     w.execute("ROLLBACK").unwrap();
     let now = Snail::open(&path).unwrap();
-    assert_eq!((now.generation(), now.replica()), (g + 1, None));
+    assert_eq!((now.generation(), now.replica()), (g, None));
+    assert_eq!(now.sequences().unwrap(), [("s.ids".to_string(), 100, true)]);
     // Marked, the applier's advances land as its writes do, and another writer's are refused.
     w.mark_replica(Some(SOURCE)).unwrap();
     w.execute("INSERT INTO s.q (v) VALUES (2)").unwrap();

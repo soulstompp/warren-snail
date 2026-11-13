@@ -32,7 +32,7 @@ pub fn at_one_moment(snails: &mut [Snail]) -> Result<Vec<u64>> {
         loop {
             let mut again = false;
             for s in snails.iter() {
-                again |= s.reader.peek_root()?.generation != s.root.generation;
+                again |= s.reader.peek_root()?.turn != s.root.turn;
             }
             if !again {
                 break;
@@ -65,7 +65,7 @@ pub fn at_one_moment(snails: &mut [Snail]) -> Result<Vec<u64>> {
                         &|k| shown(&refs, k),
                         (d, root),
                         i,
-                        roots[i].generation,
+                        roots[i].turn,
                     )?;
                     if found.is_some() {
                         break;

@@ -624,7 +624,7 @@ impl Snail {
         }
         let mut found: Option<HashSet<Vec<Datum>>> = None;
         'round: loop {
-            let base = self.root.generation;
+            let base = self.root.turn;
             let (batch, round) = self.answer_with(&plan.asked, order, params)?;
             let width = batch.num_columns() - plan.appended;
             let rows: Vec<Row> =
@@ -700,7 +700,7 @@ impl Snail {
             // A commit since the round's root: at READ COMMITTED the rows are found again on the
             // newest root; at REPEATABLE READ a row locked that another transaction changed since
             // is refused.
-            if self.reader.peek_root()?.generation != base {
+            if self.reader.peek_root()?.turn != base {
                 if !repeatable {
                     self.renew_for_question()?;
                     continue;

@@ -674,7 +674,7 @@ mod written {
             decided[0]
                 .roots
                 .iter()
-                .map(|r| (r.holds.as_str(), r.generation))
+                .map(|r| (r.holds.as_str(), r.turn))
                 .collect::<Vec<_>>(),
             [("weather.readings", g0[1] + 1)]
         );
@@ -784,7 +784,7 @@ mod written {
         assert_eq!(
             decided
                 .iter()
-                .flat_map(|d| d.roots.iter().map(|r| r.generation))
+                .flat_map(|d| d.roots.iter().map(|r| r.turn))
                 .collect::<Vec<_>>(),
             [readings_at + 1]
         );

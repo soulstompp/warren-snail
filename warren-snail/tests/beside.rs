@@ -1140,6 +1140,82 @@ fn transactions_taking_turns_keep_their_oids() {
 }
 
 #[test]
+fn two_writers_taking_oids_at_once_give_none_twice_and_each_text_is_one_generation() {
+    // Two writers on threads of one process, each a block of two tables filled, six times: the
+    // takes give no OID twice, every block is one generation, and each reads what the other
+    // committed.
+    let path = keeping("at-once-oids");
+    let g = Snail::open(&path).unwrap().generation();
+    let both = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let writers: Vec<_> = (0..2)
+        .map(|k| {
+            let (path, both) = (path.clone(), both.clone());
+            std::thread::spawn(move || {
+                let mut w = open(&path);
+                for i in 0..6 {
+                    run(&mut w, "BEGIN");
+                    run(&mut w, &format!("CREATE TABLE s.a{k}_{i} {MADE}"));
+                    run(&mut w, &format!("INSERT INTO s.a{k}_{i} VALUES ({i})"));
+                    run(&mut w, &format!("CREATE TABLE s.b{k}_{i} {MADE}"));
+                    run(&mut w, &format!("INSERT INTO s.b{k}_{i} VALUES ({i})"));
+                    run(&mut w, "COMMIT");
+                }
+                both.wait();
+                let other = 1 - k;
+                (
+                    count(&mut w, &format!("SELECT count(*) FROM s.b{other}_5")),
+                    count(
+                        &mut w,
+                        "SELECT count(*) FROM pg_tables WHERE schemaname = 's'",
+                    ),
+                )
+            })
+        })
+        .collect();
+    let seen: Vec<(i64, i64)> = writers.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(seen, [(1, 25), (1, 25)]);
+    let mut r = Snail::open(&path).unwrap();
+    assert_eq!(r.generation(), g + 12);
+    let oids = "SELECT count(DISTINCT c.oid) - count(*) FROM pg_class c \
+                JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 's'";
+    assert_eq!(count(&mut r, oids), 0);
+    let named = "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = 's'";
+    assert_eq!(count(&mut r, named), 50);
+    r.census().unwrap();
+}
+
+#[test]
+fn a_reader_opened_while_a_take_s_root_is_the_newest_reads_the_newest_commit() {
+    let path = keeping("take-newest");
+    let mut w = open(&path);
+    run(&mut w, &format!("CREATE TABLE s.done {MADE}"));
+    run(&mut w, "INSERT INTO s.done VALUES (1)");
+    let g = w.generation();
+    // A block's table takes its OIDs at the root's turn, a root newer than the last commit's.
+    run(&mut w, "BEGIN");
+    run(&mut w, &format!("CREATE TABLE s.open {MADE}"));
+    let taken = warren_snail::file::Reader::open(&path).unwrap().root().unwrap();
+    assert_eq!((taken.generation, taken.takes), (g, 1));
+    let mut r = Snail::open(&path).unwrap();
+    assert_eq!(r.generation(), g);
+    assert_eq!(count(&mut r, "SELECT count(*) FROM s.done"), 1);
+    assert_eq!(
+        count(&mut r, "SELECT count(*) FROM pg_class WHERE relname = 'open'"),
+        0
+    );
+    r.census().unwrap();
+    run(&mut w, "INSERT INTO s.open VALUES (1)");
+    run(&mut w, "COMMIT");
+    let mut r = Snail::open(&path).unwrap();
+    assert_eq!(
+        (r.generation(), count(&mut r, "SELECT count(*) FROM s.open")),
+        (g + 1, 1)
+    );
+    r.census().unwrap();
+}
+
+#[test]
 fn a_table_declared_in_the_transaction_takes_its_rows_at_its_commit() {
     let path = made("declared-here");
     let (mut a, mut b) = (open(&path), open(&path));

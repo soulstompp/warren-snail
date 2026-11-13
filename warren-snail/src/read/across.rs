@@ -516,8 +516,8 @@ impl Snails {
                 return Ok(false);
             };
             let root = &self.snails[i].reader.peek_root()?;
-            let written = root.generation > w.generation
-                || (root.generation == w.generation && root.crc()? == w.crc);
+            let written = root.turn > w.turn
+                || (root.turn == w.turn && root.crc()? == w.crc);
             if !written {
                 return Ok(false);
             }
@@ -562,7 +562,7 @@ impl Snails {
             }
             let mut again = false;
             for s in &self.snails {
-                again |= s.reader.peek_root()?.generation != s.root.generation;
+                again |= s.reader.peek_root()?.turn != s.root.turn;
             }
             if !again {
                 break;
@@ -572,7 +572,7 @@ impl Snails {
             let roots: Vec<Root> = self.snails.iter().map(|s| s.root.clone()).collect();
             let refs: Vec<&Root> = roots.iter().collect();
             for (i, root) in roots.iter().enumerate() {
-                if let Some(owed) = self.owed(&refs, i, root.generation)? {
+                if let Some(owed) = self.owed(&refs, i, root.turn)? {
                     self.snails[i].adopt(owed)?;
                 }
             }
@@ -601,7 +601,7 @@ impl Snails {
                 d != i
                     && x.decided.iter().any(|dec| {
                         dec.roots.iter().any(|w| {
-                            w.generation == r.generation + 1 && self.holder(&w.holds) == Some(i)
+                            w.turn == r.turn + 1 && self.holder(&w.holds) == Some(i)
                         })
                     })
             });
@@ -640,7 +640,7 @@ impl Snails {
         let refs: Vec<&Root> = newest.iter().collect();
         let mut owed = Vec::with_capacity(self.snails.len());
         for (i, r) in newest.iter().enumerate() {
-            owed.push(self.owed(&refs, i, r.generation)?);
+            owed.push(self.owed(&refs, i, r.turn)?);
         }
         for (i, (owed, copy)) in owed.into_iter().zip(copies).enumerate() {
             // A pending copy whose deciding root is among these, and carries no root for it.
@@ -1543,7 +1543,7 @@ impl Snails {
                 .zip(&bytes)
                 .map(|((r, holds), b)| Written {
                     holds: holds.clone(),
-                    generation: r.generation,
+                    turn: r.turn,
                     crc: u32::from_le_bytes(b[b.len() - 4..].try_into().unwrap()),
                 })
                 .collect(),
@@ -1552,7 +1552,7 @@ impl Snails {
         let w = writers[d].as_mut().unwrap();
         let mut root = self.snails[d].commit_pages(w, &landed)?;
         let parent = self.snails[d].reader.root_copy();
-        let at = root.generation;
+        let at = root.turn;
         let decision = w.prepare(&mut root)?;
         // Each other snail's root, first as a pending copy beside its root.
         for (k, &i) in written[1..].iter().enumerate() {
@@ -1635,13 +1635,13 @@ pub(super) fn carried_root(
     let (decider, decided) = decided;
     for d in &decided.decided {
         for (k, w) in d.roots.iter().enumerate() {
-            if w.generation != at + 1 || holds(&w.holds) != Some(holder) {
+            if w.turn != at + 1 || holds(&w.holds) != Some(holder) {
                 continue;
             }
             let bytes = decode_carried(&snails[decider].reader.read_extent(d.carried)?)?;
             let mut page = bytes.get(k).cloned().unwrap_or_default();
             page.resize(PAGE, 0);
-            let root = Root::decode(&page).filter(|r| r.generation == w.generation);
+            let root = Root::decode(&page).filter(|r| r.turn == w.turn);
             return match root {
                 Some(r) if r.crc()? == w.crc => Ok(Some(r)),
                 _ => Err(Error::new(format!(

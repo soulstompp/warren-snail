@@ -1148,6 +1148,7 @@ fn write_tables(
 ) -> Result<Vec<Written>> {
     let mut root = Root {
         generation: 1,
+        turn: 1,
         release: catalog.release,
         monetary: crate::file::monetary_of(catalog, carried.map_or(&[], |c| &c.monetary)),
         text_search: catalog.text_search.name().to_string(),

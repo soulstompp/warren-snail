@@ -827,7 +827,7 @@ pub struct Scan {
     next: usize,
     whole: bool,
     done: bool,
-    generation: u64,
+    turn: u64,
     counted: (u64, [u64; 12]),
     round: Round,
 }
@@ -1064,7 +1064,7 @@ impl Snail {
     /// Whether the catalog must be read again for `root`: at every generation where the root holds
     /// its tables, and where it cut them, only once a commit wrote the catalog afresh.
     pub(super) fn catalog_moved(&self, root: &Root) -> bool {
-        root.generation != self.root.generation
+        root.turn != self.root.turn
             && (root.cut.is_none() || root.catalog_named() != self.root.catalog_named())
     }
 
@@ -1472,7 +1472,7 @@ impl Snail {
             next: 0,
             whole,
             done: false,
-            generation: self.root.generation,
+            turn: self.root.turn,
             counted,
             round,
         })
@@ -1514,7 +1514,7 @@ impl Snail {
         if scan.done {
             return Ok(None);
         }
-        if scan.generation != self.root.generation {
+        if scan.turn != self.root.turn {
             return Err(Error::new("a scan goes on only on the root it began on"));
         }
         let table = &self.catalog.tables[scan.q.sides[0].table];
@@ -2374,6 +2374,10 @@ impl Snail {
         // The record of the statements whose OIDs depart from the catalog's text's order.
         if self.root.oids.bytes > 0 {
             mark(self.root.oids, 1)?;
+        }
+        // The runs of pages the takes since the last commit wrote.
+        if self.root.owed.bytes > 0 {
+            mark(self.root.owed, 1)?;
         }
         // The roots each decision across snails carries.
         for d in &self.root.decided {
