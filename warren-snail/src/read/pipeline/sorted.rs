@@ -136,27 +136,26 @@ pub(super) fn sort_key(
     sorted: &[usize],
     under: &[Option<Casing>],
 ) -> Result<Vec<Value>> {
-    sorted
-        .iter()
-        .enumerate()
-        .map(|(i, &at)| {
-            let v = row[at].clone();
-            match v {
-                Value::Scalar(ty, _) | Value::Composed(ty, _) | Value::Typed(ty, _)
-                    if !ty.ordered() && !super::anonymous_record(ty) =>
-                {
-                    Err(super::unordered(&ty.pg_name()))
-                }
-                Value::Geometric(g) => Err(super::unordered(g.kind().name())),
-                v => Ok(match (under[i], v.string_key()) {
-                    (Some(Casing::Library(id)), Some(s)) => {
-                        Value::Bytes(crate::collations::get(id).key(s))
-                    }
-                    _ => v,
-                }),
+    // As many values as it sorts by, and no room for more: each row held keeps its key.
+    let mut key = Vec::with_capacity(sorted.len());
+    for (i, &at) in sorted.iter().enumerate() {
+        let v = row[at].clone();
+        key.push(match v {
+            Value::Scalar(ty, _) | Value::Composed(ty, _) | Value::Typed(ty, _)
+                if !ty.ordered() && !super::anonymous_record(ty) =>
+            {
+                return Err(super::unordered(&ty.pg_name()))
             }
-        })
-        .collect()
+            Value::Geometric(g) => return Err(super::unordered(g.kind().name())),
+            v => match (under[i], v.string_key()) {
+                (Some(Casing::Library(id)), Some(s)) => {
+                    Value::Bytes(crate::collations::get(id).key(s))
+                }
+                _ => v,
+            },
+        });
+    }
+    Ok(key)
 }
 
 /// What a step's ORDER BY reads a row by: its places and the collations they are sorted under.

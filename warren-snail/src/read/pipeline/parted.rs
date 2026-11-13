@@ -332,6 +332,7 @@ impl Parted {
                 continue;
             }
             let _index = crate::room::holding(held.len() as u64 * 4);
+            let free = self.room.as_ref().map_or(u64::MAX, |r| r.free_bytes());
             let mut parts: Vec<(Vec<u32>, u64)> = Vec::new();
             let mut of_hash: std::collections::HashMap<u64, usize> = Default::default();
             for i in 0..held.len() {
