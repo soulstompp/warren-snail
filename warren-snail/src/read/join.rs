@@ -12,7 +12,8 @@
 //! WHERE reads on a table an outer join may leave NULL.
 
 use super::answer::{as_text, Answer, Cell, Dict};
-use super::hash::WordMap;
+use super::hash::{WordHasher, WordMap};
+use super::held::{At, Cells, Slots};
 use super::question::{Cmp, Key, Meet, Piece, Question, Test};
 use super::walk::{KeySet, Sink, Want};
 use super::{Round, Snail};
@@ -43,30 +44,41 @@ fn part_of(c: &Cell, ty: ColumnType) -> Option<Part> {
     })
 }
 
-/// A cell of a column of type `from` as a level of column `to` keys it; none where no value of the
-/// level is it.
-fn level_value(c: &Cell, from: ColumnType, to: &Column) -> Option<KeyValue> {
-    Some(match part_of(c, from)? {
+/// The same, of a value held.
+fn part_at(c: At, ty: ColumnType) -> Option<Part> {
+    match c {
+        At::Null => None,
+        At::Int(v) => Some(Part::Num(i128::from(v))),
+        At::Wide(v) => Some(Part::Num(v)),
+        At::Text(t) => Some(Part::Bytes(crate::strings::key_bytes(ty, t).into())),
+        At::Cell(c) => part_of(c, ty),
+    }
+}
+
+/// A value held of a column of type `from` as a level of column `to` keys it; none where no value
+/// of the level is it.
+fn level_value(c: At, from: ColumnType, to: &Column) -> Option<KeyValue> {
+    Some(match part_at(c, from)? {
         Part::Num(v) if to.ty.is_wide() => KeyValue::Wide(v),
         Part::Num(v) => KeyValue::Int(i64::try_from(v).ok()?),
-        Part::Bytes(_) if matches!(c, Cell::Composed(_)) => match c {
-            Cell::Composed(x) => KeyValue::Text(x.hex.clone()),
+        Part::Bytes(_) if matches!(c, At::Cell(Cell::Composed(_))) => match c {
+            At::Cell(Cell::Composed(x)) => KeyValue::Text(x.hex.clone()),
             _ => unreachable!(),
         },
         Part::Bytes(b) => crate::places::column_byte_key(to, &b),
     })
 }
 
-/// Whether a cell of a column of type `ty` passes a condition on that column.
-fn passes(p: &Piece, c: &Cell, ty: ColumnType) -> bool {
+/// Whether a value held of a column of type `ty` passes a condition on that column.
+fn passes(p: &Piece, c: At, ty: ColumnType) -> bool {
     match p {
         Piece::Empty => false,
-        Piece::Null(_, null) => matches!(c, Cell::Null) == *null,
-        Piece::Cond(cond) => cond.holds(match part_of(c, ty) {
+        Piece::Null(_, null) => matches!(c, At::Null) == *null,
+        Piece::Cond(cond) => cond.holds(match part_at(c, ty) {
             Some(Part::Num(v)) => Some(v),
             _ => None,
         }),
-        Piece::Text(t) => match part_of(c, ty) {
+        Piece::Text(t) => match part_at(c, ty) {
             Some(Part::Bytes(b)) => t.holds(&b),
             _ => false,
         },
@@ -74,10 +86,10 @@ fn passes(p: &Piece, c: &Cell, ty: ColumnType) -> bool {
     }
 }
 
-/// Whether two cells pass a comparison: neither NULL, and their keys compared so.
-fn compares(op: Cmp, a: &Cell, ta: ColumnType, b: &Cell, tb: ColumnType) -> bool {
-    match (part_of(a, ta), part_of(b, tb)) {
-        (Some(x), Some(y)) => op.holds(x.cmp(&y)),
+/// Whether two values pass a comparison: neither NULL, and their keys compared so.
+fn compares(op: Cmp, a: &Option<Part>, b: &Option<Part>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => op.holds(x.cmp(y)),
         _ => false,
     }
 }
@@ -85,12 +97,23 @@ fn compares(op: Cmp, a: &Cell, ta: ColumnType, b: &Cell, tb: ColumnType) -> bool
 /// No row: a table an outer join leaves NULL.
 const NONE: u32 = u32::MAX;
 
-/// One table's rows as the round read them: the cells of the columns the join reads of it, text as
-/// text, and how many rows of the table each stands for.
+/// One table's rows as the round read them: the cells of the columns the join reads of it held
+/// column-wise, text as text, and how many rows of the table each stands for.
 #[derive(Default)]
 struct Held {
-    cells: Vec<Vec<Cell>>,
+    cells: Cells,
     weights: Vec<u64>,
+}
+
+impl Held {
+    fn len(&self) -> usize {
+        self.weights.len()
+    }
+
+    /// The bytes its rows are held at: their cells, and each row's weight.
+    fn bytes(&self) -> u64 {
+        self.cells.bytes() + (self.weights.capacity() * std::mem::size_of::<u64>()) as u64
+    }
 }
 
 /// The keys of a table read before that a table is kept to: where its columns lie among those this
@@ -106,11 +129,12 @@ struct Filter {
 /// equal ones, counted.
 struct Gather<'a> {
     held: &'a mut Held,
-    index: Option<WordMap<Vec<Cell>, usize>>,
+    index: Option<Slots>,
     filters: &'a [Filter],
     lead: usize,
     dicts: Vec<Dict>,
     probe: Vec<Part>,
+    row: Vec<Cell>,
 }
 
 impl Gather<'_> {
@@ -145,25 +169,35 @@ impl Sink for Gather<'_> {
     }
 
     fn row(&mut self, cells: &[Cell]) {
-        let row: Vec<Cell> = cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| self.text(i, c))
-            .collect();
-        match &mut self.index {
-            Some(index) => match index.get(&row) {
-                Some(&i) => self.held.weights[i] += 1,
-                None => {
-                    index.insert(row.clone(), self.held.cells.len());
-                    self.held.cells.push(row);
-                    self.held.weights.push(1);
+        let Gather {
+            held,
+            index,
+            dicts,
+            row,
+            ..
+        } = self;
+        if let Some(index) = index {
+            row.clear();
+            row.extend(
+                cells
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| as_text(c, dicts.get(i).unwrap_or(&None))),
+            );
+            let hash = std::hash::BuildHasher::hash_one(
+                &std::hash::BuildHasherDefault::<WordHasher>::default(),
+                &row[..],
+            );
+            match index.find(hash, |r| held.cells.same(r as usize, row)) {
+                Some(r) => {
+                    held.weights[r as usize] += 1;
+                    return;
                 }
-            },
-            None => {
-                self.held.cells.push(row);
-                self.held.weights.push(1);
+                None => index.insert(hash, held.len() as u32),
             }
         }
+        held.cells.push(cells, dicts);
+        held.weights.push(1);
     }
 }
 
@@ -198,8 +232,6 @@ struct Tables<'a> {
     held: Vec<Held>,
 }
 
-static NULL: Cell = Cell::Null;
-
 impl Tables<'_> {
     fn at(&self, side: usize, column: usize, month: bool) -> usize {
         self.columns[side]
@@ -212,41 +244,60 @@ impl Tables<'_> {
         self.tables[side].column_at(column).ty
     }
 
-    /// The cell of a column of a table in a row met, NULL where the table stands NULL.
-    fn cell(&self, row: &[u32], side: usize, column: usize, month: bool) -> &Cell {
+    /// The value of a column of a table in a row met, NULL where the table stands NULL.
+    fn value(&self, row: &[u32], side: usize, column: usize, month: bool) -> At<'_> {
         match row[side] {
-            NONE => &NULL,
-            r => &self.held[side].cells[r as usize][self.at(side, column, month)],
+            NONE => At::Null,
+            r => self.held[side]
+                .cells
+                .at(r as usize, self.at(side, column, month)),
         }
+    }
+
+    /// The same, as a cell.
+    fn cell(&self, row: &[u32], side: usize, column: usize, month: bool) -> Cell {
+        match row[side] {
+            NONE => Cell::Null,
+            r => self.held[side]
+                .cells
+                .cell(r as usize, self.at(side, column, month)),
+        }
+    }
+
+    /// The key a column of a table in a row met meets another by.
+    fn part(&self, row: &[u32], c: &super::question::Col) -> Option<Part> {
+        part_at(
+            self.value(row, c.side, c.column, false),
+            self.ty(c.side, c.column),
+        )
     }
 
     fn test(&self, t: &Test, row: &[u32]) -> bool {
         match t {
             Test::One(s, p) => match p.column() {
-                Some((c, month)) => passes(p, self.cell(row, *s, c, month), self.ty(*s, c)),
-                None => passes(p, &NULL, ColumnType::Int8),
+                Some((c, month)) => passes(p, self.value(row, *s, c, month), self.ty(*s, c)),
+                None => passes(p, At::Null, ColumnType::Int8),
             },
             Test::Two(m) => self.meets(m, row),
         }
     }
 
     fn meets(&self, m: &Meet, row: &[u32]) -> bool {
-        compares(
-            m.op,
-            self.cell(row, m.a.side, m.a.column, false),
-            self.ty(m.a.side, m.a.column),
-            self.cell(row, m.b.side, m.b.column, false),
-            self.ty(m.b.side, m.b.column),
-        )
+        compares(m.op, &self.part(row, &m.a), &self.part(row, &m.b))
     }
 
     /// The values a row met holds on these columns, none where one of them is NULL.
     fn key(&self, row: &[u32], cols: &[super::question::Col]) -> Option<Vec<Part>> {
+        cols.iter().map(|c| self.part(row, c)).collect()
+    }
+
+    /// The values row `r` of table `side` holds on these of its columns, none where one is NULL.
+    fn key_of(&self, side: usize, r: usize, cols: &[usize]) -> Option<Vec<Part>> {
         cols.iter()
-            .map(|c| {
-                part_of(
-                    self.cell(row, c.side, c.column, false),
-                    self.ty(c.side, c.column),
+            .map(|&c| {
+                part_at(
+                    self.held[side].cells.at(r, self.at(side, c, false)),
+                    self.ty(side, c),
                 )
             })
             .collect()
@@ -255,14 +306,8 @@ impl Tables<'_> {
     /// Table `side`'s rows by their values on these of its columns.
     fn by_key(&self, side: usize, cols: &[usize]) -> WordMap<Vec<Part>, Vec<u32>> {
         let mut map: WordMap<Vec<Part>, Vec<u32>> = WordMap::default();
-        let at: Vec<usize> = cols.iter().map(|&c| self.at(side, c, false)).collect();
-        for (r, cells) in self.held[side].cells.iter().enumerate() {
-            let key: Option<Vec<Part>> = cols
-                .iter()
-                .zip(&at)
-                .map(|(&c, &a)| part_of(&cells[a], self.ty(side, c)))
-                .collect();
-            if let Some(k) = key {
+        for r in 0..self.held[side].len() {
+            if let Some(k) = self.key_of(side, r, cols) {
                 map.entry(k).or_default().push(r as u32);
             }
         }
@@ -281,7 +326,7 @@ impl Tables<'_> {
             .collect();
         let map = self.by_key(side, &eq.iter().map(|m| m.a.column).collect::<Vec<_>>());
         let from: Vec<super::question::Col> = eq.iter().map(|m| m.b).collect();
-        let every: Vec<u32> = (0..self.held[side].cells.len() as u32).collect();
+        let every: Vec<u32> = (0..self.held[side].len() as u32).collect();
         let mut out = Joined {
             width: j.width,
             rows: Vec::new(),
@@ -462,12 +507,12 @@ pub(super) fn ask_join_within(
             lead,
         } = reading(q, &order, i, table, streamed, &needed[side]);
         let keys = by.first().zip(kept_by.as_ref()).map(|((s, _), meets)| {
-            let values = t.held[*s].cells.iter().filter_map(|cells| {
+            let values = (0..t.held[*s].len()).filter_map(|r| {
                 meets
                     .iter()
                     .map(|m| {
                         level_value(
-                            &cells[t.at(*s, m.b.column, false)],
+                            t.held[*s].cells.at(r, t.at(*s, m.b.column, false)),
                             t.ty(*s, m.b.column),
                             &table.columns[m.a.column],
                         )
@@ -560,35 +605,29 @@ pub(super) fn ask_join_within(
                         })
                         .collect(),
                     types: meets.iter().map(|m| table.columns[m.a.column].ty).collect(),
-                    keys: t.held[*s]
-                        .cells
-                        .iter()
-                        .filter_map(|cells| {
-                            meets
-                                .iter()
-                                .map(|m| {
-                                    part_of(
-                                        &cells[t.at(*s, m.b.column, false)],
-                                        t.ty(*s, m.b.column),
-                                    )
-                                })
-                                .collect::<Option<Vec<Part>>>()
-                        })
-                        .map(|k| (k, ()))
-                        .collect(),
+                    keys: {
+                        let from: Vec<usize> = meets.iter().map(|m| m.b.column).collect();
+                        (0..t.held[*s].len())
+                            .filter_map(|r| t.key_of(*s, r, &from))
+                            .map(|k| (k, ()))
+                            .collect()
+                    },
                 })
                 .collect();
             let mut held = Held::default();
             let mut sink = Gather {
                 held: &mut held,
-                index: (!answers[side]).then(WordMap::default),
+                index: (!answers[side]).then(Slots::default),
                 filters: &filters,
                 lead: if filters.is_empty() { 0 } else { lead },
                 dicts: Vec::new(),
                 probe: Vec::new(),
+                row: Vec::new(),
             };
             snail.read_plan(&part.plan, &want, &columns, &mut sink)?;
-            sides_held.more(held.cells.len() as u64 * width);
+            let _index = crate::room::holding(sink.index.as_ref().map_or(0, Slots::bytes));
+            held.cells.shut();
+            sides_held.more(held.bytes());
             t.held[side] = held;
         }
         snail.reader.read_done();
@@ -635,7 +674,7 @@ pub(super) fn ask_join_within(
             let o = &q.outer[0];
             let start = Joined {
                 width: n,
-                rows: (0..t.held[0].cells.len() as u32)
+                rows: (0..t.held[0].len() as u32)
                     .flat_map(|r| {
                         let mut row = vec![NONE; n];
                         row[0] = r;
@@ -667,9 +706,7 @@ pub(super) fn ask_join_within(
             }
             for (cell, k) in cells.iter_mut().zip(&inputs) {
                 let c = k.col();
-                *cell = t
-                    .cell(row, c.side, c.column, matches!(k, Key::Month(_)))
-                    .clone();
+                *cell = t.cell(row, c.side, c.column, matches!(k, Key::Month(_)));
             }
             answer.add_times(&cells, joined.weights[i]);
             if i % 1024 == 1023 {
@@ -748,7 +785,7 @@ fn meet_core(q: &Question, t: &Tables, sides: &[usize]) -> Joined {
 fn full_join(t: &Tables, j: Joined, side: usize, meets: &[Meet], tests: &[Test]) -> Joined {
     let map = t.by_key(side, &meets.iter().map(|m| m.a.column).collect::<Vec<_>>());
     let from: Vec<super::question::Col> = meets.iter().map(|m| m.b).collect();
-    let mut matched = vec![false; t.held[side].cells.len()];
+    let mut matched = vec![false; t.held[side].len()];
     let mut out = Joined {
         width: j.width,
         rows: Vec::new(),
@@ -927,27 +964,26 @@ impl Sink for Probe<'_> {
         let Some(found) = self.rows.get(self.probe.as_slice()) else {
             return;
         };
-        let compared: Vec<Cell> = self
+        let compared: Vec<Option<Part>> = self
             .tests
             .iter()
             .map(|m| {
-                self.text(
-                    t.at(side, m.a.column, false),
-                    &row[t.at(side, m.a.column, false)],
+                part_of(
+                    &self.text(
+                        t.at(side, m.a.column, false),
+                        &row[t.at(side, m.a.column, false)],
+                    ),
+                    t.ty(side, m.a.column),
                 )
             })
             .collect();
         for &i in found {
             let met = self.joined.row(i as usize);
-            let passes = self.tests.iter().zip(&compared).all(|(m, a)| {
-                compares(
-                    m.op,
-                    a,
-                    t.ty(side, m.a.column),
-                    t.cell(met, m.b.side, m.b.column, false),
-                    t.ty(m.b.side, m.b.column),
-                )
-            });
+            let passes = self
+                .tests
+                .iter()
+                .zip(&compared)
+                .all(|(m, a)| compares(m.op, a, &t.part(met, &m.b)));
             if !passes {
                 continue;
             }
@@ -957,7 +993,6 @@ impl Sink for Probe<'_> {
                     row[mine(k)].clone()
                 } else {
                     t.cell(met, c.side, c.column, matches!(k, Key::Month(_)))
-                        .clone()
                 };
             }
             self.answer
