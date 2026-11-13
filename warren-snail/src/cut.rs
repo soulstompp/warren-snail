@@ -117,35 +117,46 @@ impl Widths {
 /// run of them that fills a page is a block of its own. A run that fills none joins the block before
 /// it in the place, or the block after it where it comes first, unless that would pass a row group.
 pub fn cut(keys: &Keys, sublevels: &Sublevels, widths: &Widths) -> Vec<Block> {
+    cut_within(keys, sublevels, widths, ROW_GROUP_ROWS)
+}
+
+/// The cut `cut` makes, a row group `group` rows.
+pub(crate) fn cut_within(
+    keys: &Keys,
+    sublevels: &Sublevels,
+    widths: &Widths,
+    group: usize,
+) -> Vec<Block> {
     let mut out = Vec::new();
     if keys.is_empty() {
         return out;
     }
     let mut place = Vec::new();
-    go(
+    let c = Cutting {
         keys,
         sublevels,
         widths,
-        0,
-        keys.len(),
-        0,
-        &mut place,
-        &mut out,
-    );
+        group,
+    };
+    go(&c, 0, keys.len(), 0, &mut place, &mut out);
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-fn go(
-    keys: &Keys,
-    sublevels: &Sublevels,
-    widths: &Widths,
-    start: usize,
-    end: usize,
-    r: usize,
-    place: &mut Vec<i64>,
-    out: &mut Vec<Block>,
-) {
+/// What a cut reads: the rows' keys, the sublevels, each leaf's widths, and a row group's rows.
+struct Cutting<'a> {
+    keys: &'a Keys,
+    sublevels: &'a Sublevels,
+    widths: &'a Widths,
+    group: usize,
+}
+
+fn go(c: &Cutting, start: usize, end: usize, r: usize, place: &mut Vec<i64>, out: &mut Vec<Block>) {
+    let Cutting {
+        keys,
+        sublevels,
+        widths,
+        ..
+    } = *c;
     // Rows that all lie on one part that fills are that part: the place goes on down unsplit, a
     // single row's to its end at once.
     let (held, mut r) = (place.len(), r);
@@ -161,21 +172,24 @@ fn go(
         place.push(v);
         r += 1;
     }
-    split(keys, sublevels, widths, start, end, r, place, out);
+    split(c, start, end, r, place, out);
     place.truncate(held);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn split(
-    keys: &Keys,
-    sublevels: &Sublevels,
-    widths: &Widths,
+    c: &Cutting,
     start: usize,
     end: usize,
     r: usize,
     place: &mut Vec<i64>,
     out: &mut Vec<Block>,
 ) {
+    let Cutting {
+        keys,
+        sublevels,
+        widths,
+        group,
+    } = *c;
     if r == sublevels.len() {
         out.push(Block {
             place: place.clone(),
@@ -196,7 +210,7 @@ fn split(
         i = j;
     }
     let splits = parts.iter().any(|&(_, a, b)| widths.fill(a, b));
-    if !splits && end - start <= ROW_GROUP_ROWS {
+    if !splits && end - start <= group {
         out.push(Block {
             place: place.clone(),
             start,
@@ -210,16 +224,16 @@ fn split(
     for (v, a, b) in parts {
         if widths.fill(a, b) {
             if let Some(t) = thin.take() {
-                if !join_before(out, first, place, t, a) {
+                if !join_before(out, first, place, t, a, group) {
                     after = Some(t);
                 }
             }
             let at = out.len();
             place.push(v);
-            go(keys, sublevels, widths, a, b, r + 1, place, out);
+            go(c, a, b, r + 1, place, out);
             place.pop();
             if let Some(t) = after.take() {
-                if out[at].rows() + (a - t) <= ROW_GROUP_ROWS {
+                if out[at].rows() + (a - t) <= group {
                     out[at].start = t;
                     out[at].place = place.clone();
                 } else {
@@ -246,7 +260,7 @@ fn split(
         }
     }
     if let Some(t) = thin {
-        if !join_before(out, first, place, t, end) {
+        if !join_before(out, first, place, t, end, group) {
             out.push(Block {
                 place: place.clone(),
                 start: t,
@@ -258,9 +272,16 @@ fn split(
 
 /// Joins the thin rows `t..a` to the block before them, where one lies in the place starting at
 /// block `first` and stays within a row group.
-fn join_before(out: &mut [Block], first: usize, place: &[i64], t: usize, a: usize) -> bool {
+fn join_before(
+    out: &mut [Block],
+    first: usize,
+    place: &[i64],
+    t: usize,
+    a: usize,
+    group: usize,
+) -> bool {
     match out[first..].last_mut() {
-        Some(last) if last.rows() + (a - t) <= ROW_GROUP_ROWS => {
+        Some(last) if last.rows() + (a - t) <= group => {
             last.end = a;
             last.place = place.to_vec();
             true

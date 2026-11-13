@@ -13,16 +13,22 @@ use crate::file::{
     encode_free, Extent, Place, Root, Run, Writer, FILE_PAGES, FORMAT_EIGHT, FORMAT_SEVEN,
 };
 use crate::places::{level_key, month_of, null_key, KeyValue, Keys, Sublevels};
+use crate::room::ROUND_BYTES;
 use crate::values::Values;
 use crate::{Error, Result};
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
-    StringViewArray, TimestampMicrosecondArray,
+    Int32Array, Int64Array, LargeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
+use given::{Checks, Given};
 use parquet::data_type::ByteArray;
+use std::collections::BTreeSet;
 use std::path::Path;
+
+mod closing;
+mod given;
+mod sorting;
 
 /// A table's rows, column by column in the table's column order.
 pub struct Rows {
@@ -43,7 +49,11 @@ impl Rows {
         let mut columns = Vec::with_capacity(table.columns.len());
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         for c in table.own_columns() {
-            let mut out = Values::new(c.ty);
+            // Text is held as the file's bytes.
+            let mut out = match Values::new(c.ty) {
+                Values::Text(_) => Values::Utf8(Vec::new()),
+                v => v,
+            };
             // A virtual column is computed at the read: no order holds it, and its rows give it
             // no value.
             if c.is_virtual() {
@@ -234,34 +244,32 @@ impl Rows {
                             .unwrap();
                         out.extend(a.iter());
                     }
-                    (Values::Text(out), ty, dt)
+                    (Values::Utf8(out), ty, dt)
                         if matches!(ty, ColumnType::Bpchar(_) | ColumnType::Name)
                             && matches!(
                                 dt,
                                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
                             ) =>
                     {
-                        let a = arrow::compute::cast(a, &DataType::Utf8)?;
-                        let a = a.as_any().downcast_ref::<StringArray>().unwrap();
-                        out.extend(a.iter().map(|v| v.map(str::to_string)));
+                        out.extend(shared_text(a.as_ref())?);
                     }
                     // A value of a type held as its text, read as its input reads it; a node tree
                     // as it is.
                     (
-                        Values::Text(out),
+                        Values::Utf8(out),
                         ty @ (ColumnType::Textual(_) | ColumnType::Internal(_)),
                         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
-                    ) => {
+                    ) if !matches!(ty, ColumnType::Internal(t) if t.is_bytes()) => {
                         let a = arrow::compute::cast(a, &DataType::Utf8)?;
                         let a = a.as_any().downcast_ref::<StringArray>().unwrap();
                         for v in a.iter() {
                             out.push(match (v, ty) {
                                 (None, _) => None,
-                                (Some(s), ColumnType::Textual(t)) => {
-                                    Some(crate::textual::text_in(t, s)?)
-                                }
+                                (Some(s), ColumnType::Textual(t)) => Some(ByteArray::from(
+                                    crate::textual::text_in(t, s)?.into_bytes(),
+                                )),
                                 (Some(s), ColumnType::Internal(t)) if t.copied() => {
-                                    Some(s.to_string())
+                                    Some(ByteArray::from(s))
                                 }
                                 (Some(_), ColumnType::Internal(t)) => return Err(t.refusal()),
                                 _ => unreachable!("a type held as its text"),
@@ -270,7 +278,7 @@ impl Rows {
                     }
                     // An aclitem, its three fields made into the text the snail holds.
                     (
-                        Values::Text(out),
+                        Values::Utf8(out),
                         ColumnType::Textual(crate::textual::Textual::Aclitem),
                         DataType::Struct(_),
                     ) => {
@@ -278,7 +286,11 @@ impl Rows {
                             out.push(if a.is_null(r) {
                                 None
                             } else {
-                                Some(crate::strings::aclitem_at(a.as_ref(), r).ok_or_else(wrong)?)
+                                Some(ByteArray::from(
+                                    crate::strings::aclitem_at(a.as_ref(), r)
+                                        .ok_or_else(wrong)?
+                                        .into_bytes(),
+                                ))
                             });
                         }
                     }
@@ -313,7 +325,7 @@ impl Rows {
                         Values::Utf8(out),
                         ColumnType::Internal(t),
                         DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
-                    ) => {
+                    ) if t.is_bytes() => {
                         let a = arrow::compute::cast(a, &DataType::Binary)?;
                         let a = a.as_any().downcast_ref::<BinaryArray>().unwrap();
                         for v in a.iter() {
@@ -331,17 +343,12 @@ impl Rows {
                             crate::strings::bits_key_at(ty, a.as_ref(), r).map(ByteArray::from)
                         }));
                     }
-                    (Values::Text(out), ColumnType::Text(_), DataType::Utf8) => {
-                        let a = a.as_any().downcast_ref::<StringArray>().unwrap();
-                        out.extend(a.iter().map(|v| v.map(str::to_string)));
-                    }
-                    (Values::Text(out), ColumnType::Text(_), DataType::LargeUtf8) => {
-                        let a = a.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                        out.extend(a.iter().map(|v| v.map(str::to_string)));
-                    }
-                    (Values::Text(out), ColumnType::Text(_), DataType::Utf8View) => {
-                        let a = a.as_any().downcast_ref::<StringViewArray>().unwrap();
-                        out.extend(a.iter().map(|v| v.map(str::to_string)));
+                    (
+                        Values::Utf8(out),
+                        ColumnType::Text(_),
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+                    ) => {
+                        out.extend(shared_text(a.as_ref())?);
                     }
                     (Values::Utf8(out), ColumnType::Bytes, DataType::Binary) => {
                         let a = a.as_any().downcast_ref::<BinaryArray>().unwrap();
@@ -392,7 +399,7 @@ impl Rows {
                     }
                     // A numeric held as its text, each value read as numeric_in reads it and held
                     // to the column's typmod.
-                    (Values::Text(out), ColumnType::NumericText(_), DataType::Utf8) => {
+                    (Values::Utf8(out), ColumnType::NumericText(_), DataType::Utf8) => {
                         let a = a.as_any().downcast_ref::<StringArray>().unwrap();
                         for v in a.iter() {
                             out.push(match v {
@@ -402,7 +409,9 @@ impl Rows {
                                         crate::numeric::Numeric::parse(s)?,
                                         c.ty,
                                     )? {
-                                        crate::read::statement::Datum::Text(t) => Some(t),
+                                        crate::read::statement::Datum::Text(t) => {
+                                            Some(ByteArray::from(t.into_bytes()))
+                                        }
                                         _ => unreachable!("a numeric held as its text"),
                                     }
                                 }
@@ -416,6 +425,24 @@ impl Rows {
         }
         Ok(Rows { columns })
     }
+}
+
+/// A text array's values, each sharing one copy of the array's bytes.
+fn shared_text(a: &dyn Array) -> Result<Vec<Option<ByteArray>>> {
+    let a = arrow::compute::cast(a, &DataType::Utf8)?;
+    let a = a.as_any().downcast_ref::<StringArray>().unwrap();
+    let offsets = a.value_offsets();
+    let (from, to) = (offsets[0] as usize, offsets[a.len()] as usize);
+    let held = bytes::Bytes::copy_from_slice(&a.value_data()[from..to]);
+    Ok((0..a.len())
+        .map(|i| {
+            (!a.is_null(i)).then(|| {
+                ByteArray::from(
+                    held.slice(offsets[i] as usize - from..offsets[i + 1] as usize - from),
+                )
+            })
+        })
+        .collect())
 }
 
 /// A row's value of a column, as a statement holds it.
@@ -466,11 +493,64 @@ pub struct ColumnWritten {
 }
 
 /// A table's rows as a Parquet file holds them: each row group's first row and rows, and for each
-/// row group and each of the table's leaves, in its columns' order, the chunk's pages where they can
-/// come in as they lie.
+/// row group and each of the table's leaves, in its columns' order, where the chunk's pages lie
+/// where they can come in as they lie, read only as they come in.
 pub struct Source {
     pub groups: Vec<(usize, usize)>,
-    pub chunks: Vec<Vec<Option<Encoded>>>,
+    chunks: Vec<Vec<Option<Movable>>>,
+    files: Vec<std::fs::File>,
+}
+
+/// Where a column chunk's dictionary and data pages lie in its file: each page's place, its bytes,
+/// and its first row and rows.
+struct Movable {
+    file: usize,
+    dictionary: Option<(u64, usize)>,
+    pages: Vec<(u64, usize, usize, usize)>,
+}
+
+impl Source {
+    /// The pages of leaf `l` of row group `g`, where they can come in as they lie: each data page
+    /// within `unit` disk pages, and its dictionary within the plain library's.
+    fn pages(&self, g: usize, l: usize, unit: usize) -> Result<Option<Encoded>> {
+        use std::os::unix::fs::FileExt;
+        let Some(m) = self.chunks[g][l].as_ref() else {
+            return Ok(None);
+        };
+        if m.dictionary.is_some_and(|(_, len)| len > DICTIONARY_BYTES)
+            || m.pages.iter().any(|&(_, len, _, _)| disk_pages(len) > unit)
+        {
+            return Ok(None);
+        }
+        let file = &self.files[m.file];
+        let read = |at: u64, len: usize| -> Result<Vec<u8>> {
+            let mut buf = vec![0u8; len];
+            file.read_exact_at(&mut buf, at)?;
+            Ok(buf)
+        };
+        Ok(Some(Encoded {
+            dictionary: m.dictionary.map(|(at, len)| read(at, len)).transpose()?,
+            pages: m
+                .pages
+                .iter()
+                .map(|&(at, len, first_row, rows)| {
+                    Ok(DataPage {
+                        bytes: read(at, len)?,
+                        first_row,
+                        rows,
+                    })
+                })
+                .collect::<Result<_>>()?,
+        }))
+    }
+
+    /// The row group that is the block of `rows` rows from `start`.
+    fn group_at(&self, start: usize, rows: usize) -> Option<usize> {
+        let from = self.groups.partition_point(|&(first, _)| first < start);
+        (from..self.groups.len())
+            .take_while(|&g| self.groups[g].0 == start)
+            .find(|&g| self.groups[g].1 == rows)
+    }
 }
 
 /// The row groups of a Parquet file holding a table's rows, and the pages of each column chunk that
@@ -516,13 +596,17 @@ pub fn source(path: &Path, table: &Table) -> Result<Source> {
                 .and_then(|o| o.get(g))
                 .and_then(|o| at[l].and_then(|i| o.get(i)));
             row.push(match (at[l], offsets) {
-                (Some(i), Some(o)) => movable(&file, rg.column(i), o, desc, n)?,
+                (Some(i), Some(o)) => movable(rg.column(i), o, desc, n),
                 _ => None,
             });
         }
         chunks.push(row);
     }
-    Ok(Source { groups, chunks })
+    Ok(Source {
+        groups,
+        chunks,
+        files: vec![file],
+    })
 }
 
 /// A table's rows as several Parquet files hold them, one after another: their row groups in turn.
@@ -530,6 +614,7 @@ pub fn sources(paths: &[std::path::PathBuf], table: &Table) -> Result<Source> {
     let mut out = Source {
         groups: Vec::new(),
         chunks: Vec::new(),
+        files: Vec::new(),
     };
     let mut before = 0;
     for p in paths {
@@ -538,7 +623,13 @@ pub fn sources(paths: &[std::path::PathBuf], table: &Table) -> Result<Source> {
             out.groups.push((before + first, n));
         }
         before += s.groups.iter().map(|g| g.1).sum::<usize>();
-        out.chunks.extend(s.chunks);
+        let file = out.files.len();
+        out.chunks.extend(s.chunks.into_iter().map(|row| {
+            row.into_iter()
+                .map(|m| m.map(|m| Movable { file, ..m }))
+                .collect()
+        }));
+        out.files.extend(s.files);
     }
     Ok(out)
 }
@@ -743,12 +834,25 @@ pub fn write_parquet(
     release: Option<u8>,
     lc_monetary: Option<&str>,
 ) -> Result<Vec<Written>> {
-    write_parquet_in(path, catalog, given, span, release, lc_monetary, None, None)
+    write_parquet_in(
+        path,
+        catalog,
+        given,
+        span,
+        release,
+        lc_monetary,
+        None,
+        None,
+        ROUND_BYTES,
+    )
 }
 
 /// A new snail as `write_parquet` writes it, in format 7 or 8 where `format` names one, as
-/// warren-snail 0.1.0 or 0.1.1 made it: for the checks that hold this build to them.
+/// warren-snail 0.1.0 or 0.1.1 made it: for the checks that hold this build to them. It holds the
+/// rows of one order of one table at a time, `room` bytes of them, the rest written once and read
+/// back once.
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn write_parquet_in(
     path: &Path,
     catalog: &Catalog,
@@ -758,8 +862,8 @@ pub fn write_parquet_in(
     lc_monetary: Option<&str>,
     text_search: Option<&str>,
     format: Option<u32>,
+    room: u64,
 ) -> Result<Vec<Written>> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let mut tables = Vec::new();
     let mut sourced = Vec::new();
     let mut names = Vec::new();
@@ -775,17 +879,12 @@ pub fn write_parquet_in(
             .table(name)
             .ok_or_else(|| Error::new(format!("{name} is not in the DDL")))?;
         let files = parquet_files(p)?;
-        let mut batches = Vec::new();
-        for f in &files {
-            let file =
-                std::fs::File::open(f).map_err(|e| Error::new(format!("{}: {e}", f.display())))?;
-            batches.extend(
-                ParquetRecordBatchReaderBuilder::try_new(file)?
-                    .build()?
-                    .collect::<std::result::Result<Vec<_>, _>>()?,
-            );
-        }
-        tables.push((name.clone(), Rows::from_batches(t, &batches)?));
+        let rows = Given::Files {
+            table: t.clone(),
+            files: files.clone(),
+        };
+        rows.schema_checked()?;
+        tables.push((name.clone(), rows));
         sourced.push((name.clone(), sources(&files, t)?));
     }
     let mut carried = Carried {
@@ -815,20 +914,19 @@ pub fn write_parquet_in(
         format,
         release,
         Some(&carried),
+        room,
     )
 }
 
-/// A column chunk's pages, where they can come in as they lie: the chunk of a leaf the snail
-/// describes as `ours`.
+/// Where a column chunk's pages lie, where they can come in as they lie: the chunk of a leaf the
+/// snail describes as `ours`.
 fn movable(
-    file: &std::fs::File,
     chunk: &parquet::file::metadata::ColumnChunkMetaData,
     offsets: &parquet::file::page_index::offset_index::OffsetIndexMetaData,
     ours: &parquet::schema::types::ColumnDescPtr,
     rows: usize,
-) -> Result<Option<Encoded>> {
+) -> Option<Movable> {
     use parquet::basic::{Compression, Encoding, PageType};
-    use std::os::unix::fs::FileExt;
     let pages_held = chunk.page_encoding_stats().is_some_and(|s| {
         s.iter().all(|p| {
             matches!(
@@ -854,17 +952,11 @@ fn movable(
         || !pages_held
         || mixed
     {
-        return Ok(None);
+        return None;
     }
-    let read = |at: i64, len: usize| -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; len];
-        file.read_exact_at(&mut buf, at as u64)?;
-        Ok(buf)
-    };
     let dictionary = chunk
         .dictionary_page_offset()
-        .map(|d| read(d, (chunk.data_page_offset() - d) as usize))
-        .transpose()?;
+        .map(|d| (d as u64, (chunk.data_page_offset() - d) as usize));
     let locations = offsets.page_locations();
     let mut pages = Vec::with_capacity(locations.len());
     for (i, l) in locations.iter().enumerate() {
@@ -872,13 +964,18 @@ fn movable(
         let next = locations
             .get(i + 1)
             .map_or(rows, |n| n.first_row_index as usize);
-        pages.push(DataPage {
-            bytes: read(l.offset, l.compressed_page_size as usize)?,
-            first_row: first,
-            rows: next - first,
-        });
+        pages.push((
+            l.offset as u64,
+            l.compressed_page_size as usize,
+            first,
+            next - first,
+        ));
     }
-    Ok(Some(Encoded { dictionary, pages }))
+    Some(Movable {
+        file: 0,
+        dictionary,
+        pages,
+    })
 }
 
 pub fn write(path: &Path, catalog: &Catalog, tables: &[(String, Rows)]) -> Result<Vec<Written>> {
@@ -905,17 +1002,40 @@ pub fn write_spanned(
     sources: &[(String, Source)],
     span: u64,
 ) -> Result<Vec<Written>> {
+    write_within(path, catalog, tables, sources, span, ROUND_BYTES)
+}
+
+/// A new snail as `write_spanned` writes it, holding the rows of one order of one table at a time,
+/// `room` bytes of them, the rest written once and read back once.
+#[doc(hidden)]
+pub fn write_within(
+    path: &Path,
+    catalog: &Catalog,
+    tables: &[(String, Rows)],
+    sources: &[(String, Source)],
+    span: u64,
+    room: u64,
+) -> Result<Vec<Written>> {
     let _named = crate::oids::named(catalog.oids.clone());
     write_made(
         path,
         catalog,
-        tables,
+        &held(tables),
         sources,
         span,
         None,
         crate::regs::LATEST,
         None,
+        room,
     )
+}
+
+/// Each table's rows held whole.
+fn held(tables: &[(String, Rows)]) -> Vec<(String, Given<'_>)> {
+    tables
+        .iter()
+        .map(|(n, r)| (n.clone(), Given::Held(r)))
+        .collect()
 }
 
 /// A new snail as `write_spanned` writes it, its OIDs from PostgreSQL `release`, whose catalog
@@ -928,7 +1048,17 @@ pub fn write_released(
     span: u64,
     release: u8,
 ) -> Result<Vec<Written>> {
-    write_made(path, catalog, tables, sources, span, None, release, None)
+    write_made(
+        path,
+        catalog,
+        &held(tables),
+        sources,
+        span,
+        None,
+        release,
+        None,
+        ROUND_BYTES,
+    )
 }
 
 /// What a snail written afresh from another carries over of it beyond its rows: where its
@@ -963,12 +1093,13 @@ pub fn write_carried(
     write_made(
         path,
         catalog,
-        tables,
+        &held(tables),
         sources,
         span,
         None,
         release,
         Some(carried),
+        ROUND_BYTES,
     )
 }
 
@@ -984,12 +1115,13 @@ pub fn write_format_seven(
     write_made(
         path,
         catalog,
-        tables,
+        &held(tables),
         &[],
         span,
         Some(FORMAT_SEVEN),
         crate::regs::LATEST,
         None,
+        ROUND_BYTES,
     )
 }
 
@@ -1005,12 +1137,13 @@ pub fn write_format_eight(
     write_made(
         path,
         catalog,
-        tables,
+        &held(tables),
         &[],
         span,
         Some(FORMAT_EIGHT),
         crate::regs::LATEST,
         None,
+        ROUND_BYTES,
     )
 }
 
@@ -1018,12 +1151,13 @@ pub fn write_format_eight(
 fn write_made(
     path: &Path,
     catalog: &Catalog,
-    tables: &[(String, Rows)],
+    tables: &[(String, Given)],
     sources: &[(String, Source)],
     span: u64,
     format: Option<u32>,
     release: u8,
     carried: Option<&Carried>,
+    room: u64,
 ) -> Result<Vec<Written>> {
     for (name, _) in tables {
         if catalog.table(name).is_none() {
@@ -1056,7 +1190,7 @@ fn write_made(
         }
         crate::read::old_names(&mut named, f);
     }
-    let written = write_tables(w, &named, tables, sources, carried);
+    let written = write_tables(w, &named, tables, sources, carried, room);
     if written.is_err() {
         // A write refused leaves no file of its own behind.
         let _ = std::fs::remove_file(path);
@@ -1076,9 +1210,10 @@ fn write_made(
 fn write_tables(
     mut w: Writer,
     catalog: &Catalog,
-    tables: &[(String, Rows)],
+    tables: &[(String, Given)],
     sources: &[(String, Source)],
     carried: Option<&Carried>,
+    room: u64,
 ) -> Result<Vec<Written>> {
     let mut root = Root {
         generation: 1,
@@ -1089,6 +1224,68 @@ fn write_tables(
         ..Default::default()
     };
     crate::file::holds_catalog(w.format(), catalog)?;
+    let out = if w.format() >= crate::file::FORMAT {
+        within_tables(&mut w, catalog, tables, sources, &mut root, room)?
+    } else {
+        // A snail of an older format is written from every table's rows whole.
+        let whole = tables
+            .iter()
+            .map(|(n, g)| Ok((n.clone(), g.whole(catalog)?)))
+            .collect::<Result<Vec<_>>>()?;
+        whole_tables(&mut w, catalog, &whole, sources, &mut root)?
+    };
+    // The OIDs its writers take next, and the statements whose OIDs depart from its text's order,
+    // as the snail its rows came from had them.
+    if let Some(c) = carried.filter(|_| w.format() >= crate::file::FORMAT) {
+        root.next_oid = c.next_oid;
+        if !c.oids.is_empty() {
+            root.oids = w.place(&crate::file::encode_record(&c.oids))?;
+        }
+    }
+    // What grows with the schema lies in pages of its own where the root would not hold it.
+    let mut gone = Vec::new();
+    let states = carried.map_or(&[][..], |c| &c.sequences);
+    if w.format() >= crate::file::FORMAT && !root.fits_uncut(w.format())? {
+        crate::file::cut_afresh(
+            &mut root,
+            catalog.ddl.as_bytes(),
+            states,
+            1,
+            &mut w,
+            &mut gone,
+        )?;
+        crate::file::settle_tables(&mut root, w.format(), 1, &mut w, &mut gone)?;
+    } else {
+        root.catalog = w.place(catalog.ddl.as_bytes())?;
+        if !states.is_empty() {
+            root.sequences = w.place(&crate::file::encode_sequences(states))?;
+        }
+    }
+    // The pages passed over at a file's end, where a run would have crossed into the next, are free.
+    let passed: Vec<Run> = w
+        .left_free()
+        .into_iter()
+        .map(|(start, pages)| Run {
+            start,
+            pages,
+            tag: 0,
+        })
+        .collect();
+    if !passed.is_empty() {
+        root.free = w.place_end(&encode_free(&passed, &[], w.format()))?;
+    }
+    w.commit(&mut root)?;
+    Ok(out)
+}
+
+/// Every table of the catalog written from its rows whole, each order laid out on them all.
+fn whole_tables(
+    w: &mut Writer,
+    catalog: &Catalog,
+    tables: &[(String, Rows)],
+    sources: &[(String, Source)],
+    root: &mut Root,
+) -> Result<Vec<Written>> {
     crate::read::foreign::rows_held(catalog, tables)?;
     let strands = crate::read::elements::strands_of(catalog, tables)?;
     let mut out = Vec::new();
@@ -1102,7 +1299,7 @@ fn write_tables(
         else {
             for order in &table.orders {
                 let format = w.format();
-                let (extent, written) = empty_order(&mut w, table, order, format)?;
+                let (extent, written) = empty_order(&mut *w, table, order, format)?;
                 root.orders
                     .push((table.name.clone(), order.name.clone(), extent));
                 out.push(written);
@@ -1226,54 +1423,620 @@ fn write_tables(
             let packed = w.format() != FORMAT_SEVEN;
             let format = w.format();
             let (extent, written) =
-                write_order(&mut w, table, order, rows, source, packed, format)?;
+                write_order(&mut *w, table, order, rows, source, packed, format)?;
             root.orders
                 .push((table.name.clone(), order.name.clone(), extent));
             out.push(written);
         }
     }
-    // The OIDs its writers take next, and the statements whose OIDs depart from its text's order,
-    // as the snail its rows came from had them.
-    if let Some(c) = carried.filter(|_| w.format() >= crate::file::FORMAT) {
-        root.next_oid = c.next_oid;
-        if !c.oids.is_empty() {
-            root.oids = w.place(&crate::file::encode_record(&c.oids))?;
+    Ok(out)
+}
+
+/// Every table of the catalog written one at a time, its rows a chunk at a time: each order's rows
+/// held within `room` bytes, the rest written once and read back once, each block written as it
+/// closes.
+fn within_tables(
+    w: &mut Writer,
+    catalog: &Catalog,
+    tables: &[(String, Given)],
+    sources: &[(String, Source)],
+    root: &mut Root,
+    room: u64,
+) -> Result<Vec<Written>> {
+    foreign_held(catalog, tables)?;
+    let mut out = Vec::new();
+    for table in &catalog.tables {
+        crate::file::holds(w.format(), table)?;
+        let given = |name: &str| tables.iter().find(|(n, _)| n == name).map(|(_, g)| g);
+        // An index's element strand is made from its table's rows as they come.
+        let strand;
+        let rows = match given(&table.name) {
+            Some(g) => Some(g),
+            None => match catalog
+                .tables
+                .iter()
+                .find(|t| t.element_keys.iter().any(|k| k.strand == table.name))
+                .and_then(|t| given(&t.name).map(|g| (t, g)))
+            {
+                Some((of, g)) => {
+                    strand = Given::Strand {
+                        of: of.name.clone(),
+                        rows: g,
+                        strand: table.name.clone(),
+                    };
+                    Some(&strand)
+                }
+                None => None,
+            },
+        };
+        let Some(rows) = rows else {
+            for order in &table.orders {
+                let format = w.format();
+                let (extent, written) = empty_order(&mut *w, table, order, format)?;
+                root.orders
+                    .push((table.name.clone(), order.name.clone(), extent));
+                out.push(written);
+            }
+            continue;
+        };
+        let source = sources
+            .iter()
+            .find(|(n, _)| *n == table.name)
+            .map(|(_, s)| s);
+        let mut checks = Checks::new(catalog, table);
+        let held = matches!(rows, Given::Held(_));
+        if let Given::Held(r) = rows {
+            checks.columns(r);
+            if checks.short() {
+                return checks.finish().map(|_| Vec::new());
+            }
+        }
+        if table.orders.is_empty() {
+            each_numbered(rows, catalog, table, &mut |chunk| {
+                if !held {
+                    checks.columns(&chunk);
+                }
+                checks.rows(&chunk)
+            })?;
+            checks.finish()?;
+            continue;
+        }
+        let mut checks = Some(checks);
+        for order in &table.orders {
+            let (extent, written) = within_order(
+                w,
+                catalog,
+                table,
+                order,
+                rows,
+                source,
+                room,
+                checks.take(),
+                held,
+            )?;
+            root.orders
+                .push((table.name.clone(), order.name.clone(), extent));
+            out.push(written);
         }
     }
-    // What grows with the schema lies in pages of its own where the root would not hold it.
-    let mut gone = Vec::new();
-    let states = carried.map_or(&[][..], |c| &c.sequences);
-    if w.format() >= crate::file::FORMAT && !root.fits_uncut(w.format())? {
-        crate::file::cut_afresh(
-            &mut root,
-            catalog.ddl.as_bytes(),
-            states,
-            1,
-            &mut w,
-            &mut gone,
-        )?;
-        crate::file::settle_tables(&mut root, w.format(), 1, &mut w, &mut gone)?;
-    } else {
-        root.catalog = w.place(catalog.ddl.as_bytes())?;
-        if !states.is_empty() {
-            root.sequences = w.place(&crate::file::encode_sequences(states))?;
+    Ok(out)
+}
+
+/// Hands `each` a table's rows a chunk at a time, a table with no column of a B-tree numbered from
+/// 1 as its rows are given.
+fn each_numbered(
+    given: &Given,
+    catalog: &Catalog,
+    table: &Table,
+    each: &mut dyn FnMut(Rows) -> Result<()>,
+) -> Result<()> {
+    let mut before = 0i64;
+    given.each(catalog, &mut |rows| {
+        let n = rows.len() as i64;
+        let rows = match table.arrival() {
+            Some(a) if rows.columns.len() == a => {
+                let mut columns = rows.columns;
+                columns.push(Values::Int((before + 1..=before + n).map(Some).collect()));
+                Rows { columns }
+            }
+            _ => rows,
+        };
+        before += n;
+        each(rows)
+    })
+}
+
+/// One order of a table written from its rows as they come: sorted within the room, cut as they
+/// come in its order, each block written as it closes. The first order's rows meet the table's
+/// checks first, before any block is written.
+#[allow(clippy::too_many_arguments)]
+fn within_order(
+    w: &mut Writer,
+    catalog: &Catalog,
+    table: &Table,
+    order: &Order,
+    given: &Given,
+    source: Option<&Source>,
+    room: u64,
+    mut checks: Option<Checks>,
+    held: bool,
+) -> Result<(Extent, Written)> {
+    let format = w.format();
+    let predicate = crate::read::partial::Predicate::of(catalog, table, order);
+    let collators = order
+        .levels
+        .iter()
+        .map(|l| table.columns[l.column()].orderer())
+        .collect::<Result<Vec<_>>>();
+    let (Ok(predicate), Ok(collators)) = (&predicate, &collators) else {
+        // The rows meet the table's checks before the order is refused.
+        if let Some(mut c) = checks {
+            each_numbered(given, catalog, table, &mut |chunk| {
+                if !held {
+                    c.columns(&chunk);
+                }
+                c.rows(&chunk)
+            })?;
+            c.finish()?;
         }
-    }
-    // The pages passed over at a file's end, where a run would have crossed into the next, are free.
-    let passed: Vec<Run> = w
-        .left_free()
-        .into_iter()
-        .map(|(start, pages)| Run {
-            start,
-            pages,
-            tag: 0,
+        return match (predicate, collators) {
+            (Err(e), _) | (_, Err(e)) => Err(e),
+            _ => unreachable!("an order refused"),
+        };
+    };
+    let stride = order.levels.len();
+    let bits: Vec<bool> = order
+        .leaves(table)
+        .iter()
+        .map(|(_, l)| of_bits(l))
+        .collect();
+    let leaves = bits.len();
+    let room = crate::room::Room::new(crate::room::Sizes::of(room));
+    let back = |columns: Vec<Values>| keyed(table, order, columns, collators, None);
+    let mut sorter = sorting::Sorter::new(room.clone(), table, stride, leaves, &back);
+    let mut kinds = level_kinds(table, order, format);
+    let mut rows = 0usize;
+    let mut totals = vec![0u64; leaves];
+    let mut in_order = true;
+    let mut last: Vec<KeyValue> = Vec::new();
+    // Each level under a glibc collation: its values keyed as glibc keys them, each once.
+    let mut libc: Vec<(
+        usize,
+        &crate::collations::Collator,
+        BTreeSet<(Vec<u8>, Vec<u8>)>,
+    )> = collators
+        .iter()
+        .enumerate()
+        .filter_map(|(li, c)| {
+            c.filter(|c| c.spec.provider == crate::collations::Provider::Libc)
+                .map(|c| (order.levels[li].column(), c, BTreeSet::new()))
         })
         .collect();
-    if !passed.is_empty() {
-        root.free = w.place_end(&encode_free(&passed, &[], w.format()))?;
+    each_numbered(given, catalog, table, &mut |chunk| {
+        if let Some(c) = checks.as_mut() {
+            if !held {
+                c.columns(&chunk);
+            }
+            c.rows(&chunk)?;
+        }
+        // A partial strand holds the rows its predicate admits.
+        let chunk = match predicate {
+            Some(p) => {
+                let kept: Vec<usize> = (0..chunk.len())
+                    .filter(|&r| p.admits_at(table, &chunk, r))
+                    .collect();
+                Rows {
+                    columns: chunk.columns.iter().map(|v| v.gather(&kept)).collect(),
+                }
+            }
+            None => chunk,
+        };
+        let n = chunk.len();
+        if n == 0 {
+            return Ok(());
+        }
+        for (column, collator, set) in &mut libc {
+            set.extend(agreed_keys(
+                table,
+                *column,
+                collator,
+                &chunk.columns[*column],
+            ));
+        }
+        let k = keyed(table, order, chunk.columns, collators, Some(&mut kinds))?;
+        if in_order {
+            for r in 0..n {
+                let key = &k.keys[r * stride..(r + 1) * stride];
+                let before = match r {
+                    0 => last.as_slice(),
+                    _ => &k.keys[(r - 1) * stride..r * stride],
+                };
+                if !before.is_empty() && before > key {
+                    in_order = false;
+                    break;
+                }
+            }
+            last = k.keys[(n - 1) * stride..].to_vec();
+        }
+        for r in 0..n {
+            for (s, t) in totals.iter_mut().enumerate() {
+                *t += k.widths[r * leaves + s] & !closing::NULL_BIT;
+            }
+        }
+        rows += n;
+        sorter.push(k)
+    })?;
+    if let Some(c) = checks {
+        c.finish()?;
     }
-    w.commit(&mut root)?;
-    Ok(out)
+    for (column, collator, set) in libc {
+        agreed_in(table, column, collator, set.into_iter())?;
+    }
+    let sub = Sublevels::new(order, table, &kinds);
+    let mut closing = closing::Closing::new(&sub, stride, bits.clone());
+    let source = source.filter(|_| in_order && predicate.is_none());
+    let mut blocks = Blocks::new(table, order, format, rows, &totals, &bits, source)?;
+    let mut prev: Vec<KeyValue> = Vec::new();
+    // Keys holding a NULL are each their own, unless the order says they are not distinct.
+    let shared = |a: &[KeyValue], b: &[KeyValue]| {
+        a == b && !(order.nulls_distinct && a.iter().any(KeyValue::is_null))
+    };
+    sorter.merge(&mut |columns, r, key, widths| {
+        if order.unique {
+            if !prev.is_empty() && shared(&prev, key) {
+                let values: Vec<_> = order
+                    .levels
+                    .iter()
+                    .map(|l| row_value(table.columns[l.column()].ty, &columns[l.column()], r))
+                    .collect();
+                return Err(key_shared(table, order, &values));
+            }
+            prev.clear();
+            prev.extend_from_slice(key);
+        }
+        closing.push(columns, r, key, widths);
+        while let Some(b) = closing.take() {
+            blocks.write(&mut *w, b)?;
+        }
+        Ok(())
+    })?;
+    closing.finish();
+    while let Some(b) = closing.take() {
+        blocks.write(&mut *w, b)?;
+    }
+    blocks.finish(w, &kinds)
+}
+
+/// Rows of an order as the write sorts them: each row's key and its widths, and the bytes they
+/// are held at; each text level's sublevels widened to hold them where `kinds` is given.
+fn keyed(
+    table: &Table,
+    order: &Order,
+    columns: Vec<Values>,
+    collators: &[Option<&crate::collations::Collator>],
+    mut kinds: Option<&mut Vec<u32>>,
+) -> Result<sorting::Chunk> {
+    let n = columns.first().map_or(0, Values::len);
+    let mut keys = Vec::with_capacity(n * order.levels.len());
+    for r in 0..n {
+        key_of(
+            table,
+            order,
+            &columns,
+            r,
+            collators,
+            kinds.as_deref_mut(),
+            &mut keys,
+        )?;
+    }
+    let widths = row_widths(table, order, &columns, n);
+    let bytes =
+        columns.iter().map(held_bytes).sum::<u64>() + key_bytes(&keys) + 8 * widths.len() as u64;
+    Ok(sorting::Chunk {
+        columns,
+        keys,
+        widths,
+        bytes,
+    })
+}
+
+/// A column's values under a glibc collation, keyed as `agreed` keys them.
+fn agreed_keys(
+    table: &Table,
+    column: usize,
+    collator: &crate::collations::Collator,
+    values: &Values,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    (0..values.len())
+        .filter_map(|r| values.text_value(r))
+        .map(|v| {
+            let held = crate::strings::key_bytes(table.columns[column].ty, v.data()).into_owned();
+            (collator.key(&held), held)
+        })
+        .collect()
+}
+
+/// Refuses, as `agreed` does, values of a column keyed as `agreed_keys` keys them, sorted and each
+/// once, that glibc's `strxfrm_l` keys in another order than its `strcoll_l` compares them.
+fn agreed_in(
+    table: &Table,
+    column: usize,
+    collator: &crate::collations::Collator,
+    keyed: impl Iterator<Item = (Vec<u8>, Vec<u8>)>,
+) -> Result<()> {
+    let mut before: Option<(Vec<u8>, Vec<u8>)> = None;
+    for k in keyed {
+        if let Some(p) = &before {
+            if collator.cmp(&p.1, &k.1) != p.0.cmp(&k.0) {
+                return Err(disagreed(table, column, &p.1, &k.1));
+            }
+        }
+        before = Some(k);
+    }
+    Ok(())
+}
+
+/// The foreign keys among the tables given: each child's references held against its parent's
+/// keys, as a write of every table's rows at once holds them, reading only the columns they name.
+fn foreign_held(catalog: &Catalog, tables: &[(String, Given)]) -> Result<()> {
+    let given = |name: &str| tables.iter().find(|(n, _)| n == name).map(|(_, g)| g);
+    if !catalog
+        .tables
+        .iter()
+        .any(|t| given(&t.name).is_some() && t.foreign_keys.iter().any(|k| k.enforced))
+    {
+        return Ok(());
+    }
+    // The columns a key names, of each table that is a child or a parent of one.
+    let mut named: std::collections::BTreeMap<String, BTreeSet<usize>> = Default::default();
+    for t in &catalog.tables {
+        for k in t.foreign_keys.iter().filter(|k| k.enforced) {
+            named.entry(t.name.clone()).or_default().extend(&k.columns);
+            named
+                .entry(k.parent.clone())
+                .or_default()
+                .extend(&k.parent_columns);
+        }
+    }
+    let place = |table: &str, c: usize| named[table].iter().position(|&x| x == c).unwrap();
+    let mut keyed = catalog.clone();
+    for t in &mut keyed.tables {
+        let Some(columns) = named.get(&t.name) else {
+            continue;
+        };
+        t.columns = columns.iter().map(|&c| t.columns[c].clone()).collect();
+        t.foreign_keys.retain(|k| k.enforced);
+        for k in &mut t.foreign_keys {
+            k.columns = k.columns.iter().map(|&c| place(&t.name, c)).collect();
+            k.parent_columns = k
+                .parent_columns
+                .iter()
+                .map(|&c| place(&k.parent, c))
+                .collect();
+        }
+    }
+    let mut rows = Vec::new();
+    for (name, columns) in &named {
+        let Some(g) = given(name) else {
+            continue;
+        };
+        let columns: Vec<usize> = columns.iter().copied().collect();
+        let mut out: Option<Rows> = None;
+        g.each(catalog, &mut |chunk| {
+            let chunk = Rows {
+                columns: columns.iter().map(|&c| chunk.columns[c].clone()).collect(),
+            };
+            given::appended(&mut out, &chunk);
+            Ok(())
+        })?;
+        if let Some(r) = out {
+            rows.push((name.clone(), r));
+        }
+    }
+    crate::read::foreign::rows_held(&keyed, &rows)
+}
+
+/// An order's blocks written as they close, and its directory once the last has.
+struct Blocks<'b> {
+    table: &'b Table,
+    order: &'b Order,
+    format: u32,
+    rows: usize,
+    /// Each leaf's plain bytes, or bits, over every row of the order, for its counting unit.
+    totals: Widths,
+    bits: Vec<bool>,
+    source: Option<&'b Source>,
+    at: Vec<usize>,
+    descs: Vec<parquet::schema::types::ColumnDescPtr>,
+    month_slots: Vec<usize>,
+    text_slots: Vec<usize>,
+    entries: Vec<Entry>,
+    maps: MapPages,
+    most: Vec<u64>,
+    /// Each leaf's blocks moved and on a dictionary, data pages and disk pages, and text bytes.
+    counts: Vec<[usize; 4]>,
+    bytes: Vec<u64>,
+    blocks: usize,
+}
+
+impl<'b> Blocks<'b> {
+    fn new(
+        table: &'b Table,
+        order: &'b Order,
+        format: u32,
+        rows: usize,
+        totals: &[u64],
+        bits: &[bool],
+        source: Option<&'b Source>,
+    ) -> Result<Blocks<'b>> {
+        let totals = Widths(
+            totals
+                .iter()
+                .zip(bits)
+                .map(|(&t, &b)| match b {
+                    true => Width::Bits(vec![0, t]),
+                    false => Width::Nulls {
+                        bytes: vec![0, t],
+                        nulls: vec![0, 0],
+                    },
+                })
+                .collect(),
+        );
+        let (month_slots, text_slots) = slots(table, order);
+        Ok(Blocks {
+            table,
+            order,
+            format,
+            rows,
+            totals,
+            bits: bits.to_vec(),
+            source,
+            at: order
+                .columns
+                .iter()
+                .flat_map(|&c| {
+                    let first = table.first_leaf(c);
+                    first..first + table.leaf_count(c)
+                })
+                .collect(),
+            descs: leaf_descriptors(table, order)?,
+            month_slots: month_slots.into_iter().map(|s| s as usize).collect(),
+            text_slots: text_slots.into_iter().map(|s| s as usize).collect(),
+            entries: Vec::new(),
+            maps: MapPages::new(format != FORMAT_SEVEN),
+            most: vec![0; bits.len()],
+            counts: vec![[0; 4]; bits.len()],
+            bytes: vec![0; bits.len()],
+            blocks: 0,
+        })
+    }
+
+    /// A block closed, written: each leaf's unit from its own furthest-out place.
+    fn write(&mut self, w: &mut dyn Place, b: closing::Closed) -> Result<()> {
+        let (table, order) = (self.table, self.order);
+        let n = b.rows();
+        let leaves = self.bits.len();
+        let keys = Keys {
+            stride: order.levels.len(),
+            data: b.keys,
+        };
+        let widths = Widths(
+            (0..leaves)
+                .map(|s| {
+                    let (mut sum, mut nulls) = (vec![0u64], vec![0u64]);
+                    for r in 0..n {
+                        let x = b.widths[r * leaves + s];
+                        sum.push(sum[r] + (x & !closing::NULL_BIT));
+                        nulls.push(nulls[r] + u64::from(x & closing::NULL_BIT != 0));
+                    }
+                    match self.bits[s] {
+                        true => Width::Bits(sum),
+                        false => Width::Nulls { bytes: sum, nulls },
+                    }
+                })
+                .collect(),
+        );
+        let whole = [Block {
+            place: Vec::new(),
+            start: 0,
+            end: n,
+        }];
+        let most = largest_places(&keys, &whole, order, table, &widths)
+            .pop()
+            .expect("one block");
+        for (m, &x) in self.most.iter_mut().zip(&most) {
+            *m = (*m).max(x);
+        }
+        let units: Vec<usize> = (0..leaves)
+            .map(|s| self.totals.unit(s, most[s], self.rows))
+            .collect();
+        let given = given_pages(self.source, &self.at, b.start, n, &units)?;
+        let rows = Rows { columns: b.columns };
+        let perm: Vec<usize> = (0..n).collect();
+        let block = Block {
+            place: vec![0; b.depth],
+            start: 0,
+            end: n,
+        };
+        let (entry, encoded, moved) = write_block(
+            w,
+            table,
+            order,
+            &rows,
+            &perm,
+            &keys,
+            &block,
+            &self.descs,
+            &units,
+            &self.month_slots,
+            &self.text_slots,
+            &given,
+            &mut self.maps,
+            true,
+        )?;
+        for (s, (c, e)) in self.counts.iter_mut().zip(&encoded).enumerate() {
+            c[0] += moved[s] as usize;
+            c[1] += e.dictionary.is_some() as usize;
+            c[2] += e.pages.len();
+            c[3] += e.disk_pages();
+        }
+        for (&s, &bytes) in self.text_slots.iter().zip(&entry.bytes) {
+            self.bytes[s] += bytes as u64;
+        }
+        self.entries.push(entry);
+        self.blocks += 1;
+        Ok(())
+    }
+
+    /// The order's directory written over its blocks, and its top.
+    fn finish(mut self, w: &mut Writer, kinds: &[u32]) -> Result<(Extent, Written)> {
+        let (table, order) = (self.table, self.order);
+        crate::directory::separate(&mut self.entries, kinds, None, None);
+        self.maps.finish(w)?;
+        let units: Vec<usize> = (0..self.bits.len())
+            .map(|s| self.totals.unit(s, self.most[s], self.rows))
+            .collect();
+        let mut columns = leaves_written(table, order, &units);
+        for (s, c) in columns.iter_mut().enumerate() {
+            let [moved, dictionary, data, disk] = self.counts[s];
+            c.moved_blocks = moved;
+            c.dictionary_blocks = dictionary;
+            c.data_pages = data;
+            c.disk_pages = disk;
+            if let Some(b) = c.bytes.as_mut() {
+                *b = self.bytes[s];
+            }
+        }
+        let head = Head {
+            units: units.iter().map(|&k| k as u32).collect(),
+            month_slots: self.month_slots.iter().map(|&s| s as u32).collect(),
+            text_slots: self.text_slots.iter().map(|&s| s as u32).collect(),
+            level_text: kinds.to_vec(),
+            height: 0,
+            wide_slots: wide_slots(table, order),
+            cut_under: cut_under_of(table, order),
+            span_slots: crate::spans::slots(table, order),
+            bound_slots: bound_slots(table, order, self.format),
+            summed: crate::brin::slots(table, order),
+            separated: self.format >= crate::file::FORMAT,
+        };
+        let (top, below) = build(head, self.entries, &mut |bytes| w.place(bytes))?;
+        let levels = decode_top(&top)?.0.height;
+        let extent = w.place(&top)?;
+        Ok((
+            extent,
+            Written {
+                table: table.name.clone(),
+                order: order.name.clone(),
+                rows: self.rows,
+                blocks: self.blocks,
+                index_pages: below + extent.pages(),
+                levels,
+                map_pages: self.maps.pages,
+                columns,
+            },
+        ))
+    }
 }
 
 /// Rows of a table sorted on one of its orders, and cut into blocks.
@@ -1340,60 +2103,15 @@ pub(crate) fn laid_out(
         .map(|l| table.columns[l.column()].orderer())
         .collect::<Result<Vec<_>>>()?;
     for r in 0..n {
-        for (li, &l) in order.levels.iter().enumerate() {
-            let column = &rows.columns[l.column()];
-            if column.is_null(r) {
-                unsorted.push(null_key(order, li));
-                continue;
-            }
-            if let (true, Some(held)) = (
-                crate::plane::on_plane(table.columns[l.column()].ty),
-                column.text_value(r),
-            ) {
-                let g = crate::plane::of_bytes(table.columns[l.column()].ty, held.data())
-                    .ok_or_else(|| Error::new("a shape read from its bytes"))?;
-                crate::plane::taken(order, &g)?;
-                unsorted.push(KeyValue::Wide(crate::plane::key(&g)));
-                continue;
-            }
-            let v = match column {
-                // A composed value by its key, written as text that sorts as the key does.
-                Values::Composed(x) => {
-                    let ty = table.columns[l.column()].ty;
-                    let key = x[r].as_ref().unwrap().hex.as_bytes().to_vec();
-                    if !fixed {
-                        text_sublevels[li] = crate::places::rungs_for(ty, &key, text_sublevels[li]);
-                    }
-                    unsorted.push(crate::places::byte_key(ty, &key));
-                    continue;
-                }
-                Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } => {
-                    let ty = table.columns[l.column()].ty;
-                    let held = column.text_value(r).unwrap();
-                    let key = crate::strings::column_key(ty, collators[li], held.data());
-                    if !fixed {
-                        text_sublevels[li] = crate::places::rungs_for(ty, &key, text_sublevels[li]);
-                    }
-                    unsorted.push(crate::places::column_byte_key(
-                        &table.columns[l.column()],
-                        &key,
-                    ));
-                    continue;
-                }
-                Values::Wide(v) => {
-                    unsorted.push(KeyValue::Wide(v[r].unwrap()));
-                    continue;
-                }
-                Values::Interval(_) => {
-                    unsorted.push(KeyValue::Wide(column.wide(r).unwrap()));
-                    continue;
-                }
-                Values::Float4(_) | Values::Float8(_) => column.int(r).unwrap(),
-                Values::Int(v) => v[r].unwrap(),
-                Values::Nested(_) => unreachable!("a level reads its column whole"),
-            };
-            unsorted.push(level_key(order, li, v));
-        }
+        key_of(
+            table,
+            order,
+            &rows.columns,
+            r,
+            &collators,
+            (!fixed).then_some(&mut text_sublevels),
+            &mut unsorted,
+        )?;
     }
     let row = |r: usize| &unsorted[r * stride..(r + 1) * stride];
     let mut perm: Vec<usize> = (0..n).collect();
@@ -1409,7 +2127,11 @@ pub(crate) fn laid_out(
             a == b && !(order.nulls_distinct && a.iter().any(KeyValue::is_null))
         };
         if let Some(p) = perm.windows(2).find(|p| shared(row(p[0]), row(p[1]))) {
-            return Err(key_shared(table, order, &order_values(table, order, rows, p[1])));
+            return Err(key_shared(
+                table,
+                order,
+                &order_values(table, order, rows, p[1]),
+            ));
         }
     }
     let keys = Keys {
@@ -1432,6 +2154,150 @@ pub(crate) fn laid_out(
         widths,
         blocks,
     })
+}
+
+/// Row `r`'s key on an order, a value a level, onto `out`; where `text_sublevels` is given, each text
+/// level's sublevels widened to hold it.
+pub(crate) fn key_of(
+    table: &Table,
+    order: &Order,
+    columns: &[Values],
+    r: usize,
+    collators: &[Option<&crate::collations::Collator>],
+    mut text_sublevels: Option<&mut Vec<u32>>,
+    out: &mut Vec<KeyValue>,
+) -> Result<()> {
+    for (li, &l) in order.levels.iter().enumerate() {
+        let column = &columns[l.column()];
+        if column.is_null(r) {
+            out.push(null_key(order, li));
+            continue;
+        }
+        if let (true, Some(held)) = (
+            crate::plane::on_plane(table.columns[l.column()].ty),
+            column.text_value(r),
+        ) {
+            let g = crate::plane::of_bytes(table.columns[l.column()].ty, held.data())
+                .ok_or_else(|| Error::new("a shape read from its bytes"))?;
+            crate::plane::taken(order, &g)?;
+            out.push(KeyValue::Wide(crate::plane::key(&g)));
+            continue;
+        }
+        let v = match column {
+            // A composed value by its key, written as text that sorts as the key does.
+            Values::Composed(x) => {
+                let ty = table.columns[l.column()].ty;
+                let key = x[r].as_ref().unwrap().hex.as_bytes().to_vec();
+                if let Some(t) = text_sublevels.as_deref_mut() {
+                    t[li] = crate::places::rungs_for(ty, &key, t[li]);
+                }
+                out.push(crate::places::byte_key(ty, &key));
+                continue;
+            }
+            Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } => {
+                let ty = table.columns[l.column()].ty;
+                let held = column.text_value(r).unwrap();
+                let key = crate::strings::column_key(ty, collators[li], held.data());
+                if let Some(t) = text_sublevels.as_deref_mut() {
+                    t[li] = crate::places::rungs_for(ty, &key, t[li]);
+                }
+                out.push(crate::places::column_byte_key(
+                    &table.columns[l.column()],
+                    &key,
+                ));
+                continue;
+            }
+            Values::Wide(v) => {
+                out.push(KeyValue::Wide(v[r].unwrap()));
+                continue;
+            }
+            Values::Interval(_) => {
+                out.push(KeyValue::Wide(column.wide(r).unwrap()));
+                continue;
+            }
+            Values::Float4(_) | Values::Float8(_) => column.int(r).unwrap(),
+            Values::Int(v) => v[r].unwrap(),
+            Values::Nested(_) => unreachable!("a level reads its column whole"),
+        };
+        out.push(level_key(order, li, v));
+    }
+    Ok(())
+}
+
+/// Each row's width on each leaf an order holds, a row's leaves together: its plain bytes, or its
+/// bits on a leaf of bits, `NULL_BIT` set where the row holds no value there; as `width` sums them.
+fn row_widths(table: &Table, order: &Order, columns: &[Values], n: usize) -> Vec<u64> {
+    let leaves = order.leaves(table).len();
+    let mut out = vec![0u64; n * leaves];
+    let mut s = 0;
+    for &c in &order.columns {
+        for (leaf, values) in table
+            .column_leaves(c)
+            .iter()
+            .zip(leaf_values(table, c, &columns[c]))
+        {
+            let ty = leaf.ty;
+            for r in 0..n {
+                out[r * leaves + s] = if leaf.thin {
+                    values.plain(r, ty) * 8
+                } else if let Some(bits) = ty.thin_bits() {
+                    match &*values {
+                        Values::Nested(nv) => {
+                            nv.entries(r).filter(|&e| !nv.values.is_null(e)).count() as u64 * bits
+                        }
+                        v if v.is_null(r) => 0,
+                        _ => bits,
+                    }
+                } else {
+                    let null = match &*values {
+                        Values::Nested(nv) => nv.entries(r).all(|e| nv.values.is_null(e)),
+                        v => v.is_null(r),
+                    };
+                    values.plain(r, ty) | if null { closing::NULL_BIT } else { 0 }
+                };
+            }
+            s += 1;
+        }
+    }
+    out
+}
+
+/// Whether a leaf's widths are bits, which never decide the cut.
+fn of_bits(leaf: &crate::catalog::Leaf) -> bool {
+    leaf.thin || leaf.ty.thin_bits().is_some()
+}
+
+/// The bytes a column's values are held at, a row at a time.
+fn held_bytes(values: &Values) -> u64 {
+    let n = values.len() as u64;
+    match values {
+        Values::Int(_) => 16 * n,
+        Values::Text(v) => v.iter().flatten().map(|s| 24 + s.len() as u64).sum::<u64>() + 24 * n,
+        Values::Utf8(v) => 32 * n + v.iter().flatten().map(|b| b.len() as u64).sum::<u64>(),
+        Values::Dict { .. } => 8 * n,
+        Values::Wide(_) => 32 * n,
+        Values::Float4(_) => 8 * n,
+        Values::Float8(_) => 16 * n,
+        Values::Interval(_) => 24 * n,
+        Values::Composed(v) => v
+            .iter()
+            .flatten()
+            .map(|c| 64 + 2 * c.key.len() as u64)
+            .sum::<u64>()
+            .max(8 * n),
+        Values::Nested(nv) => held_bytes(&nv.values) + 4 * nv.defs.len() as u64,
+    }
+}
+
+/// The bytes a key is held at.
+fn key_bytes(keys: &[KeyValue]) -> u64 {
+    keys.iter()
+        .map(|k| match k {
+            KeyValue::Text(s) => 32 + s.len() as u64,
+            KeyValue::Bytes(b) => 32 + b.len() as u64,
+            _ => 32,
+        })
+        .sum()
 }
 
 /// A column's values as each of the leaves its table holds it as holds them: the column's own where
@@ -1882,31 +2748,7 @@ fn write_order(
         .collect();
     for (bi, b) in blocks.iter().enumerate() {
         let units = &block_units[bi];
-        let given: Vec<Option<Encoded>> = match in_order.and_then(|s| {
-            s.groups
-                .iter()
-                .position(|&(first, n)| first == b.start && n == b.rows())
-                .map(|g| &s.chunks[g])
-        }) {
-            Some(chunks) => at
-                .iter()
-                .enumerate()
-                .map(|(s, &l)| {
-                    chunks[l]
-                        .as_ref()
-                        .filter(|e| {
-                            e.dictionary
-                                .as_ref()
-                                .is_none_or(|d| d.len() <= DICTIONARY_BYTES)
-                                && e.pages
-                                    .iter()
-                                    .all(|p| disk_pages(p.bytes.len()) <= units[s])
-                        })
-                        .cloned()
-                })
-                .collect(),
-            None => Vec::new(),
-        };
+        let given = given_pages(in_order, &at, b.start, b.rows(), units)?;
         let (entry, encoded, moved) = write_block(
             w,
             table,
@@ -1968,6 +2810,24 @@ fn write_order(
             columns,
         },
     ))
+}
+
+/// Each leaf's pages of the row group that is the block of `rows` rows from `start`, where they can
+/// come in as they lie, each the leaf at its place among the table's leaves `at` says.
+fn given_pages(
+    source: Option<&Source>,
+    at: &[usize],
+    start: usize,
+    rows: usize,
+    units: &[usize],
+) -> Result<Vec<Option<Encoded>>> {
+    let Some((s, g)) = source.and_then(|s| s.group_at(start, rows).map(|g| (s, g))) else {
+        return Ok(Vec::new());
+    };
+    at.iter()
+        .enumerate()
+        .map(|(i, &l)| s.pages(g, l, units[i]))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

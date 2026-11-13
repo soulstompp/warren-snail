@@ -28,7 +28,7 @@ PostgreSQL's SQL. It runs on Linux.
 usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--file-pages <n>]
                           [--release <14..19>] [--lc-monetary <locale>]
                           [--text-search-config <name>]
-                          [--written <written.parquet>] [--format <7|8>]
+                          [--written <written.parquet>] [--format <7|8>] [--room <bytes>]
        warren-snail exec <file> <statements.sql> --out <done.parquet> [--with <file>]...
                          [--host <command> --host-server <name>] [--applier <source>]
                          [--param <value>]... [--answers <dir>] [--go-on]
@@ -63,7 +63,11 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           pg_catalog.simple: a configuration the snail reads, simple or english, any other refused
           by name. --written
           records each order's columns as Parquet. --format writes the snail in format 7 or 8, as
-          warren-snail 0.1.0 or 0.1.1 made it, for the checks that hold this build to them.
+          warren-snail 0.1.0 or 0.1.1 made it, for the checks that hold this build to them. A
+          table is written one order at a time, its rows read from its files a batch at a time,
+          each block written as it closes; --room gives the rows of an order that many bytes (128
+          MB unless given), the rows past them written once and read back once. A snail of format
+          7 or 8 is written from every table's rows whole.
   exec    each statement in turn, on the snail open to write: INSERT, UPDATE and DELETE; BEGIN,
           COMMIT, ROLLBACK and SET CONSTRAINTS; READ COMMITTED, and READ UNCOMMITTED run as it,
           named by BEGIN, START TRANSACTION, SET TRANSACTION and SET SESSION CHARACTERISTICS; and
@@ -798,6 +802,12 @@ fn cmd_write(args: &[String]) -> Result<()> {
                 .map_err(|_| Error::new("--format takes a format before this build's, 7 or 8"))
         })
         .transpose()?;
+    let room = match flag(args, "--room") {
+        Some(bytes) => bytes
+            .parse()
+            .map_err(|_| Error::new("--room takes bytes"))?,
+        None => warren_snail::room::ROUND_BYTES,
+    };
     let written = write_parquet_in(
         Path::new(file),
         &catalog,
@@ -807,6 +817,7 @@ fn cmd_write(args: &[String]) -> Result<()> {
         flag(args, "--lc-monetary"),
         flag(args, "--text-search-config"),
         format,
+        room,
     )?;
     if let Some(out) = flag(args, "--written") {
         let rows: Vec<(

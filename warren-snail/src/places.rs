@@ -615,6 +615,18 @@ impl Sublevels {
         self.map.is_empty()
     }
 
+    /// Each level's sublevels, from its first to one past its last.
+    pub(crate) fn level_rungs(&self) -> Vec<(usize, usize)> {
+        let mut at = 0;
+        (0..self.levels.len())
+            .map(|i| {
+                let n = self.map.iter().filter(|m| m.0 == i).count();
+                at += n;
+                (at - n, at)
+            })
+            .collect()
+    }
+
     /// The value at sublevel `r` for a row whose levels key `key`.
     pub fn value(&self, key: &[KeyValue], r: usize) -> i64 {
         let (i, sub) = self.map[r];
