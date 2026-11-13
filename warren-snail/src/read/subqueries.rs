@@ -267,7 +267,7 @@ struct Answers {
 /// A subquery's last step read off its text once a round and, where it is an EXISTS read as the
 /// join it is, how it meets the query around it and what it met.
 struct Readied<'a> {
-    ready: relations::Ready<'a>,
+    ready: Box<relations::Ready<'a>>,
     joined: Option<relations::Joined<'a>>,
     met: RefCell<Option<Met>>,
 }
@@ -907,10 +907,13 @@ impl<'a, 'q> Subs<'a, 'q> {
             }
             Ok(())
         })?;
-        for mut a in ahead {
+        // Every row held let go before any part is met.
+        for a in ahead.iter_mut() {
             a.met.keys = HashSet::new();
             a.met.rows = HashMap::new();
             a.met.held = None;
+        }
+        for mut a in ahead {
             let theirs = a.theirs.into_parts(u64::MAX)?;
             let ours = a.asking.into_parts(u64::MAX)?;
             for ((lo, hi, t), (_, _, o)) in theirs.into_iter().zip(ours) {

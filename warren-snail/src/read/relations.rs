@@ -5701,7 +5701,7 @@ impl Once {
         asked: Asked,
         outer: &Outer,
         accrued: &Accrued,
-    ) -> Result<Ready<'_>> {
+    ) -> Result<Box<Ready<'_>>> {
         let mut casings = self.casings.clone();
         Ready::of(
             asked,
@@ -5837,7 +5837,8 @@ pub(super) struct Ready<'s> {
 
 impl<'s> Ready<'s> {
     /// `made_once` where the steps before it were made once a round, reading nothing of the query
-    /// around it.
+    /// around it. Held apart from the stack of the step that reads it, whose rows may call a
+    /// function whose body is read in turn.
     #[allow(clippy::too_many_arguments)]
     fn of(
         asked: Asked,
@@ -5849,7 +5850,7 @@ impl<'s> Ready<'s> {
         outer: Option<&Outer>,
         accrued: &Accrued,
         made_once: bool,
-    ) -> Result<Ready<'s>> {
+    ) -> Result<Box<Ready<'s>>> {
         let catalog = asked.reads.catalog();
         let (params, release, now) = (asked.params, asked.release, asked.now);
         // An aggregate of the query's around a subquery alone is that query's, wherever in the
@@ -6199,7 +6200,7 @@ impl<'s> Ready<'s> {
                 What::Made { .. } => made_once,
                 _ => false,
             });
-        Ok(Ready {
+        Ok(Box::new(Ready {
             step,
             from,
             made,
@@ -6213,7 +6214,7 @@ impl<'s> Ready<'s> {
             tied,
             shut,
             keepable,
-        })
+        }))
     }
 
     /// Whether, as a subquery's, its FROM is read once a round, whatever the rows asking.
