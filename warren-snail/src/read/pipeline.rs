@@ -5604,6 +5604,38 @@ fn eval_whole(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
                 .unwrap_or_else(|| super::image::anonymous(&fields));
             composed(ty, crate::composed::Item::Record(items))
         }
+        Expr::Function(f) if function_name(f) == super::image::ASSIGNED => {
+            let parts = parts_of(e);
+            let [column, value, subs @ ..] = parts.as_slice() else {
+                return Err(Error::new("a subscripted assignment is not read"));
+            };
+            // Each subscript read first, a NULL refused, as PostgreSQL checks them before the
+            // assignment.
+            let mut at = Vec::new();
+            let mut sliced = false;
+            for s in subs {
+                let bounds = match s {
+                    Expr::Function(g) if function_name(g) == super::image::SLICED => {
+                        sliced = true;
+                        parts_of(s)
+                    }
+                    s => vec![*s],
+                };
+                for b in bounds {
+                    match ev(b)? {
+                        Value::Null if !sliced => {
+                            return Err(Error::coded(
+                                "22004",
+                                "array subscript in assignment must not be null",
+                            ))
+                        }
+                        Value::Null => at.push(None),
+                        v => at.push(Some(int_of(&v)?)),
+                    }
+                }
+            }
+            raw_assigned(ev(column)?, ev(value)?, &at, sliced, quoted(value))?
+        }
         Expr::Function(f) => {
             let name = function_name(f);
             if name == "make_interval" {
@@ -6263,24 +6295,187 @@ fn streams(call: &Expr) -> bool {
 
 /// The output name PostgreSQL gives an item it is not told.
 pub(super) fn default_name(e: &Expr) -> String {
+    named(e).0
+}
+
+/// The name an item takes and how firmly: a column's or a call's firmly, a CASE's or a cast's type
+/// weakly, none for anything else; a cast keeps a firm name of what it casts, and gives a weak or
+/// no name way to its type's.
+fn named(e: &Expr) -> (String, u8) {
     match e {
-        Expr::Identifier(i) => ident(i),
-        Expr::CompoundIdentifier(p) => ident(p.last().unwrap()),
-        Expr::Function(f) => function_name(f),
-        Expr::Cast { expr, .. } => default_name(expr),
-        Expr::Nested(x) => default_name(x),
-        Expr::Case { .. } => "case".into(),
+        Expr::Identifier(i) => (ident(i), 2),
+        Expr::CompoundIdentifier(p) => (ident(p.last().unwrap()), 2),
+        Expr::Function(f) => (function_name(f), 2),
+        Expr::Cast {
+            expr, data_type, ..
+        } => match named(expr) {
+            (_, 0 | 1) => (type_named(data_type), 1),
+            firm => firm,
+        },
+        Expr::TypedString(t) => (type_named(&t.data_type), 1),
+        Expr::Interval(_) => ("interval".into(), 1),
+        Expr::Nested(x) => named(x),
+        Expr::Case { .. } => ("case".into(), 1),
         // A subscript or a field: the last field's name, else what it is taken from.
         Expr::CompoundFieldAccess { root, access_chain } => access_chain
             .iter()
             .rev()
             .find_map(|a| match a {
-                sqlparser::ast::AccessExpr::Dot(Expr::Identifier(i)) => Some(ident(i)),
+                sqlparser::ast::AccessExpr::Dot(Expr::Identifier(i)) => Some((ident(i), 2)),
                 _ => None,
             })
-            .unwrap_or_else(|| default_name(root)),
-        _ => "?column?".into(),
+            .unwrap_or_else(|| named(root)),
+        _ => ("?column?".into(), 0),
     }
+}
+
+/// The name a cast to a type gives its item: the type's own name in PostgreSQL's catalog for those
+/// its grammar spells in words, the last part of any other name as written.
+fn type_named(t: &sqlparser::ast::DataType) -> String {
+    use sqlparser::ast::{ArrayElemTypeDef, DataType as D, ExactNumberInfo, TimezoneInfo};
+    let zoned = |z: &TimezoneInfo| matches!(z, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz);
+    match t {
+        D::Int(_) | D::Integer(_) | D::Int4(_) => "int4".into(),
+        D::SmallInt(_) | D::Int2(_) => "int2".into(),
+        D::BigInt(_) | D::Int8(_) => "int8".into(),
+        D::Real | D::Float4 => "float4".into(),
+        D::Double(_) | D::DoublePrecision | D::Float8 => "float8".into(),
+        D::Float(ExactNumberInfo::Precision(p) | ExactNumberInfo::PrecisionAndScale(p, _))
+            if *p <= 24 =>
+        {
+            "float4".into()
+        }
+        D::Float(_) => "float8".into(),
+        D::Bool | D::Boolean => "bool".into(),
+        D::Numeric(_) | D::Decimal(_) | D::Dec(_) => "numeric".into(),
+        D::Char(_) | D::Character(_) => "bpchar".into(),
+        D::Varchar(_) | D::CharacterVarying(_) | D::CharVarying(_) => "varchar".into(),
+        D::Timestamp(_, z) if zoned(z) => "timestamptz".into(),
+        D::Timestamp(..) => "timestamp".into(),
+        D::Time(_, z) if zoned(z) => "timetz".into(),
+        D::Time(..) => "time".into(),
+        D::BitVarying(_) | D::VarBit(_) => "varbit".into(),
+        D::Array(
+            ArrayElemTypeDef::SquareBracket(e, _)
+            | ArrayElemTypeDef::AngleBracket(e)
+            | ArrayElemTypeDef::Parenthesis(e)
+            | ArrayElemTypeDef::Qualified(e, _),
+        ) => type_named(e),
+        D::Custom(name, _) => match name.0.last() {
+            Some(ObjectNamePart::Identifier(i)) => ident(i),
+            _ => name.to_string().to_lowercase(),
+        },
+        t => {
+            let written = t.to_string().to_lowercase();
+            written
+                .split(['(', ' ', '['])
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        }
+    }
+}
+
+/// A subscript read as an integer.
+fn int_of(v: &Value) -> Result<i64> {
+    match v {
+        Value::Int(i) if i32::try_from(*i).is_ok() => Ok(*i),
+        Value::Int(_) => Err(Error::new("integer out of range")),
+        v => match part_value(ColumnType::Int4, &part_of(ColumnType::Int4, v.clone(), false)?) {
+            Value::Int(i) => Ok(i),
+            _ => Err(Error::coded("42804", "array subscript must have type integer")),
+        },
+    }
+}
+
+/// A value of a fixed-length type with one element assigned, as PostgreSQL's raw subscripting
+/// assigns it: the value as it is where it or what is assigned is NULL; the element taken by its
+/// type's assignment, `quoted` read by its input; one subscript, within the elements; no slice.
+fn raw_assigned(
+    container: Value,
+    value: Value,
+    at: &[Option<i64>],
+    sliced: bool,
+    quoted: bool,
+) -> Result<Value> {
+    use crate::geo::{Geo, GeoKind, Point};
+    if matches!(container, Value::Null) || matches!(value, Value::Null) {
+        return Ok(container);
+    }
+    let Some(mut elements) = raw_elements(&container) else {
+        return Err(Error::coded(
+            "42804",
+            format!(
+                "cannot subscript type {} because it does not support subscripting",
+                kind_name(&container)
+            ),
+        ));
+    };
+    // A slice is assigned a value of the type itself.
+    if sliced {
+        let own = match &container {
+            Value::Geometric(g) => ColumnType::Geometric(g.kind()),
+            _ => ColumnType::Name,
+        };
+        part_of(own, value, quoted)?;
+        return Err(Error::coded(
+            "0A000",
+            "updates on slices of fixed-length arrays not implemented",
+        ));
+    }
+    let element = match &container {
+        Value::Geometric(Geo::Point(_) | Geo::Line(_)) => ColumnType::Float8,
+        Value::Str(..) => ColumnType::Char,
+        _ => ColumnType::Geometric(GeoKind::Point),
+    };
+    let value = part_value(element, &part_of(element, value, quoted)?);
+    let [Some(i)] = at else {
+        return Err(Error::coded("2202E", "wrong number of array subscripts"));
+    };
+    let i = usize::try_from(*i)
+        .ok()
+        .filter(|&i| i < elements.len())
+        .ok_or_else(|| Error::coded("2202E", "array subscript out of range"))?;
+    elements[i] = value;
+    let double = |v: &Value| match v {
+        Value::Double(d) => *d,
+        _ => f64::NAN,
+    };
+    let point = |v: &Value| match v {
+        Value::Geometric(Geo::Point(p)) => *p,
+        _ => Point { x: f64::NAN, y: f64::NAN },
+    };
+    Ok(match container {
+        Value::Geometric(Geo::Point(_)) => Value::Geometric(Geo::Point(Point {
+            x: double(&elements[0]),
+            y: double(&elements[1]),
+        })),
+        Value::Geometric(Geo::Line(_)) => Value::Geometric(Geo::Line(crate::geo::Line {
+            a: double(&elements[0]),
+            b: double(&elements[1]),
+            c: double(&elements[2]),
+        })),
+        Value::Geometric(Geo::Lseg(_)) => Value::Geometric(Geo::Lseg(crate::geo::Lseg {
+            p: [point(&elements[0]), point(&elements[1])],
+        })),
+        Value::Geometric(Geo::Box(_)) => Value::Geometric(Geo::Box(crate::geo::GeoBox {
+            high: point(&elements[0]),
+            low: point(&elements[1]),
+        })),
+        Value::Str(ty, _) => {
+            // A name's bytes up to the first that is none.
+            let bytes: Vec<u8> = elements
+                .iter()
+                .map(|e| match e {
+                    Value::Scalar(_, k) => crate::scalars::unsigned_of(*k, 8) as u8,
+                    _ => 0,
+                })
+                .take_while(|&b| b != 0)
+                .collect();
+            Value::Str(ty, String::from_utf8_lossy(&bytes).into_owned())
+        }
+        other => other,
+    })
 }
 
 /// The elements a value of a fixed-length type is subscripted by, from 0, as PostgreSQL's raw

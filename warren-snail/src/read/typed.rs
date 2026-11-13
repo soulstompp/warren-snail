@@ -371,6 +371,71 @@ impl Typing<'_> {
         }
     }
 
+    /// A subscripted column's assignment (`image::ASSIGNED`), its column's type: the value taken by
+    /// assignment as an element of a type PostgreSQL subscripts from 0, or as the type itself for a
+    /// slice; each subscript an integer.
+    fn assigned(&mut self, parts: Vec<&Expr>) -> Result<Option<ColumnType>> {
+        let [column, value, subs @ ..] = parts.as_slice() else {
+            return Ok(None);
+        };
+        let ty = self.type_of(column)?;
+        let given = self.type_of(value)?;
+        let mut sliced = false;
+        for s in subs {
+            let bounds = match s {
+                Expr::Function(f) if super::pipeline::function_name(f) == super::image::SLICED => {
+                    sliced = true;
+                    super::pipeline::parts_of(s)
+                }
+                s => vec![*s],
+            };
+            for b in bounds {
+                match self.type_of(b)? {
+                    Some(t) if !t.is_integer() && !crate::catalog::assignable(t, ColumnType::Int4) => {
+                        return Err(Error::coded("42804", "array subscript must have type integer"))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let Some(ty) = ty else {
+            return Ok(None);
+        };
+        let named = super::pipeline::column_of(column).map(|(_, n)| n).unwrap_or_default();
+        let wanted = match (raw_element_of(ty), element_of(ty)) {
+            (Some(el), _) => match sliced {
+                true => ty,
+                false => el,
+            },
+            (None, Some(_)) => {
+                return Err(Error::new(format!(
+                    "an element of the array \"{named}\" assigned is not read"
+                )))
+            }
+            (None, None) => {
+                return Err(Error::coded(
+                    "42804",
+                    format!(
+                        "cannot subscript type {} because it does not support subscripting",
+                        type_name(ty)
+                    ),
+                ))
+            }
+        };
+        if let Some(g) = given.filter(|&g| g != wanted && !crate::catalog::assignable(g, wanted)) {
+            return Err(Error::coded(
+                "42804",
+                format!(
+                    "subscripted assignment to \"{named}\" requires type {} but expression is of \
+                     type {}\nHINT:  You will need to rewrite or cast the expression.",
+                    type_name(wanted),
+                    type_name(g)
+                ),
+            ));
+        }
+        Ok(Some(ty))
+    }
+
     fn resolve(&mut self, e: &Expr) -> Result<Option<ColumnType>> {
         Ok(match e {
             // A scalar subquery's type is its column's, given before the step is typed; EXISTS, and
@@ -856,6 +921,9 @@ impl Typing<'_> {
                 super::image::field_types(&parts, &types)
                     .map(|f| super::image::anonymous_of(&f, &domains))
             }
+            Expr::Function(f) if super::pipeline::function_name(f) == super::image::ASSIGNED => {
+                self.assigned(super::pipeline::parts_of(e))?
+            }
             Expr::Function(f) => {
                 let name = super::pipeline::function_name(f);
                 // GROUPING (…): an integer, a bit for each argument.
@@ -1213,7 +1281,19 @@ fn aggregate(name: &str, args: &[Option<ColumnType>], star: bool) -> Result<Opti
             | ColumnType::Xid
             | ColumnType::Cid
             | ColumnType::Bit(_)
-            | ColumnType::Varbit(_) => return refused(),
+            | ColumnType::Varbit(_)
+            | ColumnType::Macaddr
+            | ColumnType::Macaddr8
+            | ColumnType::Geometric(_)
+            | ColumnType::Textual(
+                crate::textual::Textual::Json
+                | crate::textual::Textual::Jsonb
+                | crate::textual::Textual::Jsonpath
+                | crate::textual::Textual::Xml
+                | crate::textual::Textual::Tsvector
+                | crate::textual::Textual::Tsquery
+                | crate::textual::Textual::Aclitem,
+            ) => return refused(),
             // An array or a row of a type with no order is refused only where two are compared.
             ColumnType::Composed(r)
                 if matches!(

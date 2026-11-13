@@ -1348,6 +1348,92 @@ fn read_whole(q: &Query) -> bool {
         || !q.locks.is_empty()
 }
 
+/// An INSERT's question with each star of its SELECTs written as the columns it stands for, as
+/// PostgreSQL's parser writes it out: `*` every column of each table its FROM names, in turn,
+/// `t.*` those of the one table; none where a star stands over anything but the file's tables.
+fn stars_named(catalog: &Catalog, q: &Query) -> Option<Query> {
+    fn body(catalog: &Catalog, b: &mut SetExpr, changed: &mut bool) -> Option<()> {
+        match b {
+            SetExpr::SetOperation { left, right, .. } => {
+                body(catalog, left, changed)?;
+                body(catalog, right, changed)
+            }
+            SetExpr::Query(q) => body(catalog, &mut q.body, changed),
+            SetExpr::Select(s) => {
+                let starred = |i: &SelectItem| {
+                    matches!(i, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..))
+                };
+                if !s.projection.iter().any(starred) {
+                    return Some(());
+                }
+                // Each table of its FROM, by the name it goes by, and its columns.
+                let mut tables: Vec<(String, Vec<String>)> = Vec::new();
+                for t in &s.from {
+                    for f in std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)) {
+                        let TableFactor::Table {
+                            name, alias, args: None, ..
+                        } = f
+                        else {
+                            return None;
+                        };
+                        let ti = table_index(catalog, name).ok()?;
+                        let columns: Vec<String> = catalog.tables[ti]
+                            .own_columns()
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .collect();
+                        if alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
+                            return None;
+                        }
+                        let by = match alias {
+                            Some(a) => crate::catalog::ident(&a.name),
+                            None => crate::catalog::object_name(name),
+                        };
+                        tables.push((by, columns));
+                    }
+                }
+                let item = |by: &str, c: &str| {
+                    let by = by.rsplit('.').next().unwrap_or(by);
+                    SelectItem::UnnamedExpr(Expr::CompoundIdentifier(vec![
+                        Ident::with_quote('"', by),
+                        Ident::with_quote('"', c),
+                    ]))
+                };
+                let mut out = Vec::new();
+                for i in std::mem::take(&mut s.projection) {
+                    match i {
+                        SelectItem::Wildcard(o) if o == Default::default() => {
+                            for (by, columns) in &tables {
+                                out.extend(columns.iter().map(|c| item(by, c)));
+                            }
+                        }
+                        SelectItem::QualifiedWildcard(
+                            sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(n),
+                            o,
+                        ) if o == Default::default() => {
+                            let named = crate::catalog::object_name(&n);
+                            let (by, columns) = tables.iter().find(|(by, _)| {
+                                *by == named || by.rsplit('.').next() == Some(named.as_str())
+                            })?;
+                            out.extend(columns.iter().map(|c| item(by, c)));
+                        }
+                        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => return None,
+                        other => out.push(other),
+                    }
+                }
+                s.projection = out;
+                *changed = true;
+                Some(())
+            }
+            _ => Some(()),
+        }
+    }
+    let mut q = q.clone();
+    let mut changed = false;
+    body(catalog, &mut q.body, &mut changed)?;
+    changed.then_some(q)
+}
+
 /// A question in parentheses with nothing outside them, or nothing inside them but its body, as
 /// the question it holds, with the clauses written outside.
 fn bare(q: &Query) -> Option<Query> {
@@ -1570,6 +1656,14 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
         Some(b) => {
             unwrapped = b;
             &unwrapped
+        }
+        None => q,
+    };
+    let starred;
+    let q = match stars_named(catalog, q) {
+        Some(s) => {
+            starred = s;
+            &starred
         }
         None => q,
     };

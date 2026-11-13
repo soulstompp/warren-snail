@@ -5673,6 +5673,245 @@ fn at_at_and_a_prefix_at_written_apart_are_two_operators() {
 }
 
 #[test]
+fn an_operator_no_form_takes_beside_a_literal_of_no_type_is_refused_before_the_literal_is_read() {
+    let mut w = snail("unknown-beside");
+    let none = |l: &str, op: &str, r: &str| {
+        (
+            Some("42883"),
+            format!(
+                "operator does not exist: {l} {op} {r}\nHINT:  No operator matches the given name \
+                 and argument types. You might need to add explicit type casts."
+            ),
+        )
+    };
+    for (sql, want) in [
+        ("SELECT 'a' @@ @ '1'", none("unknown", "@@", "double precision")),
+        ("SELECT 'a' @@ (@ '1')", none("unknown", "@@", "double precision")),
+        ("SELECT 'a' @@ 1", none("unknown", "@@", "integer")),
+        ("SELECT '1' ~~ 1", none("unknown", "~~", "integer")),
+        ("SELECT g FROM dn.a WHERE 'x' @@ @ g", none("unknown", "@@", "integer")),
+        // Where a form takes the other side's type, the literal is read by it.
+        (
+            "SELECT 'a' + 1",
+            (Some("22P02"), "invalid input syntax for type integer: \"a\"".into()),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), want, "{sql}");
+    }
+}
+
+/// A snail holding gx.g's five types PostgreSQL subscripts from 0, at a path of the test's name.
+fn raw_typed(name: &str) -> Snail {
+    let path = tmp(&format!("reader-{name}.snail"));
+    let ddl = "CREATE SCHEMA gx;
+         CREATE TABLE gx.g (id integer PRIMARY KEY, p point, b box, l lseg, ln line, n name);";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute(
+        "INSERT INTO gx.g VALUES (1, '(3,4)', '(1,2),(3,4)', '[(1,2),(5,6)]', '{1,2,3}', 'abc'), \
+         (2, '(1,9)', '(0,0),(2,2)', '[(0,0),(1,1)]', '{1,-1,0}', 'de'), \
+         (3, NULL, NULL, NULL, NULL, NULL), \
+         (4, '(2,-1)', '(5,5),(6,7)', '[(9,9),(8,8)]', '{0,1,5}', 'z')",
+    )
+    .unwrap();
+    w
+}
+
+#[test]
+fn a_fixed_length_type_s_subscript_is_assigned_as_its_element() {
+    let mut w = raw_typed("raw-assigned");
+    // Each write in a transaction rolled back, and the rows it leaves read in it.
+    let mut after = |write: &str, read: &str| -> Result<Vec<String>, (Option<&'static str>, String)> {
+        w.execute("BEGIN").unwrap();
+        let got = w
+            .execute(write)
+            .map_err(|e| (e.sqlstate(), e.to_string()))
+            .and_then(|d| match d.answer {
+                Some(b) if read.is_empty() => Ok(w
+                    .text_of(&b)
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| {
+                        r.into_iter()
+                            .map(|v| v.unwrap_or_else(|| "NULL".into()))
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    })
+                    .collect()),
+                _ => Ok(rows(&mut w, read)),
+            });
+        w.execute("ROLLBACK").unwrap();
+        got
+    };
+    let p = "SELECT id, p FROM gx.g ORDER BY id";
+    let ok = |r: &[&str]| Ok(r.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    for (write, read, want) in [
+        ("UPDATE gx.g SET p[0] = 10 WHERE id = 1", p, ok(&["1|(10,4)", "2|(1,9)", "3|NULL", "4|(2,-1)"])),
+        ("UPDATE gx.g SET p[1] = p[0] + 1", p, ok(&["1|(3,4)", "2|(1,2)", "3|NULL", "4|(2,3)"])),
+        // A NULL value, or a NULL column, leaves the column as it is.
+        ("UPDATE gx.g SET p[0] = NULL WHERE id = 1", "SELECT p FROM gx.g WHERE id = 1", ok(&["(3,4)"])),
+        ("UPDATE gx.g SET p[0] = 5 WHERE id = 3", "SELECT p FROM gx.g WHERE id = 3", ok(&["NULL"])),
+        ("UPDATE gx.g SET b[0] = point '(9,9)' WHERE id = 1", "SELECT b FROM gx.g WHERE id = 1", ok(&["(9,9),(1,2)"])),
+        ("UPDATE gx.g SET l[1] = point '(0,0)' WHERE id = 1", "SELECT l FROM gx.g WHERE id = 1", ok(&["[(1,2),(0,0)]"])),
+        ("UPDATE gx.g SET ln[2] = 5 WHERE id = 1", "SELECT ln FROM gx.g WHERE id = 1", ok(&["{1,2,5}"])),
+        ("UPDATE gx.g SET n[0] = 'Z' WHERE id = 1", "SELECT n FROM gx.g WHERE id = 1", ok(&["Zbc"])),
+        ("UPDATE gx.g SET n[1] = 'xy' WHERE id = 1", "SELECT n FROM gx.g WHERE id = 1", ok(&["axc"])),
+        ("UPDATE gx.g SET p[0] = 1, p[1] = 2 WHERE id = 4", "SELECT p FROM gx.g WHERE id = 4", ok(&["(1,2)"])),
+        ("UPDATE gx.g SET p[0] = 2.5::real WHERE id = 1", "SELECT p FROM gx.g WHERE id = 1", ok(&["(2.5,4)"])),
+        ("UPDATE gx.g g SET p[1] = 7 WHERE g.id = 2", "SELECT p FROM gx.g WHERE id = 2", ok(&["(1,7)"])),
+        ("UPDATE gx.g SET p [ 0 ] = 8 WHERE id = 2", "SELECT p FROM gx.g WHERE id = 2", ok(&["(8,9)"])),
+        ("UPDATE gx.g SET \"p\"[0] = 8 WHERE id = 2", "SELECT p FROM gx.g WHERE id = 2", ok(&["(8,9)"])),
+        ("UPDATE gx.g SET p[id - 1] = 100 WHERE id < 3 RETURNING id, p", "", ok(&["1|(100,4)", "2|(1,100)"])),
+        ("UPDATE gx.g SET p[0] = 1 WHERE id = 1 RETURNING p[0], p", "", ok(&["1|(1,4)"])),
+        (
+            "INSERT INTO gx.g (id, p) VALUES (1, '(0,0)') ON CONFLICT (id) DO UPDATE SET p[0] = excluded.p[0] + 50",
+            "SELECT p FROM gx.g WHERE id = 1",
+            ok(&["(50,4)"]),
+        ),
+        // Refused as 18.6 refuses each.
+        ("UPDATE gx.g SET p[2] = 1 WHERE id = 1", "", Err((Some("2202E"), "array subscript out of range".into()))),
+        ("UPDATE gx.g SET p[-1] = 1 WHERE id = 1", "", Err((Some("2202E"), "array subscript out of range".into()))),
+        (
+            "UPDATE gx.g SET p[NULL] = 2 WHERE id = 1",
+            "",
+            Err((Some("22004"), "array subscript in assignment must not be null".into())),
+        ),
+        (
+            "UPDATE gx.g SET b[0][0] = 7 WHERE id = 1",
+            "",
+            Err((
+                Some("42804"),
+                "subscripted assignment to \"b\" requires type point but expression is of type integer\n\
+                 HINT:  You will need to rewrite or cast the expression."
+                    .into(),
+            )),
+        ),
+        (
+            "UPDATE gx.g SET p[0] = 'x' WHERE id = 1",
+            "",
+            Err((Some("22P02"), "invalid input syntax for type double precision: \"x\"".into())),
+        ),
+        (
+            "UPDATE gx.g SET p[0:1] = '{1,2}' WHERE id = 1",
+            "",
+            Err((Some("22P02"), "invalid input syntax for type point: \"{1,2}\"".into())),
+        ),
+        (
+            "UPDATE gx.g SET id[0] = 1 WHERE id = 1",
+            "",
+            Err((
+                Some("42804"),
+                "cannot subscript type integer because it does not support subscripting".into(),
+            )),
+        ),
+        (
+            "UPDATE gx.g SET nosuch[0] = 1 WHERE id = 1",
+            "",
+            Err((Some("42703"), "column \"nosuch\" of relation \"g\" does not exist".into())),
+        ),
+        (
+            "UPDATE gx.g SET p[0] = 1, p = point '(5,5)' WHERE id = 4",
+            "",
+            Err((Some("42601"), "multiple assignments to same column \"p\"".into())),
+        ),
+    ] {
+        assert_eq!(after(write, read), want, "{write}");
+    }
+}
+
+#[test]
+fn an_aggregate_with_no_form_for_its_argument_s_type_is_refused_as_18_6_refuses_it() {
+    let mut w = raw_typed("no-form");
+    let none = |f: &str, t: &str| {
+        (
+            Some("42883"),
+            format!(
+                "function {f}({t}) does not exist\nHINT:  No function matches the given name and \
+                 argument types. You might need to add explicit type casts."
+            ),
+        )
+    };
+    for (sql, want) in [
+        ("SELECT max(b[1][0]) FROM gx.g", none("max", "point")),
+        ("SELECT max(p) FROM gx.g", none("max", "point")),
+        ("SELECT min(b[0]) FROM gx.g", none("min", "point")),
+        ("SELECT sum(p) FROM gx.g", none("sum", "point")),
+        ("SELECT min(p) OVER () FROM gx.g", none("min", "point")),
+    ] {
+        assert_eq!(refused(&mut w, sql), want, "{sql}");
+    }
+    answered(
+        &mut w,
+        &[
+            ("SELECT max(p[0]), count(b[0]) FROM gx.g", &["3|3"]),
+            ("SELECT max(b[0]::text) FROM gx.g", &["(6,7)"]),
+        ],
+    );
+}
+
+#[test]
+fn a_cast_with_no_name_of_its_own_names_its_item_by_its_type() {
+    let mut w = raw_typed("cast-names");
+    for (sql, names) in [
+        (
+            "SELECT (point '(7,8)')[1], ('(7,8)'::point)[0], (CAST('(7,8)' AS point))[1], (box '(1,2),(3,4)')[0]",
+            vec!["point", "point", "point", "box"],
+        ),
+        (
+            "SELECT '1'::integer, 1::text, CAST(2 AS bigint), interval '1 day', 'a'::varchar(3), \
+             1::double precision, 2::real, 3::smallint, 4::numeric(5,2), true::boolean, 'x'::char(2)",
+            vec!["int4", "text", "int8", "interval", "varchar", "float8", "float4", "int2", "numeric", "bool", "bpchar"],
+        ),
+        (
+            "SELECT x::text, (x + 1)::text, CASE WHEN true THEN 1 END::text, '1'::int::text, \
+             '{1}'::int[], 1::float(10), '10:00'::time with time zone FROM (SELECT 1 AS x) s",
+            vec!["x", "text", "text", "text", "int4", "float4", "timetz"],
+        ),
+        ("SELECT (p)[0], (g.p)[1] FROM gx.g g WHERE id = 1", vec!["p", "p"]),
+    ] {
+        let b = w.execute(sql).unwrap().answer.unwrap();
+        let schema = b.schema();
+        let got: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(got, names, "{sql}");
+    }
+}
+
+#[test]
+fn table_is_a_question_and_an_insert_s_rows() {
+    let mut w = snail("table");
+    let all = ["1|10|x|one", "2|20|y|two", "3|10|x|three", "4|20|x|four", "5|30|y|five", "6|NULL|NULL|six", "7|NULL|NULL|seven"];
+    answered(
+        &mut w,
+        &[
+            ("TABLE dn.a", &all),
+            ("TABLE dn.a ORDER BY id DESC LIMIT 2", &["7|NULL|NULL|seven", "6|NULL|NULL|six"]),
+            ("table dn.a order by id limit 1", &["1|10|x|one"]),
+            ("TABLE dn.a LIMIT 1 OFFSET 1", &["2|20|y|two"]),
+            ("SELECT * FROM (TABLE dn.b) q WHERE v > 300 ORDER BY id", &["5|5|500", "6|5|600"]),
+            ("WITH c AS (TABLE dn.b) SELECT count(*) FROM c", &["6"]),
+            ("WITH c AS (SELECT 1 AS a) TABLE c", &["1"]),
+            ("SELECT EXISTS (TABLE dn.b)", &["t"]),
+            ("SELECT count(*) FROM (TABLE dn.b UNION ALL TABLE dn.b) u", &["12"]),
+            ("(TABLE dn.b) EXCEPT (SELECT 1, 1, 100) ORDER BY 1 LIMIT 1", &["2|1|50"]),
+            ("SELECT id FROM dn.b WHERE (id, a_id, v) IN (TABLE dn.b) AND v > 400 ORDER BY 1", &["5", "6"]),
+            ("SELECT 1 AS table", &["1"]),
+        ],
+    );
+    assert_eq!(
+        refused(&mut w, "TABLE dn.nosuch"),
+        (Some("42P01"), "relation \"dn.nosuch\" does not exist".into())
+    );
+    // An INSERT's rows.
+    w.execute("BEGIN").unwrap();
+    w.execute("CREATE TABLE dn.c (id integer NOT NULL, a_id integer NOT NULL, v integer, PRIMARY KEY (id))")
+        .unwrap();
+    w.execute("INSERT INTO dn.c TABLE dn.b").unwrap();
+    w.execute("INSERT INTO dn.c (id, a_id, v) SELECT id + 10, a_id, v FROM dn.b").unwrap();
+    answered(&mut w, &[("SELECT count(*), sum(v) FROM dn.c", &["12|3100"])]);
+    w.execute("ROLLBACK").unwrap();
+}
+
+#[test]
 fn an_arm_s_sorted_literal_is_text_before_its_set_operation_is_typed() {
     let mut w = snail("sorted-literal");
     let unmatched = |op: &str, a: &str, b: &str| {

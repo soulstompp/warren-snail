@@ -1303,6 +1303,10 @@ impl From<'_> {
                 {
                     Ok(Some(Item::Sum(Col { side, column })))
                 }
+                (side, Shape::Column(column)) => Err(super::typed::no_form(
+                    &name,
+                    &[Some(self.table(side).columns[column].ty)],
+                )),
                 _ => Err(Error::new(format!(
                     "{e}: sum is read over an integer, numeric or money column"
                 ))),
@@ -1388,21 +1392,18 @@ impl From<'_> {
                             Item::Greatest(col)
                         }))
                     }
-                    ColumnType::Textual(_) | ColumnType::Internal(_) => Err(Error::new(format!(
-                        "function {name}({}) does not exist",
-                        ty.pg_name()
-                    ))),
-                    ColumnType::Boolean
+                    ColumnType::Textual(_)
+                    | ColumnType::Internal(_)
+                    | ColumnType::Boolean
                     | ColumnType::Uuid
                     | ColumnType::Xid
                     | ColumnType::Cid
                     | ColumnType::Bit(_)
                     | ColumnType::Varbit(_)
-                    | ColumnType::Composed(_) => Err(Error::new(format!(
-                        "function {name}({}) does not exist",
-                        ty.pg_name().split('(').next().unwrap_or_default()
-                    ))),
-                    _ => Err(Error::new(format!("{e} is not read"))),
+                    | ColumnType::Macaddr
+                    | ColumnType::Macaddr8
+                    | ColumnType::Geometric(_)
+                    | ColumnType::Composed(_) => Err(super::typed::no_form(&name, &[Some(ty)])),
                 }
             }
             _ => Err(Error::new(format!("{e} is not read"))),

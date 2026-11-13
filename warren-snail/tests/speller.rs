@@ -2337,7 +2337,7 @@ fn pg_prepared_statements_holds_the_sessions_statements_as_postgresql_shows_them
     );
     // A statement whose types were not settled as PostgreSQL's parse analysis settles them refuses
     // the view while the session holds it, never answered with a guess.
-    run(&mut w, "PREPARE z AS TABLE s.t");
+    run(&mut w, "PREPARE z AS SELECT (t).* FROM s.t t");
     assert_eq!(
         refused(&mut w, "SELECT name FROM pg_prepared_statements"),
         (

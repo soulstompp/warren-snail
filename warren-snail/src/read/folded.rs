@@ -182,10 +182,29 @@ fn types_a_literal(st: &Statement) -> bool {
 }
 
 /// A refusal of the statement's analysis that is 18.6's parser's: a literal its type's input
-/// refuses (a data exception), or a cast of no path.
+/// refuses (a data exception), a cast of no path, or an operator no form takes of a literal of no
+/// type before a number or a truth, which 18.6 refuses before it reads the literal by the other
+/// side's type.
 fn analyzed_refusal(e: &crate::Error) -> bool {
+    const PLAIN: [&str; 7] = [
+        "double precision",
+        "real",
+        "numeric",
+        "bigint",
+        "integer",
+        "smallint",
+        "boolean",
+    ];
+    let beside_unknown = || {
+        let first = e.to_string();
+        let first = first.lines().next().unwrap_or_default();
+        first
+            .strip_prefix("operator does not exist: unknown ")
+            .and_then(|rest| rest.split_once(' '))
+            .is_some_and(|(op, right)| op != "||" && PLAIN.contains(&right))
+    };
     e.sqlstate()
-        .is_some_and(|s| s.starts_with("22") || s == "42846")
+        .is_some_and(|s| s.starts_with("22") || s == "42846" || s == "42883" && beside_unknown())
 }
 
 /// Whether a statement holds an expression computed of constants alone: none, and nothing is

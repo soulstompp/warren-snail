@@ -46,6 +46,12 @@ fn written_bang(sql: &str, t: &TokenWithSpan) -> bool {
 /// read as its whole row (`star_cast`, `star_operated`).
 pub(crate) fn tokens(sql: &str) -> std::result::Result<Vec<TokenWithSpan>, TokenizerError> {
     let mut tokens = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize_with_location()?;
+    if sql.len() > 5 && sql.to_ascii_lowercase().contains("table") {
+        tokens = table_queries(tokens);
+    }
+    if sql.contains('[') && sql.to_ascii_lowercase().contains("set") {
+        tokens = subscripts_assigned(tokens)?;
+    }
     if sql.contains(".*") && sql.contains("::") {
         tokens = star_cast(tokens);
     }
@@ -80,6 +86,376 @@ pub(crate) fn tokens(sql: &str) -> std::result::Result<Vec<TokenWithSpan>, Token
         }
     }
     Ok(over_arrays(out))
+}
+
+/// Each `TABLE name` that begins a query, read as PostgreSQL's grammar reads it, `SELECT * FROM
+/// name`: a statement's own, one in parentheses, an arm of a set operation, the question after a
+/// WITH's queries, and an INSERT's rows. sqlparser reads `TABLE` itself three tokens at a time, the
+/// name's quotes lost.
+fn table_queries(mut t: Vec<TokenWithSpan>) -> Vec<TokenWithSpan> {
+    let solid: Vec<usize> = (0..t.len())
+        .filter(|&i| !matches!(t[i].token, Token::Whitespace(_)))
+        .collect();
+    let word = |i: usize, k: Keyword| matches!(&t[i].token, Token::Word(w) if w.quote_style.is_none() && w.keyword == k);
+    // The place among `solid` of the parenthesis that opens the one closing at `at`.
+    let opening = |at: usize| -> Option<usize> {
+        let mut depth = 0usize;
+        for j in (0..=at).rev() {
+            match t[solid[j]].token {
+                Token::RParen => depth += 1,
+                Token::LParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    // Whether what stands before `at` (exclusive) back to an INSERT's INTO is its target: names, an
+    // alias, a column list and OVERRIDING … VALUE.
+    let after_insert_target = |at: usize| -> bool {
+        let mut j = at;
+        while j > 0 {
+            j -= 1;
+            let i = solid[j];
+            match &t[i].token {
+                Token::RParen => match opening(j) {
+                    Some(o) => j = o,
+                    None => return false,
+                },
+                Token::Word(_) if word(i, Keyword::INTO) => {
+                    return j > 0 && word(solid[j - 1], Keyword::INSERT);
+                }
+                Token::Word(w)
+                    if w.quote_style.is_some()
+                        || !matches!(
+                            w.keyword,
+                            Keyword::SELECT
+                                | Keyword::VALUES
+                                | Keyword::FROM
+                                | Keyword::WHERE
+                                | Keyword::SET
+                                | Keyword::TABLE
+                        ) => {}
+                Token::Period => {}
+                _ => return false,
+            }
+        }
+        false
+    };
+    let mut starts = Vec::new();
+    for (j, &i) in solid.iter().enumerate() {
+        if !word(i, Keyword::TABLE)
+            || !solid
+                .get(j + 1)
+                .is_some_and(|&n| matches!(t[n].token, Token::Word(_)))
+        {
+            continue;
+        }
+        let begins = match j.checked_sub(1).map(|p| (p, solid[p])) {
+            None => true,
+            Some((_, p)) if matches!(t[p].token, Token::LParen | Token::SemiColon) => true,
+            Some((_, p))
+                if [Keyword::UNION, Keyword::INTERSECT, Keyword::EXCEPT]
+                    .into_iter()
+                    .any(|k| word(p, k)) =>
+            {
+                true
+            }
+            Some((pj, p)) if word(p, Keyword::ALL) || word(p, Keyword::DISTINCT) => pj
+                .checked_sub(1)
+                .is_some_and(|q| {
+                    [Keyword::UNION, Keyword::INTERSECT, Keyword::EXCEPT]
+                        .into_iter()
+                        .any(|k| word(solid[q], k))
+                }),
+            Some((pj, p)) if matches!(t[p].token, Token::RParen) => {
+                // A WITH query's body closes before it, or an INSERT's column list.
+                let cte = opening(pj).and_then(|o| o.checked_sub(1)).is_some_and(|b| {
+                    word(solid[b], Keyword::AS) || word(solid[b], Keyword::MATERIALIZED)
+                });
+                cte || after_insert_target(j)
+            }
+            Some(_) => after_insert_target(j),
+        };
+        if begins {
+            starts.push(i);
+        }
+    }
+    for i in starts.into_iter().rev() {
+        let span = t[i].span;
+        let made = |token: Token| TokenWithSpan::new(token, span);
+        let keyword = |value: &str, keyword: Keyword| {
+            Token::Word(Word {
+                value: value.into(),
+                quote_style: None,
+                keyword,
+            })
+        };
+        let space = || Token::Whitespace(sqlparser::tokenizer::Whitespace::Space);
+        t.splice(
+            i..=i,
+            [
+                made(keyword("SELECT", Keyword::SELECT)),
+                made(space()),
+                made(Token::Mul),
+                made(space()),
+                made(keyword("FROM", Keyword::FROM)),
+            ],
+        );
+    }
+    t
+}
+
+/// The name of the call an UPDATE's subscripted assignment is read as: the column, the value, then
+/// each subscript, or a slice's bounds inside a call of `SLICED`.
+pub(super) const ASSIGNED: &str = "\u{3}assigned";
+pub(super) const SLICED: &str = "\u{3}sliced";
+
+/// Each subscripted column an UPDATE's SET, or ON CONFLICT DO UPDATE's, assigns, read as PostgreSQL
+/// reads it, the column given the value the assignment makes of it: `SET p[0] = 1` as `SET p =
+/// ASSIGNED(p, 1, 0)`, and the assignments to one column, in their order, as one (`SET p[0] = 1, p[1]
+/// = 2` as `SET p = ASSIGNED(ASSIGNED(p, 1, 0), 2, 1)`). sqlparser reads no subscript there.
+fn subscripts_assigned(t: Vec<TokenWithSpan>) -> std::result::Result<Vec<TokenWithSpan>, TokenizerError> {
+    let solid: Vec<usize> = (0..t.len())
+        .filter(|&i| !matches!(t[i].token, Token::Whitespace(_)))
+        .collect();
+    let word = |i: usize, k: Keyword| matches!(&t[i].token, Token::Word(w) if w.quote_style.is_none() && w.keyword == k);
+    let text = |from: usize, to: usize| -> String {
+        t[from..to].iter().map(|x| x.token.to_string()).collect()
+    };
+    // The name the table a write names goes by, its name read from `at` among `solid`: its alias,
+    // else the last part of its name.
+    let target = |mut at: usize| -> Option<String> {
+        if solid.get(at).is_some_and(|&i| word(i, Keyword::ONLY)) {
+            at += 1;
+        }
+        let mut last = None;
+        while let Some(&i) = solid.get(at) {
+            let Token::Word(_) = &t[i].token else { break };
+            last = Some(t[i].token.to_string());
+            if solid.get(at + 1).is_some_and(|&p| t[p].token == Token::Period) {
+                at += 2;
+            } else {
+                at += 1;
+                break;
+            }
+        }
+        if solid.get(at).is_some_and(|&i| t[i].token == Token::Mul) {
+            at += 1;
+        }
+        match solid.get(at) {
+            Some(&i) if word(i, Keyword::AS) => solid.get(at + 1).map(|&a| t[a].token.to_string()),
+            Some(&i)
+                if matches!(&t[i].token, Token::Word(w) if w.quote_style.is_some() || w.keyword == Keyword::NoKeyword) =>
+            {
+                Some(t[i].token.to_string())
+            }
+            _ => last,
+        }
+    };
+    // Each SET of an UPDATE, after the table it names, or of ON CONFLICT DO UPDATE, and the name
+    // the table written goes by.
+    let mut sets = Vec::new();
+    for (j, &i) in solid.iter().enumerate() {
+        if !word(i, Keyword::SET) {
+            continue;
+        }
+        let mut k = j;
+        let mut found = None;
+        while k > 0 {
+            k -= 1;
+            let p = solid[k];
+            if word(p, Keyword::UPDATE) {
+                found = Some(k);
+                break;
+            }
+            match &t[p].token {
+                Token::Word(_) | Token::Period | Token::Mul => {}
+                _ => break,
+            }
+            if k + 8 < j {
+                break;
+            }
+        }
+        let Some(u) = found else { continue };
+        let named = match u.checked_sub(1).filter(|&d| word(solid[d], Keyword::DO)) {
+            // The INSERT's own table.
+            Some(d) => (1..d)
+                .rev()
+                .find(|&n| word(solid[n], Keyword::INTO) && word(solid[n - 1], Keyword::INSERT))
+                .and_then(|n| target(n + 1)),
+            None => target(u + 1),
+        };
+        sets.push((j, named));
+    }
+    let mut swaps: Vec<(usize, usize, String)> = Vec::new();
+    for (j, named) in sets {
+        // Its assignments: each a column, its subscripts, and its value's tokens, to a comma or a
+        // word that ends the list at its depth.
+        struct One {
+            from: usize,
+            to: usize,
+            column: String,
+            subs: Vec<String>,
+            value: String,
+        }
+        let mut list: Vec<One> = Vec::new();
+        let mut k = j + 1;
+        loop {
+            let Some(&c) = solid.get(k) else { break };
+            let Token::Word(_) = &t[c].token else { break };
+            let column = t[c].token.to_string();
+            let mut n = k + 1;
+            let mut subs = Vec::new();
+            while solid.get(n).is_some_and(|&s| t[s].token == Token::LBracket) {
+                let open = solid[n];
+                let mut depth = 0i32;
+                let mut close = None;
+                for (m, &s) in solid.iter().enumerate().skip(n) {
+                    match t[s].token {
+                        Token::LBracket => depth += 1,
+                        Token::RBracket => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(m);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(m) = close else { break };
+                let inner = text(open + 1, solid[m]);
+                // A slice's bounds, each NULL where it is left out.
+                let mut d = 0i32;
+                let mut colon = None;
+                for (ci, ch) in inner.char_indices() {
+                    match ch {
+                        '(' | '[' => d += 1,
+                        ')' | ']' => d -= 1,
+                        ':' if d == 0
+                            && !inner[ci..].starts_with("::")
+                            && !inner[..ci].ends_with(':') =>
+                        {
+                            colon = Some(ci);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                subs.push(match colon {
+                    Some(ci) => {
+                        let bound = |s: &str| match s.trim() {
+                            "" => "NULL".to_string(),
+                            b => format!("({b})"),
+                        };
+                        format!(
+                            "\"{SLICED}\"({}, {})",
+                            bound(&inner[..ci]),
+                            bound(&inner[ci + 1..])
+                        )
+                    }
+                    None => format!("({inner})"),
+                });
+                n = m + 1;
+            }
+            let Some(&eq) = solid.get(n) else { break };
+            if t[eq].token != Token::Eq {
+                break;
+            }
+            // The value: to a comma at its depth, a word that ends the list, a parenthesis closing
+            // past it, or the end.
+            let mut depth = 0i32;
+            let mut end = n + 1;
+            while let Some(&s) = solid.get(end) {
+                match &t[s].token {
+                    Token::LParen | Token::LBracket => depth += 1,
+                    Token::RParen | Token::RBracket if depth == 0 => break,
+                    Token::RParen | Token::RBracket => depth -= 1,
+                    Token::Comma | Token::SemiColon if depth == 0 => break,
+                    Token::Word(w)
+                        if depth == 0
+                            && w.quote_style.is_none()
+                            && matches!(
+                                w.keyword,
+                                Keyword::WHERE | Keyword::FROM | Keyword::RETURNING
+                            ) =>
+                    {
+                        break
+                    }
+                    _ => {}
+                }
+                end += 1;
+            }
+            let last = solid.get(end).copied().unwrap_or(t.len());
+            list.push(One {
+                from: c,
+                to: last,
+                column,
+                subs,
+                value: text(solid[n] + 1, last).trim().to_string(),
+            });
+            match solid.get(end) {
+                Some(&s) if t[s].token == Token::Comma => k = end + 1,
+                _ => break,
+            }
+        }
+        if list.iter().all(|a| a.subs.is_empty()) {
+            continue;
+        }
+        // Each column's subscripted assignments made one, where its first stands; the rest gone,
+        // with the comma before each.
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (a, one) in list.iter().enumerate() {
+            if one.subs.is_empty() {
+                continue;
+            }
+            match seen.get(&one.column) {
+                None => {
+                    seen.insert(one.column.clone(), a);
+                    // The column's own value, of the row the write changes.
+                    let mut made = match &named {
+                        Some(n) => format!("{n}.{}", one.column),
+                        None => one.column.clone(),
+                    };
+                    for later in list[a..]
+                        .iter()
+                        .filter(|o| o.column == one.column && !o.subs.is_empty())
+                    {
+                        made = format!(
+                            "\"{ASSIGNED}\"({made}, {}, {})",
+                            later.value,
+                            later.subs.join(", ")
+                        );
+                    }
+                    swaps.push((one.from, one.to, format!("{} = {made}", one.column)));
+                }
+                Some(_) => {
+                    let before = list[a - 1].to;
+                    swaps.push((before, one.to, String::new()));
+                }
+            }
+        }
+    }
+    if swaps.is_empty() {
+        return Ok(t);
+    }
+    swaps.sort_by_key(|s| std::cmp::Reverse(s.0));
+    let mut t = t;
+    for (from, to, with) in swaps {
+        let span = t[from].span;
+        let made: Vec<TokenWithSpan> = Tokenizer::new(&PostgreSqlDialect {}, &with)
+            .tokenize()?
+            .into_iter()
+            .map(|token| TokenWithSpan::new(token, span))
+            .collect();
+        t.splice(from..to, made);
+    }
+    Ok(t)
 }
 
 /// What marks a call as carrying an operator before ANY, SOME or ALL: its name is this character and
