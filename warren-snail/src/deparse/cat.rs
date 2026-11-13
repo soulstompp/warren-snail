@@ -452,6 +452,15 @@ impl<'a> Cat<'a> {
         }
     }
 
+    /// The element type of a fixed-length type subscripted as a raw array (a point, a line, an
+    /// lseg, a box, a name), none for any other.
+    pub(crate) fn raw_element(&self, t: u32) -> u32 {
+        match self.ty(t) {
+            Some(x) if x.elem != 0 && x.len > 0 && x.subscript == "6180" => x.elem,
+            _ => 0,
+        }
+    }
+
     pub(crate) fn array_of(&self, t: u32) -> u32 {
         self.ty(t).map_or(0, |x| x.array)
     }

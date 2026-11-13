@@ -5067,12 +5067,28 @@ fn eval_whole(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
                         },
                         _ => unreachable!(),
                     },
-                    other => {
-                        return Err(Error::new(format!(
-                            "cannot subscript type {} because it does not support subscripting",
-                            kind_name(&other)
-                        )))
-                    }
+                    other => match raw_elements(&other) {
+                        Some(_) if sliced => {
+                            return Err(Error::coded(
+                                "0A000",
+                                "slices of fixed-length arrays not implemented",
+                            ))
+                        }
+                        Some(elements) => match at.as_slice() {
+                            [i] => usize::try_from(*i)
+                                .ok()
+                                .and_then(|i| elements.into_iter().nth(i))
+                                .unwrap_or(Value::Null),
+                            _ => Value::Null,
+                        },
+                        None => {
+                            return Err(Error::new(format!(
+                                "cannot subscript type {} because it does not support \
+                                 subscripting",
+                                kind_name(&other)
+                            )))
+                        }
+                    },
                 };
             }
             v
@@ -6169,8 +6185,40 @@ pub(super) fn default_name(e: &Expr) -> String {
         Expr::Cast { expr, .. } => default_name(expr),
         Expr::Nested(x) => default_name(x),
         Expr::Case { .. } => "case".into(),
+        // A subscript or a field: the last field's name, else what it is taken from.
+        Expr::CompoundFieldAccess { root, access_chain } => access_chain
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                sqlparser::ast::AccessExpr::Dot(Expr::Identifier(i)) => Some(ident(i)),
+                _ => None,
+            })
+            .unwrap_or_else(|| default_name(root)),
         _ => "?column?".into(),
     }
+}
+
+/// The elements a value of a fixed-length type is subscripted by, from 0, as PostgreSQL's raw
+/// subscripting reads them: a point's x and y, a line's A, B and C, an lseg's two points, a box's
+/// high and low corners, a name's 64 bytes, each a `"char"`; none for any other value.
+fn raw_elements(v: &Value) -> Option<Vec<Value>> {
+    use crate::geo::{Geo, Point};
+    let point = |p: &Point| Value::Geometric(Geo::Point(*p));
+    Some(match v {
+        Value::Geometric(Geo::Point(p)) => vec![Value::Double(p.x), Value::Double(p.y)],
+        Value::Geometric(Geo::Line(l)) => {
+            vec![Value::Double(l.a), Value::Double(l.b), Value::Double(l.c)]
+        }
+        Value::Geometric(Geo::Lseg(s)) => vec![point(&s.p[0]), point(&s.p[1])],
+        Value::Geometric(Geo::Box(b)) => vec![point(&b.high), point(&b.low)],
+        Value::Str(ColumnType::Name, s) => (0..64)
+            .map(|i| {
+                let byte = s.as_bytes().get(i).copied().unwrap_or(0);
+                Value::Scalar(ColumnType::Char, crate::scalars::unsigned_key(byte.into(), 8))
+            })
+            .collect(),
+        _ => return None,
+    })
 }
 
 /// One aggregate, folded a row at a time.

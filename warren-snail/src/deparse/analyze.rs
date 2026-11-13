@@ -884,7 +884,10 @@ impl Analyzer<'_, '_> {
     fn subscripted(&self, container: Node, subs: Vec<(Option<Node>, Option<Node>, bool)>, e: &Expr) -> Result<Node> {
         let t = container.ty();
         let base = self.cat.base(t);
-        let elem = self.cat.element(base);
+        let elem = match self.cat.element(base) {
+            0 => self.cat.raw_element(base),
+            elem => elem,
+        };
         if elem == 0 {
             return Err(not_read(e));
         }

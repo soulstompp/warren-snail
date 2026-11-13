@@ -5419,6 +5419,92 @@ fn a_star_of_no_relation_is_refused_as_a_missing_entry() {
 }
 
 #[test]
+fn a_fixed_length_type_s_subscript_is_its_element() {
+    let path = tmp("reader-raw-subscripts.snail");
+    let ddl = "CREATE SCHEMA gx;
+         CREATE TABLE gx.g (id integer PRIMARY KEY, p point, b box, l lseg, ln line, n name);";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute(
+        "INSERT INTO gx.g VALUES (1, '(3,4)', '(1,2),(3,4)', '[(1,2),(5,6)]', '{1,2,3}', 'abc'), \
+         (2, '(1,9)', '(0,0),(2,2)', '[(0,0),(1,1)]', '{1,-1,0}', 'de'), \
+         (3, NULL, NULL, NULL, NULL, NULL), \
+         (4, '(2,-1)', '(5,5),(6,7)', '[(9,9),(8,8)]', '{0,1,5}', 'z')",
+    )
+    .unwrap();
+    answered(
+        &mut w,
+        &[
+            ("SELECT id FROM gx.g ORDER BY p[0]", &["2", "4", "1", "3"]),
+            (
+                "SELECT id, p[0], p[1] FROM gx.g ORDER BY id",
+                &["1|3|4", "2|1|9", "3|NULL|NULL", "4|2|-1"],
+            ),
+            ("SELECT id FROM gx.g ORDER BY p[1] DESC", &["3", "2", "1", "4"]),
+            ("SELECT p[2], p[-1], p[0][0] FROM gx.g WHERE id = 1", &["NULL|NULL|NULL"]),
+            ("SELECT p['0'], p[1.6] FROM gx.g WHERE id = 1", &["3|NULL"]),
+            ("SELECT p[id - 1] FROM gx.g ORDER BY id", &["3", "9", "NULL", "NULL"]),
+            (
+                "SELECT pg_typeof(p[0]), pg_typeof(b[0]), pg_typeof(n[0]) FROM gx.g WHERE id = 1",
+                &["double precision|point|\"char\""],
+            ),
+            ("SELECT b[0], b[1], b[0][1] FROM gx.g WHERE id = 1", &["(3,4)|(1,2)|NULL"]),
+            ("SELECT l[0], l[1] FROM gx.g WHERE id = 1", &["(1,2)|(5,6)"]),
+            ("SELECT ln[0], ln[1], ln[2], ln[3] FROM gx.g WHERE id = 1", &["1|2|3|NULL"]),
+            ("SELECT n[0], n[2], n[3], n[64] FROM gx.g WHERE id = 1", &["a|c||NULL"]),
+            ("SELECT n[0] = 'a', n[3] = '' FROM gx.g WHERE id = 1", &["t|t"]),
+            ("SELECT id FROM gx.g WHERE p[0] > 2 ORDER BY id", &["1"]),
+            ("SELECT (point '(7,8)')[1]", &["8"]),
+            ("SELECT sum(p[0]) FROM gx.g", &["6"]),
+            ("SELECT (b[0])[1] FROM gx.g WHERE id = 1", &["4"]),
+            ("SELECT p[0:1] FROM gx.g WHERE id = 3", &["NULL"]),
+            ("SELECT p[NULL] FROM gx.g WHERE id = 1", &["NULL"]),
+            ("SELECT id, p[0] FROM gx.g WHERE p[1] < 5 ORDER BY p[0]", &["4|2", "1|3"]),
+        ],
+    );
+    // Named as PostgreSQL names a subscript: by what it is taken from.
+    let b = w.execute("SELECT p[0], g.b[1], (b[0])[1] FROM gx.g g WHERE id = 1").unwrap();
+    let schema = b.answer.unwrap().schema();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, ["p", "b", "b"]);
+    for (sql, want) in [
+        (
+            "SELECT p[0:1] FROM gx.g WHERE id = 1",
+            (Some("0A000"), "slices of fixed-length arrays not implemented"),
+        ),
+        (
+            "SELECT p['x'] FROM gx.g WHERE id = 1",
+            (Some("22P02"), "invalid input syntax for type integer: \"x\""),
+        ),
+        (
+            "SELECT p[true] FROM gx.g WHERE id = 1",
+            (Some("42804"), "array subscript must have type integer"),
+        ),
+        (
+            "SELECT p[0] FROM gx.g WHERE id = 1 UNION ALL SELECT 'x'::text",
+            (Some("42804"), "UNION types double precision and text cannot be matched"),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), (want.0, want.1.to_string()), "{sql}");
+    }
+    // A view's subscripts, analyzed and printed as 18.6 prints them.
+    w.execute("CREATE VIEW gx.v AS SELECT id, p[0] AS x, b[1] AS lo FROM gx.g").unwrap();
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT * FROM gx.v ORDER BY id",
+                &["1|3|(1,2)", "2|1|(0,0)", "3|NULL|NULL", "4|2|(5,5)"],
+            ),
+            (
+                "SELECT pg_get_viewdef('gx.v'::regclass)",
+                &[" SELECT id,\n    p[0] AS x,\n    b[1] AS lo\n   FROM gx.g;"],
+            ),
+        ],
+    );
+}
+
+#[test]
 fn an_arm_s_sorted_literal_is_text_before_its_set_operation_is_typed() {
     let mut w = snail("sorted-literal");
     let unmatched = |op: &str, a: &str, b: &str| {

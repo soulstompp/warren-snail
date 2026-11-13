@@ -289,6 +289,20 @@ pub(crate) fn element_of(ty: ColumnType) -> Option<ColumnType> {
     }
 }
 
+/// The element a fixed-length type's subscript gives, as PostgreSQL's raw subscripting gives it:
+/// a point's or a line's double precision, an lseg's or a box's point, a name's `"char"`.
+pub(crate) fn raw_element_of(ty: ColumnType) -> Option<ColumnType> {
+    use crate::geo::GeoKind;
+    Some(match ty {
+        ColumnType::Geometric(GeoKind::Point | GeoKind::Line) => ColumnType::Float8,
+        ColumnType::Geometric(GeoKind::Lseg | GeoKind::Box) => {
+            ColumnType::Geometric(GeoKind::Point)
+        }
+        ColumnType::Name => ColumnType::Char,
+        _ => return None,
+    })
+}
+
 /// The arguments of a call as expressions; none where they are not plain.
 fn call_args(f: &sqlparser::ast::Function) -> Option<Vec<&Expr>> {
     match &f.args {
@@ -478,10 +492,11 @@ impl Typing<'_> {
                         )
                     )
                 });
-                match t.and_then(element_of) {
-                    Some(e) if sliced => Some(array_of(e)),
-                    Some(e) => Some(e),
-                    None => None,
+                match (t.and_then(element_of), t.and_then(raw_element_of)) {
+                    (Some(e), _) if sliced => Some(array_of(e)),
+                    (Some(e), _) => Some(e),
+                    (None, Some(_)) if sliced => t,
+                    (None, raw) => raw,
                 }
             }
             // An ARRAY's elements take one type; an array among them is a dimension of it.
