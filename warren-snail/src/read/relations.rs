@@ -6361,6 +6361,21 @@ impl<'s> Ready<'s> {
         let in_order: std::cell::Cell<Option<super::strands::Led>> =
             std::cell::Cell::new(wanted_along.as_ref().map(|w| w.led));
         let along_wanted = wanted_along.as_ref().map(|w| (w, &in_order));
+        // A step over one table that sorts as one of its B-trees read backward.
+        if kept.is_none() && arm_before.is_none() && !shut && from.items.len() == 1 {
+            let mut leaves = Vec::new();
+            from.items[0].leaves(&mut leaves);
+            if let [Node {
+                what: What::Table { table, .. },
+                ..
+            }] = leaves.as_slice()
+            {
+                let table = &asked.reads.catalog().tables[*table];
+                if super::strands::backward(&step.query, table) {
+                    run.backward();
+                }
+            }
+        }
         let rows_known: std::cell::Cell<Option<u64>> = std::cell::Cell::new(None);
         let mut feed = |mut rows: Vec<Vec<Value>>, order: Option<usize>| -> Result<()> {
             if !fed.get() {

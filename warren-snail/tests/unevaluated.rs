@@ -556,6 +556,41 @@ fn a_limit_over_a_subquery_read_alone_is_the_subquery_s() {
             ("SELECT x FROM (SELECT 1/(k - 2) AS x FROM fo.src) q FETCH FIRST 1 ROW ONLY", rows(&["-1"])),
             // The rows its OFFSET passes over are made.
             ("SELECT x FROM (SELECT 1/(k - 2) AS x FROM fo.src) q LIMIT 1 OFFSET 2", zero()),
+            // A WHERE over such a subquery, or a WITH query read once, is its own.
+            ("SELECT x FROM (SELECT k, 1/(k - 2) AS x FROM fo.src) q WHERE k <> 2 ORDER BY 1", rows(&["-1", "0", "1"])),
+            (
+                "WITH c AS (SELECT k, 1/(k - 2) AS x FROM fo.src) SELECT x FROM c WHERE k <> 2 ORDER BY 1",
+                rows(&["-1", "0", "1"]),
+            ),
+            ("SELECT count(*) FROM (SELECT k, 1/(k - 2) AS x FROM fo.src) q WHERE k <> 2", rows(&["3"])),
+            ("SELECT x FROM (SELECT k, 1/(k - 2) AS x FROM fo.src ORDER BY k) q WHERE k <> 2", rows(&["-1", "1", "0"])),
+            ("SELECT x FROM (SELECT k, 1/(k - 2) AS x FROM fo.src) q WHERE x > 0 ORDER BY 1", zero()),
+            (
+                "WITH c AS MATERIALIZED (SELECT k, 1/(k - 2) AS x FROM fo.src) SELECT x FROM c WHERE k <> 2 ORDER BY 1",
+                zero(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn an_order_read_backward_under_a_limit_makes_only_the_rows_it_reaches() {
+    let mut w = snail("backward");
+    each(
+        &mut w,
+        &[
+            ("SELECT k, 1/(k - 2) FROM fo.src ORDER BY k DESC LIMIT 1", rows(&["4|0"])),
+            ("SELECT x FROM (SELECT k, 1/(k - 2) AS x FROM fo.src) q ORDER BY k DESC LIMIT 1", rows(&["0"])),
+            ("SELECT 1/(k - 2) FROM fo.src ORDER BY k DESC LIMIT 2", rows(&["0", "1"])),
+            ("SELECT k FROM fo.src WHERE 1/(k - 2) >= 0 ORDER BY k DESC LIMIT 1", rows(&["4"])),
+            ("SELECT k, 1/(k - 2) FROM fo.src WHERE k < 4 ORDER BY k DESC LIMIT 1", rows(&["3|1"])),
+            ("SELECT k, 1/(k - 3) FROM fo.src ORDER BY k DESC FETCH FIRST 1 ROW ONLY", rows(&["4|1"])),
+            // No order of the table gives it, or the OFFSET passes the row over: made.
+            ("SELECT k, 1/(k - 2) FROM fo.src ORDER BY k DESC NULLS LAST LIMIT 1", zero()),
+            ("SELECT k, 1/(k - 2) FROM fo.src ORDER BY k DESC OFFSET 2 LIMIT 1", zero()),
+            // A window read whole makes its select list only for the rows its LIMIT reaches.
+            ("SELECT k, 1/(k - 2), row_number() OVER () FROM fo.src LIMIT 1", rows(&["1|-1|1"])),
+            ("SELECT k, 1/(k - 2), sum(k) OVER () FROM fo.src LIMIT 1", rows(&["1|-1|10"])),
         ],
     );
 }

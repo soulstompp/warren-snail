@@ -215,6 +215,54 @@ pub(super) fn led_by(
     (0..table.orders.len()).find(|&i| fits(&table.orders[i]))
 }
 
+/// Whether a SELECT over one table sorts as one of the table's declared B-trees read backward: each
+/// key a column of the table, in a level's turn, each direction and NULLs' place every one the
+/// opposite of the level's, as 18.6's plan reads such an index backward for it.
+pub(super) fn backward(q: &Query, table: &Table) -> bool {
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return false;
+    };
+    if q.with.is_some() || s.from.len() != 1 || !s.from[0].joins.is_empty() {
+        return false;
+    }
+    let Some(OrderByKind::Expressions(os)) = q.order_by.as_ref().map(|o| &o.kind) else {
+        return false;
+    };
+    // A name an item takes as its alias reads that item, not the column.
+    let aliased = |n: &str| {
+        s.projection.iter().any(|i| match i {
+            SelectItem::ExprWithAlias { alias, .. } => crate::catalog::ident(alias) == n,
+            _ => false,
+        })
+    };
+    let keys: Option<Vec<(usize, bool, bool)>> = os
+        .iter()
+        .map(|o| {
+            let (_, n) = super::pipeline::column_of(&o.expr)?;
+            if aliased(&n) {
+                return None;
+            }
+            let c = table.columns.iter().position(|c| c.name == n)?;
+            let desc = super::ordering::descends(&o.options);
+            Some((c, desc, o.options.nulls_first.unwrap_or(desc)))
+        })
+        .collect();
+    let Some(keys) = keys.filter(|k| !k.is_empty()) else {
+        return false;
+    };
+    table.orders.iter().any(|o| {
+        o.method == Method::Btree
+            && o.predicate.is_none()
+            && o.levels.len() >= keys.len()
+            && keys.iter().enumerate().all(|(i, &(c, desc, first))| {
+                o.levels[i] == Level::Column(c)
+                    && desc != o.desc[i]
+                    && first != o.nulls_first[i]
+                    && !table.columns[c].collated()
+            })
+    })
+}
+
 /// The strand a question on one table may read along, the places among the columns the table stores
 /// of the columns its levels lead with, and what its rows coming so do for it.
 pub(super) fn of_step(

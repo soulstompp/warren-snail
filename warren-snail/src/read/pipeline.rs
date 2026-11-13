@@ -7169,6 +7169,9 @@ pub(super) struct Prepared<'q> {
     /// for each row the cut reaches, from the row it came from and its aggregates' and windows'
     /// values, carried after the ORDER BY's values until then.
     drawn: Vec<usize>,
+    /// Whether its WHERE is read after the sort, on each row the cut reaches, as a scan of an order
+    /// read backward reads its condition (`StepRun::backward`).
+    late_where: bool,
     /// Whether its select list's sets are made after the sort, each carried row becoming their rows.
     late_sets: bool,
     calls: Calls<'q>,
@@ -7322,14 +7325,14 @@ impl<'q> Prepared<'q> {
                 .map(|(i, e)| before(i, e, c))
                 .collect::<Result<Vec<_>>>()
         };
-        // A row whose items wait for the sort and the cut carries the row it came from, and its
-        // aggregates' and windows' values.
-        let folds = match self.drawn.is_empty() {
-            true => Vec::new(),
-            false => self.folds_of(&computed),
+        // A row whose items or WHERE wait for the sort and the cut carries the row it came from,
+        // and its aggregates' and windows' values.
+        let folds = match self.carries() {
+            false => Vec::new(),
+            true => self.folds_of(&computed),
         };
         let carry = |mut made: Vec<Value>| {
-            if !self.drawn.is_empty() {
+            if self.carries() {
                 made.extend_from_slice(row);
                 made.extend(folds.iter().cloned());
             }
@@ -7490,12 +7493,19 @@ impl<'q> Prepared<'q> {
         Ok(true)
     }
 
+    /// Whether a row it makes carries the row it came from past the sort: where items or its WHERE
+    /// wait for the sort.
+    fn carries(&self) -> bool {
+        !self.drawn.is_empty() || self.late_where
+    }
+
     /// The rows a row carried past the sort becomes, each as `taking` wants it: its items made
     /// after the sort (`drawn`) made from the row it came from and its aggregates' and windows'
     /// values, which it carries no further, and where its sets wait for the sort, the rows its
-    /// levels make, one at a time. A row carrying nothing is taken as it is.
+    /// levels make, one at a time. A row carrying nothing is taken as it is; one whose WHERE waits
+    /// for the sort, only where it holds.
     fn late_rows(&self, mut row: Vec<Value>, frame: &Frame, taking: &mut Taking) -> Result<()> {
-        if self.drawn.is_empty() {
+        if !self.carries() {
             if taking.wants() {
                 taking.take(row);
             }
@@ -7509,6 +7519,11 @@ impl<'q> Prepared<'q> {
             bound: None,
             _q: std::marker::PhantomData,
         };
+        if let Some(w) = self.selection.filter(|_| self.late_where) {
+            if !taking.wants() || holds(w, &from, frame, &computed)? != Some(true) {
+                return Ok(());
+            }
+        }
         let base = row;
         let after = |i: usize, e: &Expr, c: &Computed| match self.drawn.contains(&i) {
             true => eval(e, &from, frame, c),
@@ -7603,7 +7618,7 @@ impl Prepared<'_> {
         frame: &Frame,
     ) -> Result<Vec<Vec<Value>>> {
         // Rows carrying nothing, with no cut, go on as they came.
-        if self.drawn.is_empty() && cut.is_none() {
+        if !self.carries() && cut.is_none() {
             return Ok(rows);
         }
         let mut out = Vec::new();
@@ -8899,6 +8914,7 @@ pub(super) fn prepare<'q>(
     }
     Ok(Prepared {
         drawn,
+        late_where: false,
         late_sets,
         levels,
         ends,
@@ -9640,6 +9656,25 @@ impl<'q> StepRun<'q> {
         }
     }
 
+    /// Reads its rows as 18.6 reads an order of its table backward under its LIMIT: its WHERE and
+    /// every item its ORDER BY does not sort by read after the sort, for the rows the cut reaches
+    /// alone. Not where it groups, returns each row once, or makes a window or a set.
+    pub(super) fn backward(&mut self) {
+        let p = &mut self.p;
+        if p.limit.is_none()
+            || p.grouped
+            || p.distinct
+            || p.distinct_on.is_some()
+            || !p.calls.windows.is_empty()
+            || !p.calls.sets.is_empty()
+            || !p.below_exprs.is_empty()
+        {
+            return;
+        }
+        p.drawn = (0..p.items.len()).filter(|i| !p.sorted.contains(i)).collect();
+        p.late_where = p.selection.is_some();
+    }
+
     fn names(&self) -> Vec<String> {
         self.p.items.iter().map(|(_, n)| n.clone()).collect()
     }
@@ -9676,9 +9711,12 @@ impl<'q> StepRun<'q> {
             && !self.going.sorts
             && self.p.below_exprs.is_empty();
         let by_row = self.p.selection.filter(|w| {
-            (draws(w) || cut) && !self.p.grouped && self.p.calls.windows.is_empty()
+            !self.p.late_where
+                && (draws(w) || cut)
+                && !self.p.grouped
+                && self.p.calls.windows.is_empty()
         });
-        if let Some(w) = self.p.selection.filter(|_| by_row.is_none()) {
+        if let Some(w) = self.p.selection.filter(|_| by_row.is_none() && !self.p.late_where) {
             let mut kept = Vec::with_capacity(rel.rows.len());
             for row in std::mem::take(&mut rel.rows) {
                 if holds(w, &row, &frame, &none)? == Some(true) {
@@ -9946,16 +9984,26 @@ impl<'q> StepRun<'q> {
             let held = std::mem::replace(&mut self.held, parted::Parted::new());
             let by = windows::shared_partition(&p.calls.windows);
             let mut order = None;
+            // Rows its LIMIT cuts, nothing sorting between, are made one at a time and none past
+            // the last it keeps, as PostgreSQL's WindowAgg makes each row its Limit asks for.
+            let cut = p.limit.is_some() && !going.sorts && !p.distinct && p.distinct_on.is_none();
             held.finish(&|r| parted::partition_hash(by, r, &frame), &mut |rel| {
                 let per_row = windows::values(&p.calls.windows, &rel, &frame, None)?;
                 let mut rows = Vec::with_capacity(rel.rows.len());
                 for (row, w) in rel.rows.iter().zip(per_row) {
+                    if cut && going.ended(p, frame_ref)? {
+                        break;
+                    }
                     let computed = Computed {
                         calls: w,
                         bound: None,
                         _q: std::marker::PhantomData,
                     };
-                    rows.extend(p.project(row, &frame, computed)?);
+                    let made = p.project(row, &frame, computed)?;
+                    match cut {
+                        true => emit(made, going)?,
+                        false => rows.extend(made),
+                    }
                 }
                 order = rel.order;
                 emit(rows, going)
@@ -10487,6 +10535,14 @@ impl<'q> Stream<'q> {
     pub(super) fn along(&mut self, led: super::strands::Led) {
         if let Some(Some(r)) = self.runs.last_mut() {
             r.along(led);
+        }
+    }
+
+    /// Its question's own step reads its rows as an order of its table read backward
+    /// (`StepRun::backward`).
+    pub(super) fn backward(&mut self) {
+        if let Some(Some(r)) = self.runs.last_mut() {
+            r.backward();
         }
     }
 

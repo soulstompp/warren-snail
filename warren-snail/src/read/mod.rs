@@ -2083,6 +2083,9 @@ impl Snail {
         if let Some((_, _, led)) = &strand {
             stream.along(*led);
         }
+        if strands::backward(q, table) {
+            stream.backward();
+        }
         let sorted_at = strand.as_ref().map(|(_, at, _)| at.clone());
         // Each block's rows go to the pipeline as the scan reads them, in the order.
         let most = std::cell::Cell::new(None);
