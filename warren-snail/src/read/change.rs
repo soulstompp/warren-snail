@@ -785,6 +785,18 @@ pub(super) fn widen(table: &Table, rows: Vec<Row>) -> Vec<Row> {
         .collect()
 }
 
+/// Whether a VALUES list's questions read relations through the file's volatile functions alone,
+/// and through one at least (`own::sees_its_write`).
+fn sees_its_write(catalog: &Catalog, rows: &[(Vec<Fill>, Option<String>)]) -> bool {
+    let parsed: Vec<Vec<sqlparser::ast::Statement>> = rows
+        .iter()
+        .filter_map(|(_, q)| q.as_deref())
+        .map(super::image::parse_sql)
+        .collect::<Result<_>>()
+        .unwrap_or_default();
+    super::own::sees_its_write(catalog, &parsed)
+}
+
 /// The rows a statement found, each value in the form its table holds it: an answer gives a numeric
 /// at the precision the path that read it computes, which need not be its column's own.
 pub(super) fn found_rows(table: &Table, batch: &RecordBatch) -> Result<Vec<Row>> {
@@ -1795,6 +1807,30 @@ impl Snail {
         found: &mut Option<Vec<Row>>,
     ) -> Result<bool> {
         Ok(match st {
+            // VALUES rows read through the file's volatile functions alone, each such call's
+            // statement seeing the rows written before its own: each row written as it is made.
+            Statement::Insert {
+                table,
+                source: Source::Computed(rows),
+            } if found.is_none() && sees_its_write(&self.catalog, &rows) => {
+                self.returned_calls.clear();
+                let t = self.catalog.tables[table].clone();
+                self.computed_typed(&t, &rows)?;
+                let one = rows.len() == 1;
+                let mut all = Vec::new();
+                for row in rows {
+                    let made = self.computed(table, vec![row], one)?;
+                    let changes: Vec<Change> = made.iter().cloned().map(Change::Insert).collect();
+                    self.keep(&changes);
+                    let (rewritten, orders) = self.put(table, changes)?;
+                    done.rewritten += rewritten;
+                    done.orders = done.orders.max(orders);
+                    all.extend(made);
+                }
+                done.rows = all.len() as u64;
+                *found = Some(all);
+                done.rows > 0
+            }
             Statement::Insert { table, source } => {
                 let rows = self.proposed(table, source, found)?;
                 done.rows = rows.len() as u64;
@@ -1979,6 +2015,11 @@ impl Snail {
             .collect();
         self.reads_its_writes(&t, old.len(), defaults.iter().map(|&c| (c, old.len())))?;
         let mut drawn = self.draws(&t, defaults.iter().map(|&c| (c, old.len())))?;
+        // Values read through the file's volatile functions alone, each such call's statement
+        // seeing the rows written before its own: each row written as its values are made.
+        let stepwise = computed
+            .iter()
+            .any(|(_, e)| super::own::reads_relations(&self.catalog, e));
         let mut changes = Vec::with_capacity(old.len());
         for (o, i) in old {
             let mut n = o.clone();
@@ -1990,7 +2031,18 @@ impl Snail {
                             .iter()
                             .position(|(k, _)| k == c)
                             .expect("an expression");
-                        fill::set_to(&t, &o, *c, &computed[at].1, &by, &typed[at])?
+                        match stepwise {
+                            true => fill::set_to_reading(
+                                &t,
+                                &o,
+                                *c,
+                                &computed[at].1,
+                                &by,
+                                &typed[at],
+                                &*self,
+                            )?,
+                            false => fill::set_to(&t, &o, *c, &computed[at].1, &by, &typed[at])?,
+                        }
                     }
                     Fill::Answer(k) => {
                         let (types, values) = asked.as_ref().expect("values asked");
@@ -2005,9 +2057,18 @@ impl Snail {
             fill::check_reading(&t, &n, Some(self))?;
             fill::without_overlaps(&t, &n)?;
             changes.push(Change::Replace(o, n));
+            if stepwise {
+                let row = std::mem::take(&mut changes);
+                self.keep(&row);
+                let (rewritten, orders) = self.put(table, row)?;
+                done.rewritten += rewritten;
+                done.orders = done.orders.max(orders);
+            }
         }
-        self.keep(&changes);
-        (done.rewritten, done.orders) = self.put(table, changes)?;
+        if !stepwise {
+            self.keep(&changes);
+            (done.rewritten, done.orders) = self.put(table, changes)?;
+        }
         Ok(done.rows > 0)
     }
 
@@ -2040,7 +2101,10 @@ impl Snail {
                 self.filled(table, given)?
             }
             (Source::Filled(rows), None) => self.filled(table, rows)?,
-            (Source::Computed(rows), None) => self.computed(table, rows)?,
+            (Source::Computed(rows), None) => {
+                let one = rows.len() == 1;
+                self.computed(table, rows, one)?
+            }
             (Source::Select { question, fill } | Source::Query { question, fill }, None) => {
                 let (batch, _) = self.answer(&question, None)?;
                 let types = assigned_types(
@@ -2460,32 +2524,15 @@ impl Snail {
     /// every row's expressions typed against their columns first; then each row's question answered
     /// as the reader answers one, its expressions computed and its DEFAULTs drawn in their order
     /// among its calls, and the row filled and checked before the next is computed. One row is a
-    /// select list: each row its question answers is a row given, none where it answers none.
+    /// select list (`one`): each row its question answers is a row given, none where it answers none.
     fn computed(
         &mut self,
         table: usize,
         rows: Vec<(Vec<Fill>, Option<String>)>,
+        one: bool,
     ) -> Result<Vec<Row>> {
-        let one = rows.len() == 1;
         let t = self.catalog.tables[table].clone();
-        given_refused(&t, rows.iter().map(|(r, _)| r))?;
-        for (r, q) in &rows {
-            let Some(q) = q else {
-                continue;
-            };
-            let stated = stated_types(&self.catalog, q);
-            for (c, k) in answered(r) {
-                let col = &t.columns[c];
-                if let Some(from) = stated
-                    .get(k)
-                    .copied()
-                    .flatten()
-                    .filter(|&from| !assignable(from, col.ty))
-                {
-                    return Err(not_assigned(col, from));
-                }
-            }
-        }
+        self.computed_typed(&t, &rows)?;
         self.reads_its_writes(&t, rows.len(), defaults_taken(&t, rows.iter().map(|(r, _)| r)))?;
         let mut drawn = self.draws(&t, defaults_taken(&t, rows.iter().map(|(r, _)| r)))?;
         let mut out = Vec::with_capacity(rows.len());
@@ -2556,6 +2603,30 @@ impl Snail {
             ))),
             None => Ok(()),
         }
+    }
+
+    /// A VALUES list's rows given and typed against their columns, as `computed` reads them before
+    /// any row is computed.
+    fn computed_typed(&self, t: &Table, rows: &[(Vec<Fill>, Option<String>)]) -> Result<()> {
+        given_refused(t, rows.iter().map(|(r, _)| r))?;
+        for (r, q) in rows {
+            let Some(q) = q else {
+                continue;
+            };
+            let stated = stated_types(&self.catalog, q);
+            for (c, k) in answered(r) {
+                let col = &t.columns[c];
+                if let Some(from) = stated
+                    .get(k)
+                    .copied()
+                    .flatten()
+                    .filter(|&from| !assignable(from, col.ty))
+                {
+                    return Err(not_assigned(col, from));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// One row an INSERT gives, each cell filled: a value; the column of `answer`, of `types`, its

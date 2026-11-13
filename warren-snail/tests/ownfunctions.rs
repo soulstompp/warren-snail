@@ -1043,3 +1043,65 @@ fn create_function_refuses_the_four_forms_in_postgresql_s_words() {
         assert!(e.contains(why), "{f}: {e}");
     }
 }
+
+const SEES: &str = "CREATE SCHEMA fo; \
+     CREATE TABLE fo.u (k integer PRIMARY KEY, v integer); \
+     CREATE FUNCTION fo.usumv() RETURNS bigint LANGUAGE sql VOLATILE AS 'SELECT sum(v) FROM fo.u'; \
+     CREATE FUNCTION fo.ssumv() RETURNS bigint LANGUAGE sql STABLE AS 'SELECT sum(v) FROM fo.u'; \
+     CREATE FUNCTION fo.ucount() RETURNS bigint LANGUAGE sql VOLATILE AS 'SELECT count(*) FROM fo.u'; \
+     CREATE FUNCTION fo.uget(integer) RETURNS integer LANGUAGE sql VOLATILE AS 'SELECT v FROM fo.u WHERE k = $1';";
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_volatile_function_s_statement_sees_the_rows_its_write_changed_before_it() {
+    // As 18.6 answered each over the same DDL and rows, each statement rolled back (2026-11-12).
+    let path = written("sees-its-write", SEES);
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO fo.u VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    for (sql, want) in [
+        // Each row's call sees the rows the UPDATE set before it, in its own order.
+        (
+            "UPDATE fo.u SET v = fo.usumv() RETURNING k, v",
+            &["1|60", "2|110", "3|200"][..],
+        ),
+        (
+            "UPDATE fo.u SET v = v + fo.usumv() WHERE k >= 2 RETURNING k, v",
+            &["2|80", "3|150"],
+        ),
+        (
+            "UPDATE fo.u SET k = k + 10, v = fo.usumv() RETURNING k, v",
+            &["11|60", "12|110", "13|200"],
+        ),
+        (
+            "UPDATE fo.u SET v = coalesce(fo.uget(k - 1), 0) + 1 RETURNING k, v",
+            &["1|1", "2|2", "3|3"],
+        ),
+        // A stable function's statement reads the statement's snapshot.
+        (
+            "UPDATE fo.u SET v = fo.ssumv() RETURNING k, v",
+            &["1|60", "2|60", "3|60"],
+        ),
+        // Each VALUES row's call sees the rows inserted before it.
+        (
+            "INSERT INTO fo.u VALUES (4, fo.ucount()::integer), (5, fo.ucount()::integer), \
+             (6, fo.usumv()::integer) RETURNING k, v",
+            &["4|3", "5|4", "6|67"],
+        ),
+    ] {
+        w.execute("BEGIN").unwrap();
+        asked(&mut w, sql, want);
+        w.execute("ROLLBACK").unwrap();
+    }
+    // A statement of its own, outside a transaction.
+    asked(
+        &mut w,
+        "UPDATE fo.u SET v = fo.usumv() RETURNING k, v",
+        &["1|60", "2|110", "3|200"],
+    );
+    asked(
+        &mut w,
+        "SELECT k, v FROM fo.u ORDER BY k",
+        &["1|60", "2|110", "3|200"],
+    );
+}

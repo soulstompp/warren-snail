@@ -8637,6 +8637,31 @@ pub(crate) fn eval_typed(
     eval(e, row, &frame, &computed_none())
 }
 
+/// An expression on one row as `eval_typed` reads it, a call of the file's function whose body
+/// reads relations asking `reads`.
+pub(super) fn eval_typed_reading(
+    e: &Expr,
+    columns: Vec<(Option<String>, String)>,
+    row: &[Value],
+    release: u8,
+    casings: &Casings,
+    types: &super::typed::Types,
+    reads: &dyn super::relations::Reads,
+) -> Result<Value> {
+    let frame = Frame {
+        columns,
+        params: &[],
+        release,
+        casings,
+        types,
+        now: crate::scalars::transaction_clock(),
+        subqueries: None,
+        reads: Some(reads),
+        below: None,
+    };
+    eval(e, row, &frame, &computed_none())
+}
+
 /// An expression over no row, in the types its typing gave it, a call of the file's function whose
 /// body reads relations asking `reads` where it is given.
 pub(super) fn eval_reading(

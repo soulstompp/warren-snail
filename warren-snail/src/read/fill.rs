@@ -559,6 +559,38 @@ pub fn set_to(
     )
 }
 
+/// The value an UPDATE sets column `c` of a row to, as `set_to` reads it, a call of the file's
+/// function whose body reads relations asking `reads`.
+pub(super) fn set_to_reading(
+    table: &Table,
+    row: &Row,
+    c: usize,
+    e: &sqlparser::ast::Expr,
+    by: &str,
+    types: &super::typed::Types,
+    reads: &dyn super::relations::Reads,
+) -> Result<Datum> {
+    let col = &table.columns[c];
+    let columns = table
+        .columns
+        .iter()
+        .map(|c| (Some(by.to_string()), c.name.clone()))
+        .collect();
+    assign_value(
+        super::pipeline::eval_typed_reading(
+            e,
+            columns,
+            &values(table, row),
+            table.release,
+            &Casings::of_table(table, &[]),
+            types,
+            reads,
+        )?,
+        col.ty,
+        &col.name,
+    )
+}
+
 /// The types of an UPDATE's SET expression and each expression in it, before any row is read, as
 /// PostgreSQL's parser types it over the table's columns named as `by` names them.
 pub fn set_typed(

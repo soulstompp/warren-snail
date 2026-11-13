@@ -2024,12 +2024,14 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
             let table = &catalog.tables[ti];
             let mut sets = sets_of(table, &u.assignments)?;
             // A value set by a subquery, or by a function of the file whose body reads relations,
-            // is read on the row it changes, as a FROM's are, over a FROM listing nothing more.
+            // is read on the row it changes, as a FROM's are, over a FROM listing nothing more;
+            // but where its values read relations through the file's volatile functions alone,
+            // each row's are read once the rows before it are written.
             let reads_a_set = u.assignments.iter().any(|a| {
                 let mut found = Vec::new();
                 super::pipeline::subqueries_in(&a.value, &mut found);
                 !found.is_empty() || super::own::reads_relations(catalog, &a.value)
-            });
+            }) && !(u.from.is_none() && super::own::sees_its_write(catalog, &u.assignments));
             let none = sqlparser::ast::UpdateTableFromKind::AfterSet(Vec::new());
             let from = match (&u.from, reads_a_set) {
                 (None, true) => Some(&none),

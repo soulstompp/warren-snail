@@ -1094,6 +1094,35 @@ pub(crate) fn reads_relations<V: sqlparser::ast::Visit>(
     !catalog.functions.is_empty() && calls_reading(catalog, q, &mut Vec::new())
 }
 
+/// Whether what a write computes reads relations only through calls of the file's VOLATILE
+/// functions, and through one at least: no subquery, and no other function of the file whose body
+/// reads relations. Each such call's statement sees the rows the write changed before it.
+pub(crate) fn sees_its_write<V: sqlparser::ast::Visit>(
+    catalog: &crate::catalog::Catalog,
+    q: &V,
+) -> bool {
+    if catalog.functions.is_empty() {
+        return false;
+    }
+    let mut volatile = false;
+    let other = sqlparser::ast::visit_expressions(q, |e| match e {
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => ControlFlow::Break(()),
+        Expr::Function(f) => match named_in(catalog, &crate::catalog::object_name(&f.name)) {
+            Some(g) if reading(catalog, g, &mut Vec::new()) => match g.volatility {
+                'v' => {
+                    volatile = true;
+                    ControlFlow::Continue(())
+                }
+                _ => ControlFlow::Break(()),
+            },
+            _ => ControlFlow::Continue(()),
+        },
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break();
+    volatile && !other
+}
+
 fn calls_reading<V: sqlparser::ast::Visit>(
     catalog: &crate::catalog::Catalog,
     q: &V,
