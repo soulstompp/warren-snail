@@ -749,6 +749,11 @@ pub(crate) fn body_type(
     while let Expr::Nested(x) = body {
         body = x;
     }
+    if !matches!(body, Expr::Subquery(_)) {
+        if let Some(t) = around_subqueries(body, relations, &f.args, release)? {
+            return Ok(Some(t));
+        }
+    }
     Ok(own
         .types
         .get(&(own.body.as_ref() as *const Expr))
@@ -758,6 +763,107 @@ pub(crate) fn body_type(
             _ => None,
         })
         .or_else(|| super::pipeline::quoted(body).then_some(ColumnType::Text(None))))
+}
+
+/// The type of a body that holds subqueries beside what it computes, typed with each subquery a
+/// value of its column's type: PostgreSQL's refusal where an operator or a function takes no such
+/// value, or two such values meet in no type; none where a subquery's type is not known here.
+fn around_subqueries(
+    body: &Expr,
+    relations: &Relations,
+    args: &[ColumnType],
+    release: u8,
+) -> Result<Option<ColumnType>> {
+    use std::ops::ControlFlow;
+    let mut held = false;
+    let _ = sqlparser::ast::visit_expressions(body, |x| {
+        held |= matches!(x, Expr::Subquery(_));
+        ControlFlow::<()>::Continue(())
+    });
+    if !held {
+        return Ok(None);
+    }
+    let mut e = body.clone();
+    let mut known = true;
+    let _ = sqlparser::ast::visit_expressions_mut(&mut e, |x| {
+        if let Expr::Subquery(q) = x {
+            let cast = subquery_type(q, relations, args, release).and_then(|t| {
+                super::image::parse_expr(&format!("CAST(NULL AS {})", super::typed::type_name(t)))
+                    .ok()
+            });
+            match cast {
+                Some(c) => *x = Expr::Nested(Box::new(c)),
+                None => known = false,
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    if !known {
+        return Ok(None);
+    }
+    let columns: Vec<(Option<String>, String, Option<ColumnType>)> = args
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| (None, format!("${}", i + 1), Some(t)))
+        .collect();
+    let types = match super::pipeline::typed_on(&e, &columns, release) {
+        Ok(types) => types,
+        Err(err) if matches!(err.sqlstate(), Some("42883" | "42804")) => return Err(err),
+        Err(_) => return Ok(None),
+    };
+    // A string beside a number, by an operator of arithmetic or comparison: no form takes them; a
+    // CASE's results, its ELSE's first, of no common type.
+    let mut refused = None;
+    let _ = sqlparser::ast::visit_expressions(&e, |x| {
+        use sqlparser::ast::BinaryOperator as B;
+        if let Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } = x
+        {
+            let results: Vec<Option<ColumnType>> = else_result
+                .iter()
+                .map(|r| r.as_ref())
+                .chain(conditions.iter().map(|c| &c.result))
+                .map(|r| types.get(&(r as *const Expr)).copied())
+                .collect();
+            if let Err(why) = super::typed::common_type(&results, "CASE") {
+                refused = Some(why);
+                return ControlFlow::Break(());
+            }
+        }
+        if let Expr::BinaryOp { left, op, right } = x {
+            let (a, b) = (
+                types.get(&(left.as_ref() as *const Expr)).copied(),
+                types.get(&(right.as_ref() as *const Expr)).copied(),
+            );
+            let string = |t: Option<ColumnType>| {
+                matches!(t, Some(ColumnType::Text(_) | ColumnType::Bpchar(_) | ColumnType::Name))
+            };
+            let number = |t: Option<ColumnType>| {
+                t.is_some_and(|t| t.is_integer() || t.is_float() || t.is_numeric())
+            };
+            let compares = matches!(
+                op,
+                B::Plus | B::Minus | B::Multiply | B::Divide | B::Modulo | B::Eq | B::NotEq
+                    | B::Lt | B::LtEq | B::Gt | B::GtEq
+            );
+            if compares && (string(a) && number(b) || number(a) && string(b)) {
+                refused = Some(super::typed::no_operator(
+                    &super::typed::arg_name(a),
+                    &op.to_string(),
+                    &super::typed::arg_name(b),
+                ));
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    match refused {
+        Some(e) => Err(e),
+        None => Ok(types.get(&(&e as *const Expr)).copied()),
+    }
 }
 
 /// The type of a subquery's one column, typed over the tables its FROM names and the parameters,

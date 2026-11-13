@@ -301,6 +301,68 @@ fn create_function_types_a_statement_s_column_and_a_subquery_s_as_it_is_made() {
         let code = if why.starts_with("subquery") { "42601" } else { "42P13" };
         assert_eq!((e.sqlstate(), e.to_string()), (Some(code), why), "{body}");
     }
+    // A subquery beside what the body computes is typed as its column's type there.
+    let operator = |sides: &str| {
+        format!(
+            "operator does not exist: {sides}\nHINT:  No operator matches the given name and \
+             argument types. You might need to add explicit type casts."
+        )
+    };
+    for (head, body, code, why) in [
+        ("fo.w1() RETURNS integer", "RETURN 1 + (SELECT t FROM fo.src LIMIT 1)", "42883", operator("integer + text")),
+        (
+            "fo.w2() RETURNS integer",
+            "BEGIN ATOMIC SELECT 1 + (SELECT t FROM fo.src LIMIT 1); END",
+            "42883",
+            operator("integer + text"),
+        ),
+        ("fo.w3() RETURNS integer", "AS 'SELECT 1 + (SELECT t FROM fo.src LIMIT 1)'", "42883", operator("integer + text")),
+        (
+            "fo.w6() RETURNS integer",
+            "RETURN abs((SELECT t FROM fo.src LIMIT 1))",
+            "42883",
+            "function abs(text) does not exist\nHINT:  No function matches the given name and argument \
+             types. You might need to add explicit type casts."
+                .to_string(),
+        ),
+        ("fo.w7() RETURNS boolean", "RETURN (SELECT t FROM fo.src LIMIT 1) > 1", "42883", operator("text > integer")),
+        (
+            "fo.w8(x integer) RETURNS integer",
+            "RETURN x + (SELECT t FROM fo.src WHERE k = x)",
+            "42883",
+            operator("integer + text"),
+        ),
+        (
+            "fo.w10() RETURNS integer",
+            "RETURN coalesce((SELECT t FROM fo.src LIMIT 1), 1)",
+            "42804",
+            "COALESCE types text and integer cannot be matched".to_string(),
+        ),
+        ("fo.w11() RETURNS integer", "RETURN 1 + (SELECT max(t) FROM fo.src)", "42883", operator("integer + text")),
+        (
+            "fo.w12() RETURNS integer",
+            "RETURN CASE WHEN true THEN (SELECT t FROM fo.src LIMIT 1) ELSE 1 END",
+            "42804",
+            "CASE types integer and text cannot be matched".to_string(),
+        ),
+        (
+            "fo.w13() RETURNS integer",
+            "RETURN 1 + (SELECT (SELECT t FROM fo.src LIMIT 1))",
+            "42883",
+            operator("integer + text"),
+        ),
+    ] {
+        let ddl = format!("{TYPED} CREATE FUNCTION {head} LANGUAGE sql {body};");
+        let e = Catalog::parse(&ddl).err().unwrap_or_else(|| panic!("{body} was taken"));
+        assert_eq!((e.sqlstate(), e.to_string()), (Some(code), why), "{body}");
+    }
+    Catalog::parse(&format!(
+        "{TYPED} \
+         CREATE FUNCTION fo.w4() RETURNS integer LANGUAGE sql RETURN 1 + (SELECT k FROM fo.src LIMIT 1); \
+         CREATE FUNCTION fo.w5() RETURNS text LANGUAGE sql RETURN 'a' || (SELECT k FROM fo.src LIMIT 1); \
+         CREATE FUNCTION fo.w9() RETURNS integer LANGUAGE sql RETURN 1 + (SELECT t::integer FROM fo.src LIMIT 1);"
+    ))
+    .unwrap();
     let made = format!(
         "{TYPED} \
          CREATE FUNCTION fo.ok1() RETURNS integer LANGUAGE sql AS 'SELECT b FROM fo.src WHERE k = 1'; \
