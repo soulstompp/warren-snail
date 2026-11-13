@@ -591,6 +591,11 @@ fn an_order_read_backward_under_a_limit_makes_only_the_rows_it_reaches() {
             // A window read whole makes its select list only for the rows its LIMIT reaches.
             ("SELECT k, 1/(k - 2), row_number() OVER () FROM fo.src LIMIT 1", rows(&["1|-1|1"])),
             ("SELECT k, 1/(k - 2), sum(k) OVER () FROM fo.src LIMIT 1", rows(&["1|-1|10"])),
+            // The snail's own: a window that orders its rows, beside a backward sort, or over a
+            // WHERE read row by row, makes every row (18.6 answers `4|0|1`, `4|0|1` and `1|1`).
+            ("SELECT k, 1/(k - 2), rank() OVER (ORDER BY k DESC) FROM fo.src LIMIT 1", zero()),
+            ("SELECT k, 1/(k - 2), row_number() OVER () FROM fo.src ORDER BY k DESC LIMIT 1", zero()),
+            ("SELECT k, row_number() OVER () FROM fo.src WHERE 1/(k - 2) > -5 LIMIT 1", zero()),
         ],
     );
 }

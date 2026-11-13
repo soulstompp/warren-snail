@@ -9985,8 +9985,18 @@ impl<'q> StepRun<'q> {
             let by = windows::shared_partition(&p.calls.windows);
             let mut order = None;
             // Rows its LIMIT cuts, nothing sorting between, are made one at a time and none past
-            // the last it keeps, as PostgreSQL's WindowAgg makes each row its Limit asks for.
-            let cut = p.limit.is_some() && !going.sorts && !p.distinct && p.distinct_on.is_none();
+            // the last it keeps, as PostgreSQL's WindowAgg makes each row its Limit asks for: only
+            // where no window partitions or orders them, so that they come in the order 18.6's do.
+            let unordered = p.calls.windows.iter().all(|w| {
+                matches!(w, Expr::Function(f) if matches!(&f.over,
+                    Some(WindowType::WindowSpec(s))
+                        if s.partition_by.is_empty() && s.order_by.is_empty() && s.window_name.is_none()))
+            });
+            let cut = p.limit.is_some()
+                && !going.sorts
+                && !p.distinct
+                && p.distinct_on.is_none()
+                && unordered;
             held.finish(&|r| parted::partition_hash(by, r, &frame), &mut |rel| {
                 let per_row = windows::values(&p.calls.windows, &rel, &frame, None)?;
                 let mut rows = Vec::with_capacity(rel.rows.len());
