@@ -736,6 +736,8 @@ fn lift(
         }
     };
     let mut lifted = Lifted::default();
+    // pg_settings' values read where a server's own refuses them, before its view is lifted out.
+    super::sysviews::settings_values(&mut query, visible)?;
     match query.body.as_mut() {
         SetExpr::Select(s) => {
             for item in &mut s.from {

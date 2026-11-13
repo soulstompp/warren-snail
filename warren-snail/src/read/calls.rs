@@ -2268,7 +2268,7 @@ pub(super) fn text_array() -> ColumnType {
 }
 
 /// A one-dimensional `text[]` of the elements, from 1.
-fn text_array_of(elements: Vec<Option<String>>) -> Value {
+pub(super) fn text_array_of(elements: Vec<Option<String>>) -> Value {
     use crate::composed::{Compound, Item};
     let ty = text_array();
     let n = elements.len() as i32;

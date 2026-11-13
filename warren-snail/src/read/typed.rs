@@ -977,6 +977,9 @@ impl Typing<'_> {
                     if let Some(t) = time(&name, &types)? {
                         return Ok(t);
                     }
+                    if name == super::settings::ROWS && types.is_empty() {
+                        return Ok(Some(super::settings::record()));
+                    }
                     if let Some(t) = super::tsearch::typed(&name, &types)? {
                         return Ok(t);
                     }

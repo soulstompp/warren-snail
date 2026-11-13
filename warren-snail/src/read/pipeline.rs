@@ -1763,6 +1763,7 @@ const SET_RETURNING: [&str; 18] = [
 /// Whether a name is a set-returning function a step's select list reads.
 pub(crate) fn is_set_returning(name: &str) -> bool {
     SET_RETURNING.contains(&name)
+        || name == super::settings::ROWS
         || super::json::SETS.contains(&name)
         || super::tsearch::SETS.contains(&name)
         || super::handed::is_set_returning(name)
@@ -7451,6 +7452,21 @@ fn set_values(c: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
     }
     if let Some(v) = super::clock::zone_sets(&name, frame.now)? {
         return Ok(v);
+    }
+    if name == super::settings::ROWS {
+        let ty = super::settings::record();
+        let columns = super::settings::columns();
+        return super::settings::rows(frame.release)?
+            .into_iter()
+            .map(|r| {
+                let items = r
+                    .into_iter()
+                    .zip(&columns)
+                    .map(|(v, (_, t))| part_of(*t, v, false))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(composed(ty, crate::composed::Item::Record(items)))
+            })
+            .collect();
     }
     let casing = match super::calls::is_regexp_function(&name) {
         true => regex_casing(frame, c, &values.iter().map(|(v, _)| v).collect::<Vec<_>>())?,

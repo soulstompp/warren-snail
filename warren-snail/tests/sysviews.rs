@@ -213,7 +213,7 @@ fn a_view_whose_rows_only_a_server_holds_is_refused_whole() {
             "SELECT count(*) FROM information_schema.table_privileges",
             "privileges",
         ),
-        ("SELECT count(*) FROM pg_settings", "settings"),
+        ("SELECT count(*) FROM pg_file_settings", "settings"),
         ("SELECT count(*) FROM pg_locks", "locks"),
         ("SELECT count(*) FROM pg_stat_activity", "statistics"),
     ] {
@@ -262,4 +262,208 @@ fn what_postgresqls_views_are_written_in_is_read() {
     // A volatile operand is read once in PostgreSQL, and is not written into each WHEN.
     let e = refused(&mut snail, "SELECT CASE random() WHEN 1 THEN 1 END");
     assert!(e.contains("not read"), "{e}");
+}
+
+/// A row of text and NULLs, `-` a NULL.
+fn n(v: &[&str]) -> Vec<Option<String>> {
+    v.iter().map(|x| (*x != "-").then(|| x.to_string())).collect()
+}
+
+#[test]
+fn pg_settings_holds_every_setting_a_server_s_own_values_refused() {
+    let mut snail = Snail::open(&written("sv-settings", 18)).unwrap();
+    // Every setting 18.6 shows, in its order; seed is none of them.
+    assert_eq!(
+        rows(
+            &mut snail,
+            "SELECT count(*)::text, count(*) FILTER (WHERE context = 'user')::text, \
+             count(DISTINCT category)::text FROM pg_settings"
+        ),
+        [s(&["399", "151", "46"])]
+    );
+    assert_eq!(
+        rows(&mut snail, "SELECT count(*)::text FROM pg_settings WHERE name = 'seed'"),
+        [s(&["0"])]
+    );
+    assert_eq!(
+        rows(&mut snail, "SELECT name FROM pg_settings LIMIT 3 OFFSET 20"),
+        [
+            s(&["autovacuum_vacuum_insert_scale_factor"]),
+            s(&["autovacuum_vacuum_insert_threshold"]),
+            s(&["autovacuum_vacuum_max_threshold"]),
+        ]
+    );
+    // What the release says of each, a server's own among them.
+    assert_eq!(
+        rows(
+            &mut snail,
+            "SELECT name, unit, category, short_desc, extra_desc, context, vartype, min_val, \
+             max_val, enumvals::text, boot_val FROM pg_settings WHERE name IN ('shared_buffers', \
+             'work_mem', 'search_path', 'transaction_isolation', 'config_file') ORDER BY name"
+        ),
+        [
+            n(&["config_file", "-", "File Locations", "Sets the server's main configuration file.",
+                "-", "postmaster", "string", "-", "-", "-", "-"]),
+            n(&["search_path", "-", "Client Connection Defaults / Statement Behavior",
+                "Sets the schema search order for names that are not schema-qualified.", "-",
+                "user", "string", "-", "-", "-", "\"$user\", public"]),
+            n(&["shared_buffers", "8kB", "Resource Usage / Memory",
+                "Sets the number of shared memory buffers used by the server.", "-", "postmaster",
+                "integer", "16", "1073741823", "-", "16384"]),
+            n(&["transaction_isolation", "-", "Client Connection Defaults / Statement Behavior",
+                "Sets the current transaction's isolation level.", "-", "user", "enum", "-", "-",
+                "{serializable,\"repeatable read\",\"read committed\",\"read uncommitted\"}",
+                "read committed"]),
+            n(&["work_mem", "kB", "Resource Usage / Memory",
+                "Sets the maximum memory to be used for query workspaces.",
+                "This much memory can be used by each internal sort operation and hash table \
+                 before switching to temporary disk files.", "user", "integer", "64",
+                "2147483647", "-", "4096"]),
+        ]
+    );
+    // A session's own at its value in its base unit, where it comes from and its value at the
+    // session's start.
+    let values = "SELECT name, setting, unit, source, reset_val, boot_val, sourcefile, \
+         sourceline::text, pending_restart::text FROM pg_settings WHERE name IN ('work_mem', \
+         'statement_timeout', 'random_page_cost', 'enable_seqscan', 'IntervalStyle', \
+         'extra_float_digits', 'server_encoding', 'transaction_isolation', \
+         'default_transaction_isolation', 'vacuum_cost_delay', 'session_replication_role', \
+         'client_encoding', 'integer_datetimes', 'max_identifier_length', 'xmloption', \
+         'timezone_abbreviations') \
+         ORDER BY name";
+    assert_eq!(
+        rows(&mut snail, values),
+        [
+            n(&["IntervalStyle", "postgres", "-", "default", "postgres", "postgres", "-", "-", "false"]),
+            n(&["client_encoding", "UTF8", "-", "default", "UTF8", "SQL_ASCII", "-", "-", "false"]),
+            n(&["default_transaction_isolation", "read committed", "-", "default",
+                "read committed", "read committed", "-", "-", "false"]),
+            n(&["enable_seqscan", "on", "-", "default", "on", "on", "-", "-", "false"]),
+            n(&["extra_float_digits", "1", "-", "default", "1", "1", "-", "-", "false"]),
+            n(&["integer_datetimes", "on", "-", "default", "on", "on", "-", "-", "false"]),
+            n(&["max_identifier_length", "63", "-", "default", "63", "63", "-", "-", "false"]),
+            n(&["random_page_cost", "4", "-", "default", "4", "4", "-", "-", "false"]),
+            n(&["server_encoding", "UTF8", "-", "default", "UTF8", "SQL_ASCII", "-", "-", "false"]),
+            n(&["session_replication_role", "origin", "-", "default", "origin", "origin", "-", "-",
+                "false"]),
+            n(&["statement_timeout", "0", "ms", "default", "0", "0", "-", "-", "false"]),
+            // No boot value: the server puts PostgreSQL's Default set in place as it starts.
+            n(&["timezone_abbreviations", "Default", "-", "default", "Default", "-", "-", "-",
+                "false"]),
+            n(&["transaction_isolation", "read committed", "-", "override", "read committed",
+                "read committed", "-", "-", "false"]),
+            n(&["vacuum_cost_delay", "0", "ms", "default", "0", "0", "-", "-", "false"]),
+            n(&["work_mem", "4096", "kB", "default", "4096", "4096", "-", "-", "false"]),
+            n(&["xmloption", "content", "-", "default", "content", "content", "-", "-", "false"]),
+        ]
+    );
+    // A server's own row stands, and each of its values is refused by its name where it is read;
+    // the search path's for its own reason.
+    assert_eq!(
+        rows(
+            &mut snail,
+            "SELECT name, boot_val FROM pg_settings WHERE name IN ('shared_buffers', 'search_path') \
+             ORDER BY name"
+        ),
+        [s(&["search_path", "\"$user\", public"]), s(&["shared_buffers", "16384"])]
+    );
+    assert_eq!(
+        refused(
+            &mut snail,
+            "SELECT setting FROM pg_settings WHERE name = 'shared_buffers'"
+        ),
+        "pg_settings.setting of shared_buffers is refused: shared_buffers is the server's own \
+         setting, and a snail has no server"
+    );
+    assert_eq!(
+        refused(&mut snail, "SELECT * FROM pg_settings"),
+        "pg_settings.setting of allow_alter_system is refused: allow_alter_system is the \
+         server's own setting, and a snail has no server"
+    );
+    assert_eq!(
+        refused(
+            &mut snail,
+            "SELECT s.reset_val FROM pg_settings s WHERE s.name = 'search_path'"
+        ),
+        "pg_settings.reset_val of search_path is refused: a snail names each table by its \
+         schema, and has no search path"
+    );
+    for q in [
+        "SELECT (SELECT setting FROM pg_settings WHERE name = 'shared_buffers')",
+        "SELECT count(s.setting)::text FROM pg_settings s",
+        "SELECT name FROM pg_settings ORDER BY setting",
+    ] {
+        let e = refused(&mut snail, q);
+        assert!(e.contains("is the server's own setting"), "{q}: {e}");
+    }
+    assert_eq!(
+        rows(
+            &mut snail,
+            "SELECT (SELECT setting FROM pg_settings WHERE name = 'work_mem'), \
+             (SELECT p.name FROM pg_settings p WHERE p.name = 'port')"
+        ),
+        [s(&["4096", "port"])]
+    );
+    for column in ["source", "sourcefile", "sourceline::text", "pending_restart::text"] {
+        let e = refused(
+            &mut snail,
+            &format!("SELECT {column} FROM pg_settings WHERE name = 'port'"),
+        );
+        assert!(e.contains("of port is refused: port is the server's own setting"), "{e}");
+    }
+    // 19 RC1's settings for a file of 19.
+    let mut nineteen = Snail::open(&written("sv-settings-19", 19)).unwrap();
+    assert_eq!(
+        rows(&mut nineteen, "SELECT count(*)::text FROM pg_settings"),
+        [s(&["419"])]
+    );
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn pg_settings_shows_what_the_session_set() {
+    let mut snail = Snail::open_writing(&written("sv-settings-set", 18)).unwrap();
+    for set in [
+        "SET work_mem = '64MB'",
+        "SET random_page_cost = 2.5",
+        "SET vacuum_cost_delay = '1500us'",
+        "SET default_transaction_isolation = 'repeatable read'",
+        "SET statement_timeout = '5min'",
+        "SET timezone_abbreviations = 'Default'",
+        "BEGIN",
+        "SET LOCAL enable_seqscan = off",
+    ] {
+        snail.execute(set).unwrap_or_else(|e| panic!("{set}: {e}"));
+    }
+    let set = "SELECT name, setting, unit, source, reset_val FROM pg_settings WHERE name IN \
+         ('work_mem', 'statement_timeout', 'random_page_cost', 'enable_seqscan', \
+         'vacuum_cost_delay', 'transaction_isolation', 'default_transaction_isolation') \
+         ORDER BY name";
+    assert_eq!(
+        rows(&mut snail, set),
+        [
+            n(&["default_transaction_isolation", "repeatable read", "-", "session",
+                "read committed"]),
+            n(&["enable_seqscan", "off", "-", "session", "on"]),
+            n(&["random_page_cost", "2.5", "-", "session", "4"]),
+            n(&["statement_timeout", "300000", "ms", "session", "0"]),
+            n(&["transaction_isolation", "repeatable read", "-", "override", "read committed"]),
+            n(&["vacuum_cost_delay", "1.5", "ms", "session", "0"]),
+            n(&["work_mem", "65536", "kB", "session", "4096"]),
+        ]
+    );
+    for sql in ["COMMIT", "RESET work_mem"] {
+        snail.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(
+        rows(
+            &mut snail,
+            "SELECT name, setting, source, reset_val FROM pg_settings \
+             WHERE name IN ('work_mem', 'enable_seqscan') ORDER BY name"
+        ),
+        [
+            s(&["enable_seqscan", "on", "default", "on"]),
+            s(&["work_mem", "4096", "default", "4096"]),
+        ]
+    );
 }

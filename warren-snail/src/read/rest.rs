@@ -169,6 +169,7 @@ const FORMS: &[Form] = &[
         R::T(ColumnType::Text(None)),
     ),
     ("error_on_null", &[P::Element], R::First),
+    (super::settings::VALUE, &[TEXT, TEXT, P::Element], R::First),
     ("format_type", &[OID, I4], R::T(ColumnType::Text(None))),
     ("nameconcatoid", &[P::T(ColumnType::Name), OID], R::T(ColumnType::Name)),
     (
@@ -260,6 +261,7 @@ fn takes_null(name: &str) -> bool {
             | "error_on_null"
             | "format_type"
             | "set_config"
+            | super::settings::VALUE
     )
 }
 
@@ -1113,10 +1115,17 @@ fn text_of(v: &Value) -> Option<String> {
     }
 }
 
-/// current_setting and set_config of the fixed settings; none where it is neither.
+/// current_setting and set_config of the fixed settings, and a value of pg_settings read; none
+/// where it is none of them.
 fn settings(name: &str, values: &[Value]) -> Result<Option<Value>> {
     // A writer's session hands its own settings to the statement.
     match name {
+        super::settings::VALUE => {
+            if let (Some(n), Some(c)) = (text_of(&values[0]), text_of(&values[1])) {
+                super::settings::value_read(&n, &c)?;
+            }
+            return Ok(Some(values[2].clone()));
+        }
         "current_setting" => {
             let n = text_of(&values[0]).unwrap_or_default();
             let missing_ok = matches!(values.get(1), Some(Value::Bool(true)));

@@ -2,8 +2,12 @@
 //! those that change no answer, taken at any value PostgreSQL takes; those the session reads where
 //! they act, taken so too; those it answers under one value of, taken at that value alone; the
 //! transaction's modes; and the server's own, refused by name.
-//! Each value is read and shown as PostgreSQL's `guc.c` reads and shows it.
+//! Each value is read and shown as PostgreSQL's `guc.c` reads and shows it. pg_settings holds a row
+//! of every setting the release shows, a session's own at its value and source, a server's own
+//! with each of its values refused by name where a statement reads it, as SHOW refuses it.
 
+use super::pipeline::Value;
+use crate::catalog::ColumnType;
 use crate::{Error, Result};
 
 /// One of PostgreSQL's settings, as its release's `pg_settings` lists it.
@@ -12,10 +16,17 @@ pub(crate) struct Guc {
     pub(crate) name: &'static str,
     vartype: &'static str,
     unit: &'static str,
+    /// Its boot value, empty where it has none.
     pub(crate) boot: &'static str,
+    /// Whether it has no boot value: pg_settings shows NULL.
+    boot_null: bool,
     enumvals: Vec<&'static str>,
     min: &'static str,
     max: &'static str,
+    context: &'static str,
+    category: &'static str,
+    short_desc: &'static str,
+    extra_desc: &'static str,
 }
 
 fn read_table(text: &'static str) -> Vec<Guc> {
@@ -27,10 +38,15 @@ fn read_table(text: &'static str) -> Vec<Guc> {
                 name: f[0],
                 vartype: f[1],
                 unit: f[2],
-                boot: f[3],
+                boot: if f[3] == "\\N" { "" } else { f[3] },
+                boot_null: f[3] == "\\N",
                 enumvals: f[4].split(',').filter(|s| !s.is_empty()).collect(),
                 min: f[5],
                 max: f[6],
+                context: f[7],
+                category: f[8],
+                short_desc: f[9],
+                extra_desc: f[10],
             }
         })
         .collect()
@@ -100,7 +116,7 @@ const TAKEN: [&str; 16] = [
 ];
 
 /// The settings the snail answers under one value of, and why.
-const OWN: [(&str, &str); 17] = [
+const OWN: [(&str, &str); 16] = [
     (
         "idle_in_transaction_session_timeout",
         "the snail ends no session",
@@ -135,10 +151,6 @@ const OWN: [(&str, &str); 17] = [
         "restrict_nonsystem_relation_kind",
         "it changes which relations a statement reads",
     ),
-    (
-        "timezone_abbreviations",
-        "the snail reads PostgreSQL's Default set alone",
-    ),
 ];
 
 /// How the snail takes the setting of that name, lower case.
@@ -171,6 +183,11 @@ pub(crate) fn kind(release: u8, name: &str) -> Option<Kind> {
         "search_path" => Kind::Path,
         "session_replication_role" | "timezone" => Kind::Read,
         "client_encoding" => Kind::Own("UTF8", "the snail answers in UTF8"),
+        // Its boot value is none: PostgreSQL's Default set is put in place as a server starts.
+        "timezone_abbreviations" => Kind::Own(
+            "Default",
+            "the snail reads PostgreSQL's Default set alone",
+        ),
         "server_encoding" => Kind::Preset("UTF8"),
         "integer_datetimes" => Kind::Preset("on"),
         "max_identifier_length" => Kind::Preset("63"),
@@ -382,6 +399,188 @@ pub(crate) fn shown(view: &View, name: &str) -> Result<(String, String)> {
         Kind::Server => return Err(server_own(&format!("SHOW {name}"), name)),
     };
     Ok((column, value))
+}
+
+impl View {
+    /// The settings as a session of the release begins: none set, each mode its default, the
+    /// file's lc_monetary and default_text_search_config.
+    fn at_start(
+        release: u8,
+        monetary: crate::monetary::Monetary,
+        text_search: crate::tsearch::TextSearch,
+    ) -> View {
+        const MODES: [&str; 6] = [
+            "transaction_isolation",
+            "transaction_read_only",
+            "transaction_deferrable",
+            "default_transaction_isolation",
+            "default_transaction_read_only",
+            "default_transaction_deferrable",
+        ];
+        View {
+            release,
+            monetary: monetary.name(),
+            lc_monetary: monetary,
+            text_search,
+            values: std::collections::BTreeMap::new(),
+            modes: MODES
+                .into_iter()
+                .map(|n| (n, find(release, n).expect("a mode's setting").boot))
+                .collect(),
+            changed: Vec::new(),
+        }
+    }
+}
+
+/// What pg_settings' rows are read from where a statement reads pg_settings: no name a statement
+/// can write.
+pub(crate) const ROWS: &str = "\u{1}pg_settings";
+
+/// What each value of a row of pg_settings is read through: the value, or its refusal where the
+/// setting is the server's own.
+pub(crate) const VALUE: &str = "\u{1}pg_settings_value";
+
+/// pg_settings' columns that hold a setting's value, which a server's own setting refuses.
+pub(crate) const VALUES: [&str; 6] = [
+    "setting",
+    "source",
+    "reset_val",
+    "sourcefile",
+    "sourceline",
+    "pending_restart",
+];
+
+/// pg_settings' columns, as pg_show_all_settings names them, and their types.
+pub(crate) fn columns() -> [(&'static str, ColumnType); 17] {
+    let text = ColumnType::Text(None);
+    [
+        ("name", text),
+        ("setting", text),
+        ("unit", text),
+        ("category", text),
+        ("short_desc", text),
+        ("extra_desc", text),
+        ("context", text),
+        ("vartype", text),
+        ("source", text),
+        ("min_val", text),
+        ("max_val", text),
+        ("enumvals", super::calls::text_array()),
+        ("boot_val", text),
+        ("reset_val", text),
+        ("sourcefile", text),
+        ("sourceline", ColumnType::Int4),
+        ("pending_restart", ColumnType::Boolean),
+    ]
+}
+
+/// The record of a row of pg_settings.
+pub(crate) fn record() -> ColumnType {
+    crate::composed::type_of(crate::composed::Composed::Record {
+        name: "record".into(),
+        fields: columns()
+            .iter()
+            .map(|(n, t)| crate::composed::Field::new(n, *t))
+            .collect(),
+    })
+}
+
+/// pg_settings' rows: every setting the release shows, in its order, each its values in
+/// `columns()`' order. A session's own stands at its value, `session` where the session set it,
+/// `override` for the transaction's modes and `default` otherwise, and its value as the session
+/// began; a server's own and the search path hold NULL where their values stand, refused where
+/// they are read (`value_read`).
+pub(crate) fn rows(release: u8) -> Result<Vec<Vec<Value>>> {
+    VIEW.with(|v| {
+        let held = v.borrow();
+        let begun;
+        let view = match held.as_ref() {
+            Some(view) => view,
+            None => {
+                begun = View::at_start(release, crate::monetary::Monetary::C, Default::default());
+                &begun
+            }
+        };
+        let start = View::at_start(view.release, view.lc_monetary, view.text_search);
+        table(view.release)
+            .iter()
+            .map(|g| row(view, &start, g))
+            .collect()
+    })
+}
+
+fn row(view: &View, start: &View, g: &Guc) -> Result<Vec<Value>> {
+    let text = |s: &str| Value::Text(s.to_string());
+    let or_null = |s: &str| if s.is_empty() { Value::Null } else { text(s) };
+    let lower = g.name.to_ascii_lowercase();
+    let k = kind(view.release, &lower).expect("a setting of the release");
+    let (setting, source, reset, pending) = match k {
+        Kind::Server | Kind::Path => (Value::Null, Value::Null, Value::Null, Value::Null),
+        _ => {
+            let now = shown(view, &lower)?.1;
+            let source = match k {
+                Kind::Mode if !lower.starts_with("default_") => "override",
+                Kind::Mode if now != g.boot => "session",
+                _ if view.values.contains_key(&lower) => "session",
+                _ => "default",
+            };
+            let began = shown(start, &lower)?.1;
+            (
+                text(&raw(g, &now)),
+                text(source),
+                text(&raw(g, &began)),
+                Value::Bool(false),
+            )
+        }
+    };
+    let enumvals = match g.enumvals.is_empty() {
+        true => Value::Null,
+        false => super::calls::text_array_of(g.enumvals.iter().map(|e| Some(e.to_string())).collect()),
+    };
+    Ok(vec![
+        text(g.name),
+        setting,
+        or_null(g.unit),
+        text(g.category),
+        text(g.short_desc),
+        or_null(g.extra_desc),
+        text(g.context),
+        text(g.vartype),
+        source,
+        or_null(g.min),
+        or_null(g.max),
+        enumvals,
+        if g.boot_null { Value::Null } else { text(g.boot) },
+        reset,
+        Value::Null,
+        Value::Null,
+        pending,
+    ])
+}
+
+/// A setting's value as pg_settings writes it: an integer or a real in its base unit, as
+/// GetConfigOptionValues writes it; any other as SHOW does.
+fn raw(g: &Guc, shown: &str) -> String {
+    match g.vartype {
+        "integer" => parse_number(shown, g.unit, true)
+            .map_or_else(|| shown.to_string(), |v| (v as i64).to_string()),
+        "real" => parse_number(shown, g.unit, false).map_or_else(|| shown.to_string(), g_format),
+        _ => shown.to_string(),
+    }
+}
+
+/// A value of the column `column` of pg_settings' row of the setting `name`, read: refused where
+/// the setting is the server's own, as SHOW refuses it, and the search path for its own reason.
+pub(crate) fn value_read(name: &str, column: &str) -> Result<()> {
+    let release = VIEW
+        .with(|v| v.borrow().as_ref().map(|v| v.release))
+        .unwrap_or_else(super::handed::release_held);
+    let what = format!("pg_settings.{column} of {name}");
+    match kind(release, &name.to_ascii_lowercase()) {
+        Some(Kind::Server) => Err(server_own(&what, name)),
+        Some(Kind::Path) => Err(no_path(&what)),
+        _ => Ok(()),
+    }
 }
 
 thread_local! {

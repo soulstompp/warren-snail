@@ -240,7 +240,6 @@ const SERVERS_VIEWS: &[(&[&str], &str)] = &[
     (&["pg_locks", "pg_prepared_xacts"], "transactions' locks"),
     (
         &[
-            "pg_settings",
             "pg_file_settings",
             "pg_hba_file_rules",
             "pg_ident_file_mappings",
@@ -468,8 +467,302 @@ pub(crate) fn system_view(
         return Err(Error::new(format!("{full}'s definition is no question")));
     };
     let mut q = (**q).clone();
+    if bare == "pg_settings" {
+        settings_read(&mut q)?;
+    }
     let refused = rewrite(&mut q, catalog)?;
     Ok(Some((super::spelled::between_written(&q), refused)))
+}
+
+/// pg_settings read from the session's rows of every setting, where its definition reads
+/// pg_show_all_settings: each value a server's own setting holds is NULL there, and refused where
+/// a statement reads it (`settings_values`).
+fn settings_read(q: &mut Query) -> Result<()> {
+    let SetExpr::Select(s) = q.body.as_mut() else {
+        return Err(Error::new("pg_settings' definition is no question"));
+    };
+    for t in &mut s.from {
+        if let sqlparser::ast::TableFactor::Table { name, args: Some(_), .. } = &mut t.relation {
+            if crate::catalog::object_name(name) == "pg_show_all_settings" {
+                *name = sqlparser::ast::ObjectName::from(vec![sqlparser::ast::Ident::with_quote(
+                    '"',
+                    super::settings::ROWS,
+                )]);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A SELECT whose FROM reads pg_settings, its expressions that read a value a setting holds
+/// (`settings::VALUES`) reading it through the refusal of a server's own, by the row's name: an
+/// item that is the value alone keeps its column's name, a star over pg_settings is its columns
+/// so read, and its whole row is refused, as a server's own values in it are. A bare name is
+/// pg_settings' where it is the FROM's one pg_settings, and in a subquery only where no FROM
+/// stands between them. A WITH query of the name is no view.
+pub(crate) fn settings_values(q: &mut Query, visible: &[String]) -> Result<()> {
+    use sqlparser::ast::{JoinConstraint, JoinOperator, TableFactor, TableWithJoins, VisitMut};
+    let SetExpr::Select(s) = q.body.as_mut() else {
+        return Ok(());
+    };
+    // Each FROM relation in order: the name it goes by, and whether it is pg_settings.
+    fn relations(t: &TableWithJoins, visible: &[String], out: &mut Vec<(Option<String>, bool)>) {
+        for f in std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)) {
+            out.push(match f {
+                TableFactor::Table {
+                    name, alias, args, ..
+                } => {
+                    let n = crate::catalog::object_name(name);
+                    let settings = args.is_none()
+                        && !visible.contains(&n)
+                        && view_named(&n).as_deref() == Some("pg_catalog.pg_settings");
+                    let by = match alias {
+                        Some(a) => crate::catalog::ident(&a.name),
+                        None => n.rsplit('.').next().unwrap_or(&n).to_string(),
+                    };
+                    (Some(by), settings)
+                }
+                TableFactor::Derived { alias, .. } => {
+                    (alias.as_ref().map(|a| crate::catalog::ident(&a.name)), false)
+                }
+                TableFactor::NestedJoin {
+                    table_with_joins, ..
+                } => {
+                    relations(table_with_joins, visible, out);
+                    continue;
+                }
+                _ => (None, false),
+            });
+        }
+    }
+    let mut from = Vec::new();
+    for t in &s.from {
+        relations(t, visible, &mut from);
+    }
+    let settings: Vec<&str> = from
+        .iter()
+        .filter(|(_, s)| *s)
+        .filter_map(|(n, _)| n.as_deref())
+        .collect();
+    let [relation] = settings.as_slice() else {
+        return Ok(());
+    };
+    let relation = relation.to_string();
+    // A join USING or NATURAL merges columns a star gives once.
+    let merged = s.from.iter().flat_map(|t| &t.joins).any(|j| {
+        let on = match &j.join_operator {
+            JoinOperator::Join(c)
+            | JoinOperator::Inner(c)
+            | JoinOperator::Left(c)
+            | JoinOperator::LeftOuter(c)
+            | JoinOperator::Right(c)
+            | JoinOperator::RightOuter(c)
+            | JoinOperator::FullOuter(c) => Some(c),
+            _ => None,
+        };
+        matches!(on, Some(JoinConstraint::Using(_) | JoinConstraint::Natural))
+    });
+    // pg_settings' columns as a star gives them, each value read through its refusal.
+    let columns = |by: &str| -> Result<Vec<SelectItem>> {
+        let q = super::relations::quote(by);
+        let list: Vec<String> = super::settings::columns()
+            .iter()
+            .map(|(c, _)| format!("{q}.{c}"))
+            .collect();
+        let mut items = select_list(&list.join(", "))?;
+        for item in &mut items {
+            if let SelectItem::UnnamedExpr(e) = item {
+                if let Some(c) = value_column(e, by) {
+                    *item = SelectItem::ExprWithAlias {
+                        expr: value_read(e, by, &c)?,
+                        alias: sqlparser::ast::Ident::new(c),
+                    };
+                }
+            }
+        }
+        Ok(items)
+    };
+    let mut projection = Vec::with_capacity(s.projection.len());
+    for item in std::mem::take(&mut s.projection) {
+        match &item {
+            SelectItem::Wildcard(_) => {
+                for (by, settings) in &from {
+                    match (by, settings) {
+                        (Some(by), true) => projection.extend(columns(by)?),
+                        (Some(by), false) if !merged => projection.extend(select_list(&format!(
+                            "{}.*",
+                            super::relations::quote(by)
+                        ))?),
+                        _ => {
+                            return Err(Error::new(
+                                "* is not read beside pg_settings here: a server's own \
+                                 setting's values are refused where they are read, so name each \
+                                 column",
+                            ))
+                        }
+                    }
+                }
+            }
+            SelectItem::QualifiedWildcard(
+                sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(n),
+                _,
+            ) if crate::catalog::object_name(n) == relation => projection.extend(columns(&relation)?),
+            _ => projection.push(item),
+        }
+    }
+    s.projection = projection;
+    let mut wrap = Wrap {
+        relation: &relation,
+        from: Vec::new(),
+        inside: 0,
+        failed: None,
+    };
+    for item in &mut s.projection {
+        let alone = match item {
+            SelectItem::UnnamedExpr(e) => value_column(e, &relation),
+            _ => None,
+        };
+        let _ = item.visit(&mut wrap);
+        if let (Some(c), SelectItem::UnnamedExpr(e)) = (alone, &*item) {
+            *item = SelectItem::ExprWithAlias {
+                expr: e.clone(),
+                alias: sqlparser::ast::Ident::new(c),
+            };
+        }
+    }
+    let _ = s.selection.visit(&mut wrap);
+    let _ = s.having.visit(&mut wrap);
+    let _ = s.group_by.visit(&mut wrap);
+    let _ = s.distinct.visit(&mut wrap);
+    let _ = s.named_window.visit(&mut wrap);
+    for t in &mut s.from {
+        for j in &mut t.joins {
+            let _ = j.join_operator.visit(&mut wrap);
+        }
+    }
+    let _ = q.order_by.visit(&mut wrap);
+    match wrap.failed {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// A select list's items, as written.
+fn select_list(text: &str) -> Result<Vec<SelectItem>> {
+    let parsed = crate::read::image::parse_sql(&format!("SELECT {text}"))?;
+    match parsed.as_slice() {
+        [sqlparser::ast::Statement::Query(q)] => match q.body.as_ref() {
+            SetExpr::Select(s) => Ok(s.projection.clone()),
+            _ => Err(Error::new(format!("{text} is no select list"))),
+        },
+        _ => Err(Error::new(format!("{text} is no select list"))),
+    }
+}
+
+/// The value column of pg_settings, by the name it goes by, that an expression names: bare or
+/// after that name.
+fn value_column(e: &Expr, relation: &str) -> Option<String> {
+    let c = match e {
+        Expr::Identifier(i) => crate::catalog::ident(i),
+        Expr::CompoundIdentifier(p) => {
+            let names: Vec<String> = p.iter().map(crate::catalog::ident).collect();
+            match names.as_slice() {
+                [r, c] if r == relation => c.clone(),
+                [s, r, c] if s == "pg_catalog" && r == relation && r == "pg_settings" => c.clone(),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    super::settings::VALUES.contains(&c.as_str()).then_some(c)
+}
+
+/// A value column of pg_settings read through the refusal of a server's own setting, by its row's
+/// name.
+fn value_read(e: &Expr, relation: &str, column: &str) -> Result<Expr> {
+    let read = select_list(&format!(
+        "\"{}\"({}.name, '{column}', {e})",
+        super::settings::VALUE,
+        super::relations::quote(relation)
+    ))?;
+    match read.into_iter().next() {
+        Some(SelectItem::UnnamedExpr(x)) => Ok(x),
+        _ => Err(Error::new(format!("{e} is not read"))),
+    }
+}
+
+/// Each expression reading a value column of pg_settings read through `value_read`, and its whole
+/// row refused.
+struct Wrap<'a> {
+    relation: &'a str,
+    /// For each subquery entered, whether a FROM of its own stands in it.
+    from: Vec<bool>,
+    /// How many values read through their refusal the expression is inside.
+    inside: usize,
+    failed: Option<Error>,
+}
+
+impl sqlparser::ast::VisitorMut for Wrap<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<()> {
+        self.from
+            .push(!matches!(q.body.as_ref(), SetExpr::Select(s) if s.from.is_empty()));
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _: &mut Query) -> ControlFlow<()> {
+        self.from.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        // A value already read through its refusal is read so once.
+        if let Expr::Function(f) = e {
+            if function_name(f) == super::settings::VALUE {
+                self.inside += 1;
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        if let Expr::Function(f) = e {
+            if function_name(f) == super::settings::VALUE {
+                self.inside -= 1;
+                return ControlFlow::Continue(());
+            }
+        }
+        if self.inside > 0 {
+            return ControlFlow::Continue(());
+        }
+        let bare = !self.from.iter().any(|f| *f);
+        let column = |n: &str| super::settings::columns().iter().any(|(c, _)| *c == n);
+        match e {
+            Expr::Identifier(_) if !bare => {}
+            Expr::Identifier(i)
+                if crate::catalog::ident(i) == self.relation
+                    && !column(&crate::catalog::ident(i)) =>
+            {
+                self.failed.get_or_insert(Error::new(format!(
+                    "a whole row of pg_settings is not read: a server's own setting's values in \
+                     it are refused where they are read, so name each column of {}",
+                    self.relation
+                )));
+            }
+            _ => {
+                if let Some(c) = value_column(e, self.relation) {
+                    match value_read(e, self.relation, &c) {
+                        Ok(x) => *e = x,
+                        Err(err) => {
+                            self.failed.get_or_insert(err);
+                        }
+                    }
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// Each output column's refusal: a select item reading what only a server fills is NULL. Then,
