@@ -486,7 +486,8 @@ fn cut_above(key: &[KeyValue], other: &[KeyValue]) -> (Vec<KeyValue>, bool) {
 
 /// Neighbouring blocks written afresh, their first and last keys whole, given the bounds between
 /// them: each block's first the separator below it, its last the greatest key the separator above
-/// it leaves it. The first block's lower bound is `lower` where its first key reaches it, `lower`
+/// it leaves it; where a block's last key is the next one's first, that key itself, which the next
+/// shares. The first block's lower bound is `lower` where its first key reaches it, `lower`
 /// being also the upper bound of the block before, which a bound cut lower would leave keys of;
 /// else its first key as `cut_below` cuts it beside the last block's last, the lower of the two.
 /// The last block's upper bound is `upper`, with whether every key sorts before it, or its last key
