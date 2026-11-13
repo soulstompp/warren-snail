@@ -4216,7 +4216,12 @@ fn values_step(
         for r in &rows {
             ts.push(typing.type_of(&r[c])?);
         }
-        types.push(typed::common_type(&ts, "VALUES")?);
+        let t = typed::common_type(&ts, "VALUES")?;
+        // Its modifier kept only where every row gives that type and modifier.
+        types.push(match ts.iter().all(|&x| x == Some(t)) {
+            true => t,
+            false => typed::unmodified(t),
+        });
     }
     let subs = super::subqueries::Subs::new(&plans, asked, made, casings, &[], accrued);
     let frame = pipeline::Frame {
@@ -4522,8 +4527,8 @@ fn arm_of(
 
 /// What each column of an arm's SELECT is where an untyped literal or parameter makes it, as
 /// PostgreSQL leaves such an arm's output untyped; text where its DISTINCT, DISTINCT ON, GROUP BY
-/// or ORDER BY sorts the column (by place, output name or the item itself); none where a star
-/// stands.
+/// or ORDER BY sorts the column (by place, output name or the item itself), or where a CASE of them
+/// stands; none where a star stands.
 fn untyped_of(q: &Query) -> Vec<Untyped> {
     use sqlparser::ast::{Distinct, GroupByExpr, OrderByKind};
     let SetExpr::Select(s) = q.body.as_ref() else {
@@ -4565,6 +4570,19 @@ fn untyped_of(q: &Query) -> Vec<Untyped> {
                 SqlValue::Null | SqlValue::Placeholder(_) => Untyped::Null,
                 _ => Untyped::No,
             },
+            // A CASE whose every result is untyped is text, as transformCaseExpr resolves it.
+            Expr::Case {
+                conditions,
+                else_result,
+                ..
+            } if conditions
+                .iter()
+                .map(|w| &w.result)
+                .chain(else_result.as_deref())
+                .all(|r| !matches!(of(r), Untyped::No)) =>
+            {
+                Untyped::Text
+            }
             _ => Untyped::No,
         }
     }
@@ -4802,7 +4820,14 @@ fn met(arm: &Arm, made: &Steps, casings: &Casings) -> Result<Met> {
             Untyped::No => m.types[c],
             _ => None,
         };
-        let ty = typed::common_type(&[side(&l), side(&r)], context)?;
+        let sides = [side(&l), side(&r)];
+        let ty = typed::common_type(&sides, context)?;
+        // Its modifier kept only where both arms give that type and modifier, as PostgreSQL's
+        // select_common_typmod keeps it.
+        let ty = match sides == [Some(ty), Some(ty)] {
+            true => ty,
+            false => typed::unmodified(ty),
+        };
         // A literal is read in the type found before any row, as PostgreSQL's parser reads it.
         for m in [&l, &r] {
             if let Untyped::Literal(s) = &m.untyped[c] {

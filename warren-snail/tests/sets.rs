@@ -288,6 +288,106 @@ fn sorted_and_limited_over_the_whole_inside_with_and_derived() {
 }
 
 #[test]
+fn a_column_keeps_a_length_only_where_every_arm_gives_it() {
+    let path = tmp("sets-lengths.snail");
+    let catalog = Catalog::parse(
+        "CREATE SCHEMA b; CREATE TABLE b.l (id integer NOT NULL, agegr1 varchar(5), \
+         v7 varchar(7), c3 char(3), c5 char(5), PRIMARY KEY (id));",
+    )
+    .unwrap();
+    let text = |s: &str| Values::Text(vec![Some(s.into())]);
+    let l = Rows {
+        columns: vec![
+            Values::Int(vec![Some(1)]),
+            text("a"),
+            text("abcdefg"),
+            text("abc"),
+            text("abcde"),
+        ],
+    };
+    write(&path, &catalog, &[("b.l".into(), l)]).unwrap();
+    // An answer's first column, each value as text, and the type its metadata names, if any.
+    let ask = |q: &str| {
+        let (b, _) = fresh(&path)
+            .ask(q, None)
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        let ty = b.schema().field(0).metadata().get("pg_type").cloned();
+        let values: Vec<String> = rows(&b)
+            .into_iter()
+            .map(|r| r[0].clone().unwrap_or_else(|| "-".into()))
+            .collect();
+        (values.join(" "), ty.unwrap_or_default())
+    };
+    // A literal, or a CASE of literals, beside a varchar(5), either first, at the top and in a FROM:
+    // a varchar of no length, the CASE's text where it comes first.
+    for (q, want) in [
+        ("SELECT 'African Descent' AS c UNION ALL SELECT agegr1 FROM b.l", "African Descent a"),
+        ("SELECT agegr1 FROM b.l UNION ALL SELECT 'African Descent'", "a African Descent"),
+        (
+            "SELECT c || '|' || pg_typeof(c) FROM (SELECT 'African Descent' AS c UNION ALL \
+             SELECT agegr1 FROM b.l) x ORDER BY 1",
+            "African Descent|character varying a|character varying",
+        ),
+        (
+            "SELECT c || '|' || pg_typeof(c) FROM (SELECT agegr1 AS c FROM b.l UNION ALL \
+             SELECT 'African Descent') x ORDER BY 1",
+            "African Descent|character varying a|character varying",
+        ),
+        (
+            "SELECT c || '|' || pg_typeof(c) FROM (SELECT CASE WHEN id > 0 THEN 'African Descent' \
+             ELSE 'x' END AS c FROM b.l UNION ALL SELECT agegr1 FROM b.l) x ORDER BY 1",
+            "African Descent|text a|text",
+        ),
+        (
+            "SELECT c || '|' || pg_typeof(c) FROM (SELECT agegr1 AS c FROM b.l UNION ALL \
+             SELECT CASE WHEN id > 0 THEN 'African Descent' ELSE 'x' END FROM b.l) x ORDER BY 1",
+            "African Descent|character varying a|character varying",
+        ),
+        (
+            "SELECT c FROM (SELECT v7 AS c FROM b.l UNION ALL SELECT agegr1 FROM b.l) x ORDER BY 1",
+            "a abcdefg",
+        ),
+        (
+            "SELECT column1 FROM (VALUES ('abc'::varchar(5)), ('African Descent')) v ORDER BY 1",
+            "African Descent abc",
+        ),
+    ] {
+        assert_eq!(ask(q).0, want, "{q}");
+    }
+    // A char(3) keeps its length only beside a char(3): beside a literal it pads nothing and cuts
+    // nothing.
+    for (q, want, ty) in [
+        ("SELECT c3 FROM b.l UNION ALL SELECT c3 FROM b.l", "abc abc", "character(3)"),
+        ("SELECT c3 FROM b.l UNION ALL SELECT c5 FROM b.l", "abc abcde", "bpchar"),
+        ("SELECT c3 FROM b.l UNION ALL SELECT 'abcdefgh'", "abc abcdefgh", "bpchar"),
+        ("SELECT c3 FROM b.l UNION ALL SELECT NULL", "abc -", "bpchar"),
+        (
+            "SELECT * FROM (VALUES ('ab'::char(3)), ('cd'::char(3))) v",
+            "ab  cd ",
+            "character(3)",
+        ),
+    ] {
+        assert_eq!(ask(q), (want.to_string(), ty.to_string()), "{q}");
+    }
+    for (q, want) in [
+        (
+            "SELECT octet_length(c) FROM (SELECT c3 AS c FROM b.l UNION ALL SELECT 'ab') x",
+            "3 2",
+        ),
+        (
+            "SELECT octet_length(c) FROM (SELECT 'ab' AS c UNION ALL SELECT c3 FROM b.l) x",
+            "2 3",
+        ),
+        (
+            "SELECT octet_length(column1) FROM (VALUES ('ab'::char(3)), ('abcdefgh')) v",
+            "3 8",
+        ),
+    ] {
+        assert_eq!(ask(q).0, want, "{q}");
+    }
+}
+
+#[test]
 fn rows_of_arrays_are_met_by_their_elements() {
     let path = snail("arrays");
     let q = "SELECT d.x::text FROM (SELECT x FROM (VALUES ('{a,b}'::text[]), ('{a,b}'), \
