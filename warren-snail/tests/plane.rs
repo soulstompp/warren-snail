@@ -2002,21 +2002,23 @@ fn a_question_with_no_limit_or_as_many_rows_as_the_table_goes_by_pages_and_its_r
     let every = "SELECT id FROM s.t ORDER BY v <-> point '(1500,1500)', id LIMIT 16384";
     let (got, round) = along(&mut fresh(&path), every, None);
     assert_eq!((got, round.order.as_str()), (key.clone(), "t_pkey"));
-    // Past its room a sort spills, and the strand reads nothing more and holds a ring of blocks.
+    // Past its room a sort spills, and the strand's walk more: it holds each row it has read and not
+    // handed on whole, where the sort holds each as one string of bytes. So the table's own order
+    // and a sort, the pages the strand would read and fewer written.
     let dir = tmp("plane-near-all-spill");
     std::fs::create_dir_all(&dir).unwrap();
     let mut s = fresh(&path);
     s.size_rounds(warren_snail::room::Sizes::of(131_072).in_dir(&dir));
     let (got, round) = along(&mut s, q, None);
     assert_eq!(got, key);
-    assert_eq!(round.order, "t_gist", "{round:?}");
+    assert_eq!(round.order, "t_pkey", "{round:?}");
     assert_eq!(round.column_pages_read, whole.column_pages_read, "{round:?}");
     assert_eq!(round.spill_pages_written, round.spill_pages_read, "{round:?}");
     let mut s = fresh(&path);
     s.size_rounds(warren_snail::room::Sizes::of(131_072).in_dir(&dir));
-    let (got, by_key) = along(&mut s, q, Some("t_pkey"));
+    let (got, by_strand) = along(&mut s, q, Some("t_gist"));
     assert_eq!(got, key);
-    assert!(by_key.spill_pages_written > round.spill_pages_written, "{by_key:?} {round:?}");
+    assert!(by_strand.spill_pages_written > round.spill_pages_written, "{by_strand:?} {round:?}");
     // At a room smaller than a block's rows what the walk holds is written, once, and read back once.
     let mut s = fresh(&path);
     s.size_rounds(warren_snail::room::Sizes::of(16_384).in_dir(&dir));

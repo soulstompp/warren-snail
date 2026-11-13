@@ -220,6 +220,11 @@ fn near_of(v: &Value) -> Result<Near> {
     }
 }
 
+/// The bytes a walk holds a row of `values` values at, beside the values' own: the row whole.
+pub(super) fn ring_row_bytes(values: usize) -> u64 {
+    (std::mem::size_of::<Vec<Value>>() + values * std::mem::size_of::<Value>()) as u64
+}
+
 /// The rows a walk has read and not yet handed on, nearest first, in the round's room: where they do
 /// not fit, those that sort last are written, and read back once the rows before them have gone.
 struct Frontier {
@@ -601,10 +606,17 @@ impl Snail {
                 .iter()
                 .map(|&c| held_width(table.columns[c].ty))
                 .sum();
+            // What the sort and the walk write past the room, each written and read back: the rows
+            // past what it holds, a sort's as one string of bytes each, the walk's each whole.
             let room = self.reader.room().sizes().bytes;
-            let sort = 2 * (whole.table_rows * width)
-                .saturating_sub(room)
-                .div_ceil(PAGE as u64);
+            let past = |rows: u64, held: u64| {
+                2 * (rows.saturating_sub(room / held.max(1)) * width).div_ceil(PAGE as u64)
+            };
+            let sort = past(whole.table_rows, pipeline::sort_held_bytes(width, width));
+            let walk = past(
+                need.unwrap_or(whole.table_rows).min(whole.table_rows),
+                ring_row_bytes(stored.len()) + width,
+            );
             let held = self.reader.held_under(tag);
             let along = match need {
                 Some(n) => {
@@ -634,7 +646,7 @@ impl Snail {
                 exact: None,
                 held: 0,
             });
-            if along >= whole_file + sort {
+            if along + walk >= whole_file + sort {
                 return Ok(Nearest::Table(
                     self.touched() - before,
                     self.pages_held() - held_before,

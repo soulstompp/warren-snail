@@ -15,24 +15,21 @@ use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-/// A row held: its key's hash, the place it came in, the row as one string of bytes, and the bytes
-/// it holds.
+/// A row held: its key's hash, the place it came in, and the row as one string of bytes.
 struct Held {
     hash: u64,
     seq: u64,
     row: Packed,
-    bytes: u64,
 }
 
 impl Held {
     fn of(hash: u64, seq: u64, row: Packed) -> Held {
-        let bytes = std::mem::size_of::<Held>() as u64 + row.len() as u64;
-        Held {
-            hash,
-            seq,
-            row,
-            bytes,
-        }
+        Held { hash, seq, row }
+    }
+
+    /// The bytes it holds.
+    fn bytes(&self) -> u64 {
+        (std::mem::size_of::<Held>() + self.row.len()) as u64
     }
 }
 
@@ -97,7 +94,7 @@ pub(in crate::read) fn key_hash(k: &[Key], salt: u32) -> u64 {
 }
 
 fn bytes_of(rows: &[Held]) -> u64 {
-    rows.iter().map(|h| h.bytes).sum()
+    rows.iter().map(|h| h.bytes()).sum()
 }
 
 /// The bytes a part's rows take held here: each as the spill wrote it, and its place.
@@ -136,7 +133,7 @@ impl Parted {
     /// A row more as one string of bytes, `whole` the row where it is at hand.
     fn place(&mut self, hash: u64, packed: Packed, whole: Option<Vec<Value>>) -> Result<()> {
         let h = Held::of(hash, self.seq, packed);
-        let bytes = h.bytes;
+        let bytes = h.bytes();
         self.seq += 1;
         if let Some(room) = self.room.clone() {
             loop {
@@ -155,8 +152,8 @@ impl Parted {
                         let (_, at) = self.heap.pop().expect("a row is held");
                         let out = self.held[at].take().expect("a row is held");
                         self.free.push(at);
-                        self.held_bytes -= out.bytes;
-                        room.let_go(out.bytes);
+                        self.held_bytes -= out.bytes();
+                        room.let_go(out.bytes());
                         let row = self.packer.unpack(&out.row)?;
                         self.write(out.hash, row)?;
                     }
@@ -287,7 +284,7 @@ impl Parted {
                     if *last.get_or_insert(hash) == hash {
                         let h = Held::of(hash, 0, self.packer.pack(&r));
                         if let Some(room) = &self.room {
-                            room.hold_anyway(h.bytes);
+                            room.hold_anyway(h.bytes());
                         }
                         whole.push(h);
                     } else {

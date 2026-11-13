@@ -402,19 +402,19 @@ fn a_window_past_the_round_s_room_holds_every_partition_whole_and_writes_the_row
     let q = "SELECT t.id, row_number() OVER (PARTITION BY t.id % 64 ORDER BY t.id) FROM s.t t";
     let rank = |i: i64| (i - i % 64) / 64 + i64::from(i % 64 != 0);
     // The step holds every row as the table's read gives it, keyed by its partition's hash: each row
-    // one string of bytes as the spill writes it, its two integers 18 bytes, beside the 40 bytes that
-    // find it (its hash, its place, the string's box, its bytes): 58 bytes a row. The 16,383 rows to
-    // come are 950,214 bytes, within two rooms of 512 KiB, so the rows past the room are written as
-    // one part, once. The read's plan holds a block read's 40 bytes for each of the table's 31
-    // blocks, 1,240: the room holds 9,018 rows, and the other 7,365 at 18 bytes are 132,570 bytes, 33
-    // pages, 33 for any share of the plan's from none to 9,596 bytes.
+    // one string of bytes as the spill writes it, its two integers 18 bytes, beside the 32 bytes that
+    // find it (its hash, its place, the string's box): 50 bytes a row. The 16,383 rows to come are
+    // 819,150 bytes, within two rooms of 512 KiB, so the rows past the room are written as one part,
+    // once. The read's plan holds a block read's 40 bytes for each of the table's 31 blocks, 1,240:
+    // the room holds 10,460 rows, and the other 5,923 at 18 bytes are 106,614 bytes, 27 pages, 27 for
+    // any share of the plan's from 939 to 12,338 bytes.
     let room: u64 = 512 << 10;
-    let row = 18 + 40;
+    let row = 18 + 32;
     assert!(N as u64 * row <= 2 * room);
     let rows_held = |plan: u64| (room - plan) / row;
     let pages = ((N as u64 - rows_held(31 * 40)) * 18).div_ceil(4096);
-    assert_eq!((rows_held(31 * 40), pages), (9_018, 33));
-    for plan in [0, 9_596] {
+    assert_eq!((rows_held(31 * 40), pages), (10_460, 27));
+    for plan in [939, 12_338] {
         assert_eq!(((N as u64 - rows_held(plan)) * 18).div_ceil(4096), pages);
     }
     for (sizes, written) in [
@@ -750,8 +750,11 @@ fn a_join_of_two_sides_past_the_room_is_met_in_batches_each_row_read_back_once()
 fn a_join_of_a_side_the_room_holds_hashes_it_and_reads_the_other_a_chunk_at_a_time() {
     let path = tree("one-side");
     let dir = spill_dir("one-side");
-    // A hundred nodes held, against every node written: 16,383 rows past the room, the step's own
-    // 72 pages, read back once; the hash is the hundred's. Nodes 5000 to 5099 have 200 children.
+    // A hundred nodes held column-wise, 816 bytes, against every node written: the step's rows, two
+    // integers held column-wise, fill what the hundred and the read's plan leave; the rest, 18 bytes
+    // each on the spill, are 72 pages for any share the plan and the hundred's map take above 112
+    // bytes, written once and read back once; the hash is the hundred's. Nodes 5000 to 5099 have 200
+    // children.
     let q = "WITH k AS (SELECT t.id FROM s.t t WHERE t.id BETWEEN 5000 AND 5099), \
              b AS (SELECT u.parent, u.id FROM s.t u) \
              SELECT count(*) FROM k JOIN b ON b.parent = k.id";
@@ -761,8 +764,10 @@ fn a_join_of_a_side_the_room_holds_hashes_it_and_reads_the_other_a_chunk_at_a_ti
     let (b, round) = snail.ask(q, None).unwrap();
     each_read_exact(q, &round);
     assert_eq!(one(&b), 200);
-    let held = room - 100 * 9;
-    let past = (N as u64 * 18 - (held / 18) * 18).div_ceil(4096);
+    let side = held_ints(100, 1);
+    let pages = |plan: u64| ((N as u64 - rows_in(room - side - plan, 2)) * 18).div_ceil(4096);
+    assert_eq!((side, pages(113), pages(room - side)), (816, 72, 72));
+    let past = pages(113);
     assert_eq!(
         (round.spill_pages_written, round.spill_pages_read),
         (past, past),
@@ -866,18 +871,22 @@ fn a_sort_past_the_room_writes_the_rows_that_sort_last_and_hands_on_each_pass_in
             round.spill_pages_read, round.spill_pages_written,
             "{q}: {round:?}"
         );
-        // Beside the room, a page for each of the 8 runs a merge takes at most, and the chunk it hands
-        // on: rows of one integer until their 9 bytes each pass four pages, 1,821, each in hand as the
-        // sort holds it, 72 bytes beside it, 64 its key's value and the row's 9.
+        // Beside the room, the greater of what comes in and what a merge hands on: a block's rows as
+        // the read hands them on, the table's largest block of 1,022 rows of two values in hand (the
+        // id and the value it is sorted by); or a page for each of the 8 runs a merge takes at most,
+        // and the chunk it hands on, rows of one integer until their 9 bytes each pass four pages,
+        // 1,821, each as the sort holds it, 32 bytes beside it, its key's 9 bytes and their length's
+        // 1, and the row's 9.
+        let merge = 8 * 4096 + 1_821 * (32 + 1 + 9 + 9);
         assert!(
-            round.bytes_held <= room + 1_821 * (72 + 64 + 9) + 8 * 4096,
+            round.bytes_held <= room + one_chunk(&path, 18).max(merge),
             "{q}: {round:?}"
         );
         (ints(&b), round)
     };
-    // Every node, last first: a row held to be sorted is 72 bytes beside it, 64 its key's value and
-    // the row's 9, so a run is 217 rows in the room less the read's plan, a block read's 40 bytes for
-    // each of the table's 31 blocks.
+    // Every node, last first: a row held to be sorted is 32 bytes beside it, its key's 9 bytes and
+    // their length's 1, and the row's 9, so a run is 618 rows in the room less the read's plan, a
+    // block read's 40 bytes for each of the table's 31 blocks.
     let (got, round) = ints_of("SELECT x.id FROM (SELECT t.id FROM s.t t ORDER BY t.id DESC) x");
     let want: Vec<Vec<i64>> = (1..=N).rev().map(|i| vec![i]).collect();
     assert_eq!(got, want);
@@ -895,25 +904,29 @@ fn a_sort_past_the_room_writes_the_rows_that_sort_last_and_hands_on_each_pass_in
     let (got, round) = ints_of(q);
     // The root's parent sorts first, then node 8,191's two children.
     assert_eq!(got, [[1], [16_383]]);
-    // A row held to be sorted by two values is 72 bytes beside it, 128 its key's and the row's 18: 218
-    // bytes, 144 rows a run in the room less the plan's 1,240 bytes (144 for any plan from 1,159 bytes
-    // to 1,376), each run one page. 113 runs, the last 111 rows held. A merge takes 8 runs at most in
-    // this room: 15 merges bring the 113 to 8, 14 of them of 8 runs of one page, 1,152 rows of 18 bytes,
-    // 6 pages each, and the last of the run left and 7 merged, 8,208 rows, 37 pages. The step after it
-    // holds its rows column-wise beside the 111 held, 526 of them, and writes the other 15,857, 70
-    // pages: 113 + 84 + 37 + 70.
-    let per_run = |plan: u64| (room - plan) / 218;
-    assert_eq!((per_run(1_159), per_run(1_240), per_run(1_376)), (144, 144, 144));
+    // A row held to be sorted by two values is 32 bytes beside it, its key's 18 bytes and their
+    // length's 1, and the row's 18: 69 bytes, 456 rows a run in the room less the plan's 1,240 bytes
+    // (456 for any plan from 1,236 bytes to 1,304), each run 8,208 bytes, 3 pages. 35 runs, the last
+    // 423 rows held. A merge takes 8 runs at most in this room, the first only as many as leave
+    // merges of 8 to bring them to 8: 7 runs, 3,192 rows of 18 bytes, 15 pages; then 3 of 8, 3,648
+    // rows, 17 pages each: 35, 29, 22, 15, 8. The step after it holds its rows column-wise beside the
+    // 423 held, 219 of them, and writes the other 16,164, 72 pages: 105 + 15 + 51 + 72.
+    let per_run = |plan: u64| (room - plan) / 69;
+    assert_eq!((per_run(1_236), per_run(1_240), per_run(1_304)), (456, 456, 456));
     let per_run = per_run(1_240);
     let (runs, left) = (N as u64 / per_run, N as u64 % per_run);
-    assert_eq!((runs, left, (runs - 8) / 7), (113, 111, 15));
-    let merged = (8 * per_run * 18).div_ceil(4096);
-    let last = ((7 * 8 + 1) * per_run * 18).div_ceil(4096);
-    let place = ((N as u64 - rows_in(room - left * 218, 2)) * 18).div_ceil(4096);
-    assert_eq!((merged, last, rows_in(room - left * 218, 2), place), (6, 37, 526, 70));
+    let first = (runs - 2) % 7 + 2;
+    assert_eq!((runs, left, first, (runs - first + 1 - 8) / 7), (35, 423, 7, 3));
+    let pages = |rows: u64| (rows * 18).div_ceil(4096);
+    let held = rows_in(room - left * 69, 2);
+    let place = pages(N as u64 - held);
+    assert_eq!(
+        (pages(per_run), pages(first * per_run), pages(8 * per_run), held, place),
+        (3, 15, 17, 219, 72)
+    );
     assert_eq!(
         round.spill_pages_written,
-        runs + 14 * merged + last + place,
+        runs * pages(per_run) + pages(first * per_run) + 3 * pages(8 * per_run) + place,
         "{q}: {round:?}"
     );
     // Rows that tie across 9 runs, in the order they came: the root, then the children of nodes
@@ -1314,8 +1327,9 @@ fn a_window_over_a_join_along_its_first_table_s_strand_holds_one_partition_at_a_
         round.reads.iter().any(|r| r.order == "p_owner"),
         "{round:?}"
     );
-    // With the other side past the room, 512 owners at 9 bytes in 4 KiB, its order is lost: the
-    // partitions held whole, and the answer the same over the first 32 owners' purchases.
+    // With the other side past the room, 512 owners held column-wise at 4,160 bytes in 4 KiB, its
+    // order is lost: the partitions held whole, and the answer the same over the first 32 owners'
+    // purchases.
     let q = "SELECT p.id, row_number() OVER (PARTITION BY p.owner ORDER BY p.at) \
              FROM s.p p JOIN (SELECT o.k FROM s.o o ORDER BY o.k) d ON d.k = p.owner \
              WHERE p.owner < 32";
@@ -1357,90 +1371,104 @@ fn rows_past_several_rooms_are_written_once_and_read_back_once_at_each_place() {
     let path = owned("rooms");
     let dir = spill_dir("rooms");
     let n = PURCHASES as u64;
-    let room: u64 = 64 << 10;
-    // A window over every purchase on an order no strand gives, its three integers 27 bytes: 442,368
-    // bytes, 6.75 rooms, cut at once into 8 parts of whole partitions. The 2,427 rows the room holds are
-    // never written; the other 13,957, 376,839 bytes, are 93 pages, a part page more in each part at
-    // most. Written again each pass they would be 312. Its moments fall as its ids rise.
+    // Pages of `rows` rows of `width` bytes each on the spill.
+    let pages = |rows: u64, width: u64| (rows * width).div_ceil(4096);
+    // Written once, each row past what the room holds at `held` bytes is written, and no row twice: a
+    // part page more in each of `parts` parts at most.
+    let once = |q: &str, round: &Round, room: u64, held: u64, width: u64, parts: u64| {
+        let least = pages(n - room / held, width);
+        let most = pages(n, width) + parts;
+        assert!(
+            round.spill_pages_written >= least && round.spill_pages_written <= most,
+            "{q}: {least} to {most}: {round:?}"
+        );
+    };
+    // A window over every purchase on an order no strand gives, in 128 KiB: each row held as the spill
+    // writes it, its three integers 27 bytes, beside the 32 that find it, 59: 966,656 bytes, 7.4
+    // rooms, cut at once into parts of whole partitions, at most 8. The 2,221 rows the room holds at
+    // most are never written; the other 14,163, 382,401 bytes, are 94 pages; every row written once,
+    // 108, a part page more in each part. Its moments fall as its ids rise.
+    let room: u64 = 128 << 10;
     let q = "SELECT p.id, row_number() OVER (PARTITION BY p.id % 64 ORDER BY p.at) FROM s.p p";
     let rank = |i: i64| 256 - i / 64;
     let (mut got, round) = past_room(&path, &dir, room, q);
     got.sort();
     let want: Vec<Vec<i64>> = (0..PURCHASES).map(|i| vec![i, rank(i)]).collect();
     assert_eq!(got, want, "{q}");
-    let least = ((n - room / 27) * 27).div_ceil(4096);
-    assert!(
-        round.spill_pages_written >= least && round.spill_pages_written <= least + 8,
-        "{q}: {least}: {round:?}"
-    );
+    assert_eq!((pages(n - room / 59, 27), pages(n, 27)), (94, 108));
+    once(q, &round, room, 59, 27, 8);
     assert!(
         round.bytes_held <= room + one_chunk(&path, 27) + 8 * 4096,
         "{q}: {round:?}"
     );
-    // The same over a join, how many rows come not known before the first write, each row its four
-    // columns, 36 bytes: 589,824 bytes, 9 rooms, in the 8 parts a room this size lets it fill. A part
-    // past the room goes round again: at most half as many pages again as the 128 past it; written
-    // again each pass, 576.
+    // The same over a join in 64 KiB, how many rows come not known before the first write, each row
+    // its four columns, 36 bytes, held at 68: 1,114,112 bytes, 17 rooms, in the 8 parts a room this
+    // size lets it fill, of 8 whole partitions each, 2.1 rooms. Each part past the room goes round once
+    // more, cut again into parts within it: at least the 128 pages past the room, at most every row
+    // written twice, 288.
+    let room: u64 = 64 << 10;
     let q = "SELECT p.id, row_number() OVER (PARTITION BY p.id % 64 ORDER BY p.at) \
              FROM s.o o JOIN s.p p ON p.owner = o.k";
     let (mut got, round) = past_room(&path, &dir, room, q);
     got.sort();
     assert_eq!(got, want, "{q}");
-    assert!(round.spill_pages_written > 0, "{q}: {round:?}");
     let past = (n * 36 - room).div_ceil(4096);
+    assert_eq!((past, 2 * pages(n, 36)), (128, 288));
     assert!(
-        round.spill_pages_written >= past && round.spill_pages_written <= past * 3 / 2,
+        round.spill_pages_written >= past && round.spill_pages_written <= 2 * pages(n, 36),
         "{q}: {round:?}"
     );
-    // A grouping, in 128 KiB: each group its first row, 27 bytes, and 32 of its fold: 966,656 bytes,
-    // 7.4 rooms, cut at once into 9 parts. The 2,221 groups the room holds write nothing; the other
-    // 14,163 rows are 382,401 bytes, 94 pages, a part page more in each at most.
-    let groups: u64 = 128 << 10;
+    // A grouping, in 384 KiB: each group its first row, its fold and its key with its rows, 300 bytes
+    // held: 4,915,200 bytes, 12.5 rooms, cut at once into 13 parts. The 1,310 groups the room holds at
+    // most write nothing; the other rows, 27 bytes each, are 100 pages at least; every row written
+    // once, 108, a part page more in each part.
+    let room: u64 = 384 << 10;
     let q = "SELECT p.id, count(*) FROM s.p p GROUP BY p.id LIMIT 100000";
-    let (mut got, round) = past_room(&path, &dir, groups, q);
+    let (mut got, round) = past_room(&path, &dir, room, q);
     got.sort();
-    let once: Vec<Vec<i64>> = (0..PURCHASES).map(|i| vec![i, 1]).collect();
-    assert_eq!(got, once, "{q}");
-    let least = ((n - groups / 59) * 27).div_ceil(4096);
-    assert!(
-        round.spill_pages_written >= least && round.spill_pages_written <= least + 9,
-        "{q}: {least}: {round:?}"
-    );
-    // A DISTINCT, in 32 KiB: every purchase's id at 9 bytes, 147,456 bytes, 4.5 rooms, cut at once into
-    // 5 parts. The 3,640 the room holds write nothing; the other 12,744 are 28 pages, a part page more
-    // in each at most.
-    let distinct: u64 = 32 << 10;
+    let ones: Vec<Vec<i64>> = (0..PURCHASES).map(|i| vec![i, 1]).collect();
+    assert_eq!(got, ones, "{q}");
+    assert_eq!(((n * 300).div_ceil(room), pages(n - room / 300, 27)), (13, 100));
+    once(q, &round, room, 300, 27, 13);
+    // A DISTINCT, in 64 KiB: every purchase's id at 9 bytes, held at 28 with its key: 458,752 bytes,
+    // 7 rooms, cut at once into 7 parts. The 2,340 the room holds at most write nothing; the other
+    // 14,044 are 31 pages at least; every id written once, 36, a part page more in each part.
+    let room: u64 = 64 << 10;
     let q = "SELECT DISTINCT p.id FROM s.p p LIMIT 100000";
-    let (mut got, round) = past_room(&path, &dir, distinct, q);
+    let (mut got, round) = past_room(&path, &dir, room, q);
     got.sort();
     let ids: Vec<Vec<i64>> = (0..PURCHASES).map(|i| vec![i]).collect();
     assert_eq!(got, ids, "{q}");
-    let least = ((n - distinct / 9) * 9).div_ceil(4096);
-    assert!(
-        round.spill_pages_written >= least && round.spill_pages_written <= least + 5,
-        "{q}: {least}: {round:?}"
-    );
-    // A sort, in 32 KiB: the same 147,456 bytes known past two rooms, cut into runs of 3,640 rows,
-    // 8 pages each: 4 of them, the last 1,824 rows held and merged with them. Each page read back once.
+    assert_eq!((pages(n - room / 28, 9), pages(n, 9)), (31, 36));
+    once(q, &round, room, 28, 9, 7);
+    // A sort, in 128 KiB: every id held at 51 bytes (32 beside it, its key's 9 and their length's 1,
+    // the row's 9), 835,584 bytes known past two rooms, cut into runs of 2,544 rows in the room less
+    // the plan's 32 blocks of 40 bytes (any plan to 11,681 bytes), 6 pages each: 6 of them, the last
+    // 1,120 rows held and merged with them, as many runs as a merge takes in this room. Each page read
+    // back once.
+    let room: u64 = 128 << 10;
+    let per_run = |plan: u64| (room - plan) / 51;
+    let runs = |plan: u64| (n / per_run(plan), pages(per_run(plan), 9));
+    assert_eq!((per_run(32 * 40), runs(0), runs(32 * 40), runs(11_681)), (2_544, (6, 6), (6, 6), (6, 6)));
     let q = "SELECT p.id FROM s.p p ORDER BY p.id DESC LIMIT 100000";
-    let (got, round) = past_room(&path, &dir, distinct, q);
+    let (got, round) = past_room(&path, &dir, room, q);
     let down: Vec<Vec<i64>> = (0..PURCHASES).rev().map(|i| vec![i]).collect();
     assert_eq!(got, down, "{q}");
-    assert_eq!(round.spill_pages_written, 4 * 8, "{q}: {round:?}");
+    assert_eq!(round.spill_pages_written, 6 * 6, "{q}: {round:?}");
     assert!(
-        round.bytes_held <= distinct + one_chunk(&path, 9) + 4 * 4096,
+        round.bytes_held <= room + one_chunk(&path, 9) + 6 * 4096,
         "{q}: {round:?}"
     );
-    // Over a join, not known: once a room of them is written they are cut into runs, the rows written
-    // standing as one part, held for the merge; every row written once, 147,456 bytes, 37 pages,
-    // a part page more in each run at most.
+    // Over a join in 96 KiB, not known: once a room of them is written they are cut into runs, the
+    // rows written standing as one part, held for the merge. The 1,927 the room holds at most are
+    // never written; the rest 32 pages at least; every row written once, 36, a part page more in each
+    // of the 9 runs at most.
+    let room: u64 = 96 << 10;
     let q = "SELECT p.id FROM s.o o JOIN s.p p ON p.owner = o.k ORDER BY p.id DESC LIMIT 100000";
-    let (got, round) = past_room(&path, &dir, distinct, q);
+    let (got, round) = past_room(&path, &dir, room, q);
     assert_eq!(got, down, "{q}");
-    assert!(
-        round.spill_pages_written >= 28 && round.spill_pages_written <= 37 + 5,
-        "{q}: {round:?}"
-    );
+    assert_eq!(((n * 51).div_ceil(room), pages(n - room / 51, 9)), (9, 32));
+    once(q, &round, room, 51, 9, 9);
 }
 
 /// Rows of very different widths: 20 of 3,000 bytes of text, then 280 of one byte that sort before
@@ -1471,24 +1499,27 @@ fn widths(name: &str) -> PathBuf {
 fn a_row_past_the_room_that_sorts_after_one_written_is_never_handed_on_before_it() {
     let path = widths("widths");
     let dir = spill_dir("widths");
-    // A row held to be sorted is 72 bytes beside it, its key's two values 64 each and the text's
-    // bytes, and the row as the spill writes it: each wide row 6,223 bytes, each narrow one 225. The
-    // 20 wide come first, 124,460 bytes; the 280 narrow that sort before them 63,000 more, 6,223 past
-    // 181,237 bytes, so in a room of 180 KiB less the read's plan one narrow row lets the last wide one
-    // go, freeing room for the rest; the 200 narrow rows that sort after it, 45,000 bytes, past the
-    // room and within two, are set aside with it, held in the room it freed until one finds none,
-    // then written. 18.6's order: the narrow rows that sort first, the wide, the narrow that sort
-    // last. The wide row let go, 3,023 bytes on the spill, is the one page written; the narrow rows
-    // written, 24 bytes each, lie in the part page kept in memory.
-    let (wide, narrow) = (72 + 128 + 3_000 + 3_023, 72 + 128 + 1 + 24);
-    assert_eq!(20 * wide + 280 * narrow - wide, 181_237);
+    // A row held to be sorted is 32 bytes beside it, its key's bytes and their length, and the row as
+    // the spill writes it. The key: k a tag and 8 bytes, pad a tag, its length and its text. A wide row
+    // 32 + 2 + 3,012 + 3,023 = 6,069 bytes; a narrow one 32 + 1 + 12 + 24 = 69. The 20 wide come
+    // first, 121,380 bytes; the 280 narrow that sort before them 19,320 more: 140,700, and 134,631
+    // less one wide. So in a room of 136 KiB, 139,264 bytes, less the read's plan (any plan below
+    // 4,633 bytes), one narrow row lets the last wide one go, freeing room for the rest; the 200
+    // narrow rows that sort after it, past the room and within two, are set aside with it, held in the
+    // room it freed until one finds none, then written. 18.6's order: the narrow rows that sort first,
+    // the wide, the narrow that sort last. The wide row let go, 3,023 bytes on the spill, is the one
+    // page written; the narrow rows written, 24 bytes each, lie in the part page kept in memory.
+    let (wide, narrow) = (32 + 2 + 3_012 + 3_023, 32 + 1 + 12 + 24);
+    assert_eq!((20 * wide + 280 * narrow, 20 * wide + 280 * narrow - wide), (140_700, 134_631));
+    let room: u64 = 136 << 10;
+    assert!(room - 4_633 == 134_631 && room < 140_700);
     let q = "SELECT w.id FROM s.w w ORDER BY w.k, w.pad";
     let want: Vec<Vec<i64>> = (20..=299)
         .chain(0..=19)
         .chain(300..=499)
         .map(|i| vec![i])
         .collect();
-    let (got, round) = past_room(&path, &dir, 180 << 10, q);
+    let (got, round) = past_room(&path, &dir, room, q);
     assert_eq!(got, want, "{q}");
     assert_eq!(round.spill_pages_written, 1, "{q}: {round:?}");
     // Given room for every row, the same rows in the same order, nothing written.

@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 pub(super) mod parted;
 mod sorted;
+pub(super) use sorted::held_bytes as sort_held_bytes;
 pub(super) mod windows;
 
 /// One value of a row: a number whole or with its scale, text, bytes, a truth, or a uuid.

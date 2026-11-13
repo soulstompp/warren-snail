@@ -296,10 +296,11 @@ pub(super) fn of_step(
 }
 
 impl Snail {
-    /// Whether a strand's pages from the file are fewer than another order's together with the sort
-    /// the strand saves: `own` where the round reads along it else, or the order of fewest pages. A
-    /// sort that fits the round's room costs no page, one past it its spill, written and read back,
-    /// priced from the rows the counts give the question at their held width.
+    /// Whether a strand's pages from the file, with what its walk writes, are fewer than another
+    /// order's together with the sort the strand saves: `own` where the round reads along it else, or
+    /// the order of fewest pages. What fits the round's room costs no page; past it, the rows past
+    /// what it holds are written and read back, priced from the rows the counts give the question:
+    /// a sort's at the bytes it holds a row at, a nearest walk's at a whole row each.
     pub(super) fn strand_wins(
         &self,
         q: &super::question::Question,
@@ -323,10 +324,17 @@ impl Snail {
             .map(|&c| held_width(table.columns[c].ty))
             .sum();
         let room = self.reader.room().sizes().bytes;
-        let sort = 2
-            * (along.rows.1 * width)
-                .saturating_sub(room)
-                .div_ceil(PAGE as u64);
-        Ok(from_file(&by) < from_file(&along) + sort)
+        let rows = along.rows.1;
+        let past = |held: u64| {
+            2 * (rows.saturating_sub(room / held.max(1)) * width).div_ceil(PAGE as u64)
+        };
+        let sort = past(super::pipeline::sort_held_bytes(width, width));
+        let walk = match table.orders[strand].method {
+            Method::Gist | Method::Spgist => past(
+                super::nearest::ring_row_bytes(want.columns.len()) + width,
+            ),
+            _ => 0,
+        };
+        Ok(from_file(&by) + walk < from_file(&along) + sort)
     }
 }
