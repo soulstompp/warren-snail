@@ -268,21 +268,49 @@ fn each_table_of(
     }
 }
 
-/// A question that reads a table's virtual columns, read through a first step that computes them
-/// from the columns the table stores; none where it reads no such column.
+/// What names the step that computes a table's virtual columns, before the table's place in the
+/// catalog.
+pub(super) const COMPUTED: &str = "snail_computed_";
+
+/// A question that reads a table's virtual columns, by name, by a star or in its whole row, read
+/// through a first step that computes them from the columns the table stores; none where it reads
+/// no such column.
 fn computed(catalog: &Catalog, q: &sqlparser::ast::Query) -> Result<Option<sqlparser::ast::Query>> {
     use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, TableAlias, TableFactor};
     let mut read: Vec<usize> = Vec::new();
+    // Each table read by the name the question gives it, its alias where it has one.
+    let mut named: Vec<(usize, String)> = Vec::new();
     let mut q = q.clone();
     each_table(&mut q, &mut |t| {
-        if let TableFactor::Table { name, .. } = t {
+        if let TableFactor::Table { name, alias, .. } = t {
             let n = crate::catalog::object_name(name);
             if let Some(i) = catalog.tables.iter().position(|x| x.name == n) {
                 if !read.contains(&i) {
                     read.push(i);
                 }
+                named.push((
+                    i,
+                    match alias {
+                        Some(a) => crate::catalog::ident(&a.name),
+                        None => n.rsplit('.').next().unwrap_or(&n).to_string(),
+                    },
+                ));
             }
         }
+    });
+    // The names the question reads alone, each a whole row where it names a table read and no
+    // column of a table read bears it.
+    let mut alone: Vec<String> = Vec::new();
+    let _ = sqlparser::ast::visit_expressions(&q, |e| {
+        if let sqlparser::ast::Expr::Identifier(i) = e {
+            alone.push(crate::catalog::ident(i));
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    alone.retain(|a| {
+        !read
+            .iter()
+            .any(|&i| catalog.tables[i].columns.iter().any(|c| &c.name == a))
     });
     let text = q.to_string();
     let words: Vec<String> =
@@ -314,10 +342,11 @@ fn computed(catalog: &Catalog, q: &sqlparser::ast::Query) -> Result<Option<sqlpa
     let mut steps = Vec::new();
     for &i in &read {
         let t = &catalog.tables[i];
+        let whole = named.iter().any(|(j, n)| *j == i && alone.contains(n));
         let reads = t
             .columns
             .iter()
-            .any(|c| c.is_virtual() && (wildcard || words.contains(&c.name)));
+            .any(|c| c.is_virtual() && (wildcard || whole || words.contains(&c.name)));
         if !reads {
             continue;
         }
@@ -333,7 +362,7 @@ fn computed(catalog: &Catalog, q: &sqlparser::ast::Query) -> Result<Option<sqlpa
                 _ => quote(&c.name),
             })
             .collect();
-        let step = format!("snail_computed_{i}");
+        let step = format!("{COMPUTED}{i}");
         steps.push((
             i,
             step.clone(),

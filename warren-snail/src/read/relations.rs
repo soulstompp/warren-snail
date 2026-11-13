@@ -3854,8 +3854,16 @@ fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr
             .iter()
             .map(|&p| Some(crate::composed::Field::new(&typed[p].1, typed[p].2?)))
             .collect::<Option<_>>()?;
-        let ty = match &leaf.what {
-            What::Table { table, .. } => {
+        // A table read through the step computing its virtual columns is still the table.
+        let computed = match &leaf.what {
+            What::Made { name, .. } => name
+                .strip_prefix(super::COMPUTED)
+                .and_then(|i| i.parse::<usize>().ok())
+                .filter(|&i| i < catalog.tables.len()),
+            _ => None,
+        };
+        let ty = match (&leaf.what, computed.as_ref()) {
+            (What::Table { table, .. }, _) | (_, Some(table)) => {
                 let name = &catalog.tables[*table].name;
                 super::handed::table_row(name).unwrap_or_else(|| {
                     crate::composed::type_of(crate::composed::Composed::Record {

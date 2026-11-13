@@ -274,6 +274,58 @@ fn a_generated_column_is_computed_at_the_write_where_stored_and_at_the_read_wher
 }
 
 #[test]
+fn a_whole_row_holds_its_virtual_columns() {
+    let path = made(
+        "whole-virtual",
+        "CREATE SCHEMA n8; CREATE TABLE n8.kv (id integer PRIMARY KEY, \
+             n integer GENERATED ALWAYS AS (2), m integer GENERATED ALWAYS AS (id * 10) STORED, s text);
+         CREATE TABLE n8.w (id integer PRIMARY KEY, kvid integer);",
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    run(&mut w, "INSERT INTO n8.kv (id, s) VALUES (1, 'a'), (2, NULL)");
+    run(&mut w, "INSERT INTO n8.w VALUES (10, 1), (20, 2)");
+    drop(w);
+    let mut s = Snail::open(&path).unwrap();
+    for (sql, want) in [
+        (
+            "SELECT v::text FROM n8.kv v",
+            vec![row(&["(1,2,10,a)"]), row(&["(2,2,20,)"])],
+        ),
+        (
+            "SELECT kv::text FROM n8.kv",
+            vec![row(&["(1,2,10,a)"]), row(&["(2,2,20,)"])],
+        ),
+        (
+            "SELECT row_to_json(v)::text FROM n8.kv v",
+            vec![
+                row(&["{\"id\":1,\"n\":2,\"m\":10,\"s\":\"a\"}"]),
+                row(&["{\"id\":2,\"n\":2,\"m\":20,\"s\":null}"]),
+            ],
+        ),
+        (
+            "SELECT pg_typeof(v)::text FROM n8.kv v LIMIT 1",
+            vec![row(&["n8.kv"])],
+        ),
+        (
+            "SELECT id FROM n8.kv v WHERE v = ROW(1, 2, 10, 'a')::n8.kv",
+            vec![row(&["1"])],
+        ),
+        (
+            "SELECT array_agg(v ORDER BY id)::text FROM n8.kv v",
+            vec![row(&["{\"(1,2,10,a)\",\"(2,2,20,)\"}"])],
+        ),
+        (
+            "SELECT w.id, v::text FROM n8.w w JOIN n8.kv v ON v.id = w.kvid",
+            vec![row(&["10", "(1,2,10,a)"]), row(&["20", "(2,2,20,)"])],
+        ),
+        // A column bearing the name is the column.
+        ("SELECT s FROM n8.kv s", vec![row(&["NULL"]), row(&["a"])]),
+    ] {
+        assert_eq!(rows(&mut s, sql), want, "{sql}");
+    }
+}
+
+#[test]
 fn checks_refuse_what_postgresql_refuses_and_a_null_passes() {
     let path = made(
         "checks",
