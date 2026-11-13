@@ -6428,6 +6428,27 @@ pub(super) fn several(catalog: &Catalog, q: &Query) -> bool {
     beyond || renamed || tables.len() != 1
 }
 
+/// Whether a question's FROM names a table under an alias that renames its columns, which only the
+/// relations' reader reads.
+pub(super) fn renames_columns(q: &Query) -> bool {
+    fn renames(f: &TableFactor) -> bool {
+        match f {
+            TableFactor::Table { alias: Some(a), .. } => !a.columns.is_empty(),
+            TableFactor::NestedJoin {
+                table_with_joins: t,
+                ..
+            } => renames(&t.relation) || t.joins.iter().any(|j| renames(&j.relation)),
+            _ => false,
+        }
+    }
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return false;
+    };
+    s.from
+        .iter()
+        .any(|t| renames(&t.relation) || t.joins.iter().any(|j| renames(&j.relation)))
+}
+
 /// Whether a question names a view.
 pub(super) fn names_a_view(catalog: &Catalog, q: &Query) -> bool {
     if catalog.views.is_empty() {

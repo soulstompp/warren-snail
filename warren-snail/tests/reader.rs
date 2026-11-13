@@ -5505,6 +5505,74 @@ fn a_fixed_length_type_s_subscript_is_its_element() {
 }
 
 #[test]
+fn a_table_alias_s_column_names_rename_its_columns() {
+    let path = tmp("reader-alias-columns.snail");
+    let ddl = "CREATE SCHEMA n8;
+         CREATE TABLE n8.k (id integer PRIMARY KEY, b text);
+         CREATE TABLE n8.m (id integer PRIMARY KEY, a_id integer, v integer);";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO n8.k VALUES (1, 'x'), (2, 'y')").unwrap();
+    w.execute("INSERT INTO n8.m VALUES (10, 1, 100), (11, 1, 110), (12, 2, 120)").unwrap();
+    answered(
+        &mut w,
+        &[
+            ("SELECT a, c FROM n8.k AS x(a, c) ORDER BY a", &["1|x", "2|y"]),
+            ("SELECT x.a, x.c FROM n8.k x(a, c) WHERE x.a = 2", &["2|y"]),
+            ("SELECT * FROM n8.k AS x(a, c) ORDER BY 1", &["1|x", "2|y"]),
+            ("SELECT a, b FROM n8.k AS x(a) ORDER BY 1", &["1|x", "2|y"]),
+            ("SELECT x.* FROM n8.k AS x(a) ORDER BY 1", &["1|x", "2|y"]),
+            ("SELECT x FROM n8.k AS x(a, c) ORDER BY a", &["(1,x)", "(2,y)"]),
+            (
+                "SELECT row_to_json(x) FROM n8.k AS x(a, c) ORDER BY a",
+                &["{\"id\":1,\"b\":\"x\"}", "{\"id\":2,\"b\":\"y\"}"],
+            ),
+            ("SELECT c, count(*) FROM n8.k x(a, c) GROUP BY c ORDER BY c", &["x|1", "y|1"]),
+            ("SELECT a FROM n8.k x(a, c) WHERE c = 'y'", &["2"]),
+            ("SELECT \"A\" FROM n8.k x(\"A\", c) ORDER BY 1", &["1", "2"]),
+            (
+                "SELECT x.a, y.v FROM n8.k x(a, c) JOIN n8.m y(i, a_id, v) ON y.a_id = x.a ORDER BY \
+                 y.i",
+                &["1|100", "1|110", "2|120"],
+            ),
+            (
+                "SELECT a, i FROM n8.k x(a, c) JOIN n8.m y(i) ON y.a_id = x.a ORDER BY i",
+                &["1|10", "1|11", "2|12"],
+            ),
+            (
+                "SELECT a, b FROM n8.k AS x(a) WHERE a IN (SELECT a_id FROM n8.m) ORDER BY a",
+                &["1|x", "2|y"],
+            ),
+        ],
+    );
+    let named = |w: &mut Snail, sql: &str| -> Vec<String> {
+        let b = w.execute(sql).unwrap().answer.unwrap();
+        b.schema().fields().iter().map(|f| f.name().clone()).collect()
+    };
+    assert_eq!(named(&mut w, "SELECT * FROM n8.k AS x(a, c)"), ["a", "c"]);
+    assert_eq!(named(&mut w, "SELECT * FROM n8.k AS x(a)"), ["a", "b"]);
+    for (sql, want) in [
+        ("SELECT id FROM n8.k AS x(a)", (Some("42703"), "column \"id\" does not exist")),
+        ("SELECT x.id FROM n8.k AS x(a)", (Some("42703"), "column x.id does not exist")),
+        (
+            "SELECT k.id FROM n8.k AS x(a)",
+            (Some("42P01"), "missing FROM-clause entry for table \"k\""),
+        ),
+        (
+            "SELECT a, c FROM n8.k AS x(a, c, d)",
+            (Some("42P10"), "table \"x\" has 2 columns available but 3 columns specified"),
+        ),
+        (
+            "SELECT a, c FROM n8.k AS x(a, a)",
+            (Some("42702"), "column reference \"a\" is ambiguous"),
+        ),
+        ("SELECT a FROM n8.k x(\"A\", c)", (Some("42703"), "column \"a\" does not exist")),
+    ] {
+        assert_eq!(refused(&mut w, sql), (want.0, want.1.to_string()), "{sql}");
+    }
+}
+
+#[test]
 fn an_arm_s_sorted_literal_is_text_before_its_set_operation_is_typed() {
     let mut w = snail("sorted-literal");
     let unmatched = |op: &str, a: &str, b: &str| {

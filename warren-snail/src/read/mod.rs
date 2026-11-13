@@ -1895,7 +1895,9 @@ impl Snail {
                 round.directory_pages_predicted += touched;
                 return Ok((batch, round));
             }
-            let relations = relations::is_set_operation(q) || relations::is_values(q);
+            let relations = relations::is_set_operation(q)
+                || relations::is_values(q)
+                || relations::renames_columns(q);
             if pipeline::is_pipeline(q)
                 || relations
                 || pipeline::tests_composite_null(&self.catalog, q)
@@ -1971,6 +1973,7 @@ impl Snail {
             || names_system
             || pipeline::reads_whole_rows(&self.catalog, q)
             || own::reads_relations(&self.catalog, q)
+            || relations::renames_columns(q)
         {
             return relations::answer(self, q, params);
         }
