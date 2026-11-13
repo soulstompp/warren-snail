@@ -1601,6 +1601,7 @@ fn a_configuration_goes_out_and_comes_in_with_the_tables_as_lc_monetary_does() {
         None,
         Some("simple"),
         None,
+        warren_snail::room::ROUND_BYTES,
     )
     .unwrap_err()
     .to_string();
