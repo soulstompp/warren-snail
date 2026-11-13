@@ -1170,3 +1170,99 @@ fn the_arrival_number_is_no_column_of_the_table() {
         .collect();
     assert_eq!(columns, ["columns=2"]);
 }
+
+/// A place past a tid's 65,535 rows is cut by count into blocks that share its key: every row is
+/// read, has its ctid, and is found in the block of the run that holds it when a statement deletes
+/// or replaces it, on the table's order and on a strand, in a transaction of one snapshot too, after a
+/// prune rewrites a block of the run and after rows inserted cut its last block again. Every answer
+/// and count is 18.6's over the same statements (`tmp/line5/run4.sql`).
+#[test]
+fn a_row_is_found_in_a_run_of_blocks() {
+    let path = declared(
+        "run-of-blocks",
+        "CREATE SCHEMA s;
+         CREATE TABLE s.big (a integer NOT NULL, c integer, b json);
+         CREATE INDEX big_c ON s.big (c);",
+        &[
+            "INSERT INTO s.big SELECT 1, 7, '{\"gone\": 1}' FROM generate_series(1, 5000)",
+            "INSERT INTO s.big VALUES (1, 7, '{\"first\": true}'), (1, 7, '{\"second\": true}'), \
+             (1, 7, '{\"rr\": true}')",
+            "INSERT INTO s.big SELECT 1, 7, CASE g WHEN 60000 THEN '{\"mid\": 1}'::json \
+             ELSE '{}'::json END FROM generate_series(1, 134996) g",
+            "INSERT INTO s.big VALUES (1, 7, '{\"last\": true}')",
+        ],
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    // The table's order and the strand each lie in blocks within a tid's rows, the place over three:
+    // `first`, `second` and `rr` in the first, `mid` in the second, `last` in the third.
+    let blocks = |w: &Snail, order: &str| -> Vec<u64> {
+        let mut seen: Vec<(u64, u64)> = w
+            .blocks()
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.table == "s.big" && b.order == order)
+            .map(|b| (b.block, b.rows))
+            .collect();
+        seen.dedup();
+        seen.into_iter().map(|(_, rows)| rows).collect()
+    };
+    for order in [GIVEN, "big_c"] {
+        let rows = blocks(&w, order);
+        assert!(rows.len() >= 3 && rows.iter().all(|&r| r <= 65_535), "{order}: {rows:?}");
+        assert_eq!(rows.iter().sum::<u64>(), 140_000, "{order}");
+    }
+    assert_eq!(
+        rows(&mut w, "SELECT count(*), count(DISTINCT ctid) FROM s.big WHERE a = 1"),
+        ["140000|140000"]
+    );
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM s.big WHERE c = 7"), ["140000"]);
+    assert_eq!(
+        rows(&mut w, "SELECT count(*) FROM s.big WHERE a = 1 AND c = 7"),
+        ["140000"]
+    );
+    // A row of the run's first block and one of its last in one statement; a row of the first
+    // replaced.
+    let ends = "DELETE FROM s.big WHERE b::text IN ('{\"first\": true}', '{\"last\": true}')";
+    assert_eq!(changed(&mut w, ends), 2);
+    assert_eq!(
+        changed(&mut w, "UPDATE s.big SET b = '{\"moved\": 1}' WHERE b::text = '{\"second\": true}'"),
+        1
+    );
+    assert_eq!(changed(&mut w, "DELETE FROM s.big WHERE b::text = '{\"gone\": 1}'"), 5000);
+    // A read of the rows finds the first block wasted; the writer's next commit prunes it.
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM s.big"), ["134998"]);
+    assert_eq!(rows(&mut w, "SELECT count(b) FROM s.big"), ["134998"]);
+    let next = w.execute("INSERT INTO s.big VALUES (2, 8, '{}')").unwrap();
+    assert!(next.blocks_pruned >= 1, "{next:?}");
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM s.big WHERE a = 1"), ["134998"]);
+    assert_eq!(
+        rows(&mut w, "SELECT b::text AS b, count(*) FROM s.big GROUP BY 1 ORDER BY 1"),
+        ["{\"mid\": 1}|1", "{\"moved\": 1}|1", "{\"rr\": true}|1", "{}|134996"]
+    );
+    // A transaction of one snapshot replaces a row of the run and deletes one of its first block and
+    // one of its second, a block whose first key the next block shares.
+    w.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+    assert_eq!(
+        changed(&mut w, "UPDATE s.big SET c = 9 WHERE b::text = '{\"moved\": 1}'"),
+        1
+    );
+    let two = "DELETE FROM s.big WHERE b::text IN ('{\"rr\": true}', '{\"mid\": 1}')";
+    assert_eq!(changed(&mut w, two), 2);
+    w.execute("COMMIT").unwrap();
+    assert_eq!(
+        rows(&mut w, "SELECT c, count(*) FROM s.big GROUP BY c ORDER BY c"),
+        ["7|134995", "8|1", "9|1"]
+    );
+    let nine = "DELETE FROM s.big WHERE ctid = (SELECT ctid FROM s.big WHERE c = 9 LIMIT 1)";
+    assert_eq!(changed(&mut w, nine), 1);
+    // Rows enough to cut the run's last block again, its first block sharing the key still.
+    changed(&mut w, "INSERT INTO s.big SELECT 1, 7, '{}' FROM generate_series(1, 20000)");
+    assert_eq!(
+        rows(&mut w, "SELECT count(*) FROM s.big WHERE c = 7 AND a = 1"),
+        ["154995"]
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT a, c, b::text AS b FROM s.big WHERE c <> 7 ORDER BY 1, 2"),
+        ["2|8|{}"]
+    );
+}

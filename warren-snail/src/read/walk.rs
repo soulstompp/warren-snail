@@ -2915,6 +2915,7 @@ mod tests {
         months[11] = 21;
         let block = Entry {
             open: false,
+            shared: false,
             depth: 1,
             rows: 120,
             dead: 0,
@@ -2961,6 +2962,7 @@ mod tests {
         // 100 rows, `nulls` of them NULL, the rest from 1 to 50.
         let block = |nulls: u32| Entry {
             open: false,
+            shared: false,
             depth: 1,
             rows: 100,
             dead: 0,
@@ -3000,6 +3002,7 @@ mod tests {
         // 100 rows, 20 of them NULL, the rest from 1 to 50.
         let block = |min: i128, max: i128, nulls: u32| Entry {
             open: false,
+            shared: false,
             depth: 1,
             rows: 100,
             dead: 0,

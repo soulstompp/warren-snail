@@ -35,7 +35,7 @@ use arrow::array::{
     RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use parquet::data_type::ByteArray;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// What a statement did.
 #[derive(Clone, Debug, Default)]
@@ -3287,7 +3287,7 @@ impl Snail {
                     continue;
                 }
                 let mut path = Vec::new();
-                self.locate(&mut top, &head, &b.first, &mut path)?;
+                self.locate_block(&mut top, &head, &b.first, b.child, &mut path)?;
                 if entry_at(&top, &path).child != b.child {
                     return Err(Error::new(format!(
                         "{}: a block of {} the transaction holds was written by another writer",
@@ -3684,7 +3684,7 @@ impl Snail {
                     continue;
                 }
                 let mut path = Vec::new();
-                self.locate(&mut top, &head, &b.first, &mut path)?;
+                self.locate_block(&mut top, &head, &b.first, b.child, &mut path)?;
                 let was = entry_at(&top, &path).clone();
                 if was.child != b.child {
                     return Err(Error::new(format!(
@@ -4225,9 +4225,14 @@ impl Snail {
             });
         } else {
             let mut by_block: BTreeMap<Vec<usize>, Vec<Effect>> = BTreeMap::new();
+            let mut taken = BTreeMap::new();
             for e in effects {
                 let mut path = Vec::new();
-                self.locate(&mut top, &head, &e.key, &mut path)?;
+                if e.delete {
+                    path = self.holding(&mut top, &head, (table, order), &e, &mut taken)?;
+                } else {
+                    self.locate(&mut top, &head, &e.key, &mut path)?;
+                }
                 // A row written is checked against the block after its own, where glibc orders it.
                 if let (false, Some(next)) = (e.delete, following(&top, &path)) {
                     crate::write::agreed_beside(table, order, &e.key, next)?;
@@ -4287,8 +4292,8 @@ impl Snail {
             .filter(|e| e.child.start < STAGED)
             .map(|e| (lock::block_byte_of(key, oi, &e.first), e))
             .collect();
+        // Blocks sharing a byte, a place cut by count among them, take it once, and each is checked.
         want.sort_by_key(|x| x.0);
-        want.dedup_by_key(|x| x.0);
         let mut got = Vec::new();
         for (b, _) in &want {
             if self.locks.contains(b) || got.contains(b) {
@@ -4338,7 +4343,7 @@ impl Snail {
         };
         for e in blocks {
             let mut path = Vec::new();
-            self.locate(&mut top, &head, &e.first, &mut path)?;
+            self.locate_block(&mut top, &head, &e.first, e.child, &mut path)?;
             if entry_at(&top, &path).child != e.child {
                 return Ok(false);
             }
@@ -4370,25 +4375,150 @@ impl Snail {
         let i = pick(&node.entries, key);
         path.push(i);
         if node.height > 1 {
-            if !node.kids.contains_key(&i) {
-                let entries = decode_page(
-                    &self.reader.read_extent(node.entries[i].child)?,
-                    head,
-                    node.entries[i].bound(),
-                )?;
-                node.kids.insert(
-                    i,
-                    Node {
-                        entries,
-                        height: node.height - 1,
-                        kids: BTreeMap::new(),
-                        at: node.entries[i].child,
-                    },
-                );
-            }
+            self.read_kid(node, head, i)?;
             self.locate(node.kids.get_mut(&i).unwrap(), head, key, path)?;
         }
         Ok(())
+    }
+
+    /// The directory page under entry `i` of `node`, read where it is not yet.
+    fn read_kid(&self, node: &mut Node, head: &Head, i: usize) -> Result<()> {
+        if !node.kids.contains_key(&i) {
+            let entries = decode_page(
+                &self.reader.read_extent(node.entries[i].child)?,
+                head,
+                node.entries[i].bound(),
+            )?;
+            node.kids.insert(
+                i,
+                Node {
+                    entries,
+                    height: node.height - 1,
+                    kids: BTreeMap::new(),
+                    at: node.entries[i].child,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Moves a path to the block before the one it names, reading the directory pages on the way;
+    /// false where it names the first.
+    fn back(&self, node: &mut Node, head: &Head, path: &mut Vec<usize>) -> Result<bool> {
+        let Some(d) = path.iter().rposition(|&i| i > 0) else {
+            return Ok(false);
+        };
+        path.truncate(d + 1);
+        path[d] -= 1;
+        let mut at: &mut Node = node;
+        for i in &path[..d] {
+            at = at.kids.get_mut(i).expect("a page read on the way down");
+        }
+        while at.height > 1 {
+            let i = *path.last().expect("a path names an entry");
+            self.read_kid(at, head, i)?;
+            at = at.kids.get_mut(&i).expect("a page just read");
+            path.push(at.entries.len() - 1);
+        }
+        Ok(true)
+    }
+
+    /// Every block a key may lie in, first to last: the block it belongs with, and before it each
+    /// block the next one shares its first key with, while that key is the key.
+    pub(super) fn blocks_of_key(
+        &self,
+        node: &mut Node,
+        head: &Head,
+        key: &[KeyValue],
+    ) -> Result<Vec<Vec<usize>>> {
+        let mut path = Vec::new();
+        self.locate(node, head, key, &mut path)?;
+        let mut run = vec![path.clone()];
+        loop {
+            let e = entry_at(node, &path);
+            if !e.shared || e.first.as_slice() != key || !self.back(node, head, &mut path)? {
+                break;
+            }
+            run.push(path.clone());
+        }
+        run.reverse();
+        Ok(run)
+    }
+
+    /// Reads down the directory to the block whose first key is `first` and whose page map is
+    /// `child`: of blocks sharing their first key, the one `child` names; where none is, the block
+    /// the key belongs with.
+    pub(super) fn locate_block(
+        &self,
+        node: &mut Node,
+        head: &Head,
+        first: &[KeyValue],
+        child: Extent,
+        path: &mut Vec<usize>,
+    ) -> Result<()> {
+        self.locate(node, head, first, path)?;
+        let mut at = path.clone();
+        loop {
+            let e = entry_at(node, &at);
+            if e.child == child {
+                *path = at;
+                return Ok(());
+            }
+            if !e.shared || e.first.as_slice() != first || !self.back(node, head, &mut at)? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The block a row a change deletes or replaces lies in: the block its key belongs with; where
+    /// blocks share the key, the first of them holding a live row of its values that no change
+    /// routed before it has taken, `taken` counting each block's.
+    pub(super) fn holding(
+        &self,
+        top: &mut Node,
+        head: &Head,
+        on: (&Table, &Order),
+        e: &Effect,
+        taken: &mut BTreeMap<Vec<usize>, HashMap<Vec<Datum>, usize>>,
+    ) -> Result<Vec<usize>> {
+        let mut run = self.blocks_of_key(top, head, &e.key)?;
+        if run.len() > 1 {
+            for path in &run {
+                if !taken.contains_key(path) {
+                    let live = self.live_alike(on, head, entry_at(top, path))?;
+                    taken.insert(path.clone(), live);
+                }
+                let live = taken.get_mut(path).expect("counted just now");
+                if let Some(n) = live.get_mut(&e.values).filter(|n| **n > 0) {
+                    *n -= 1;
+                    return Ok(path.clone());
+                }
+            }
+        }
+        Ok(run.pop().expect("a key belongs with a block"))
+    }
+
+    /// How many live rows of a block hold each row's values, as its order holds them.
+    pub(super) fn live_alike(
+        &self,
+        (table, order): (&Table, &Order),
+        head: &Head,
+        entry: &Entry,
+    ) -> Result<HashMap<Vec<Datum>, usize>> {
+        let map = read_map(&self.reader, entry, &head.level_text)?;
+        let columns = self.block_columns(table, order, &map)?;
+        let types: Vec<ColumnType> = order.columns.iter().map(|&c| table.columns[c].ty).collect();
+        let dead: std::collections::HashSet<u32> = map.dead.iter().copied().collect();
+        let mut live: HashMap<Vec<Datum>, usize> = HashMap::new();
+        for p in (0..map.rows() as usize).filter(|p| !dead.contains(&(*p as u32))) {
+            let row = columns
+                .iter()
+                .zip(&types)
+                .map(|(v, &ty)| datum_typed(v, p, ty))
+                .collect();
+            *live.entry(row).or_default() += 1;
+        }
+        Ok(live)
     }
 
     /// What a round found wasted, as it ends: in a transaction, pruned within it; outside one, kept
@@ -4502,7 +4632,7 @@ impl Snail {
             let mut replaced: BTreeMap<Vec<usize>, Vec<Entry>> = BTreeMap::new();
             for b in blocks {
                 let mut path = Vec::new();
-                self.locate(&mut top, &head, &b.first, &mut path)?;
+                self.locate_block(&mut top, &head, &b.first, b.child, &mut path)?;
                 let entry = entry_at(&top, &path).clone();
                 if entry.child != b.child || replaced.contains_key(&path) {
                     continue;
@@ -4715,6 +4845,10 @@ impl Snail {
                 Some(&entry.first),
                 Some(entry.bound()),
             );
+            // The first keeps the block's first key, and with it what the block before shares.
+            if let Some(first) = written.first_mut() {
+                first.shared = entry.shared;
+            }
             return Ok((written, true));
         }
         // The new rows go after the block's last, into its tail: plain pages of one disk page, each

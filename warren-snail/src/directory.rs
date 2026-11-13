@@ -204,6 +204,9 @@ pub struct Entry {
     /// Whether every key under it sorts before its last, the separator above it, where its order
     /// keeps one separator between blocks and no key just below the separator can be named.
     pub open: bool,
+    /// Whether its first key is also the last key of the entry before it: a place cut by count,
+    /// its rows alike lying in neighbouring blocks.
+    pub shared: bool,
     /// One for each leaf the order holds, each column's in turn.
     pub columns: Vec<Summary>,
     /// The rows on each month, January first, for each of the order's month columns.
@@ -501,6 +504,9 @@ pub fn separate(
     let seps: Vec<Vec<KeyValue>> = (1..n)
         .map(|i| separator(&entries[i - 1].last, &entries[i].first))
         .collect();
+    let shared: Vec<bool> = (1..n)
+        .map(|i| entries[i - 1].last == entries[i].first)
+        .collect();
     let cut = cut_below(&entries[0].first, &entries[n - 1].last);
     let first = match lower {
         Some(l) if entries[0].first.as_slice() >= l => l.to_vec(),
@@ -519,9 +525,13 @@ pub fn separate(
     entries[0].first = first;
     entries[n - 1].last = last;
     entries[n - 1].open = open;
-    for (i, s) in seps.into_iter().enumerate() {
-        (entries[i].last, entries[i].open) = below(&s, level_text);
+    for (i, (s, shared)) in seps.into_iter().zip(shared).enumerate() {
+        (entries[i].last, entries[i].open) = match shared {
+            true => (s.clone(), false),
+            false => below(&s, level_text),
+        };
         entries[i + 1].first = s;
+        entries[i + 1].shared = shared;
     }
 }
 
@@ -597,6 +607,10 @@ const ENTRY_ENDS: u32 = 1 << 31;
 /// past them follows the spans. An entry with none is written as before.
 const ENTRY_TAILS: u32 = 1 << 30;
 
+/// The next bit, set where its first key is also the last key of the entry before it. An entry
+/// without it is written as before.
+const ENTRY_SHARED: u32 = 1 << 29;
+
 impl Entry {
     /// Whether any of its month columns holds an infinite instant.
     fn has_ends(&self) -> bool {
@@ -652,6 +666,7 @@ impl Entry {
         };
         let mut e = Entry {
             open: last.open,
+            shared: first.shared,
             depth: 0,
             rows: 0,
             dead: 0,
@@ -725,7 +740,12 @@ impl Entry {
     fn encode(&self, o: &mut Out) {
         let ends = self.has_ends();
         let tails = self.has_tails();
-        o.u32(self.depth | if ends { ENTRY_ENDS } else { 0 } | if tails { ENTRY_TAILS } else { 0 });
+        o.u32(
+            self.depth
+                | if ends { ENTRY_ENDS } else { 0 }
+                | if tails { ENTRY_TAILS } else { 0 }
+                | if self.shared { ENTRY_SHARED } else { 0 },
+        );
         o.u32(self.rows);
         o.u32(self.dead);
         keys_out(o, kept(&self.first));
@@ -778,7 +798,8 @@ impl Entry {
     fn decode(i: &mut In, head: &Head) -> Result<Entry> {
         let depth = i.u32()?;
         let (ends, tails) = (depth & ENTRY_ENDS != 0, depth & ENTRY_TAILS != 0);
-        let depth = depth & !(ENTRY_ENDS | ENTRY_TAILS);
+        let shared = depth & ENTRY_SHARED != 0;
+        let depth = depth & !(ENTRY_ENDS | ENTRY_TAILS | ENTRY_SHARED);
         let rows = i.u32()?;
         let dead = i.u32()?;
         let levels = head.level_text.len();
@@ -856,6 +877,7 @@ impl Entry {
         let child = i.extent()?;
         Ok(Entry {
             open: false,
+            shared,
             depth,
             rows,
             dead,
@@ -1070,8 +1092,8 @@ pub fn encode_page(entries: &[Entry]) -> Vec<u8> {
 }
 
 /// A directory page, its entries' kinds told by `head`. Each entry keeps one key: an entry's last is
-/// the greatest the next entry's separator leaves it, and the page's last entry's `upper`, the last
-/// of the entry above the page.
+/// the greatest the next entry's separator leaves it, or that separator itself where the next shares
+/// it; and the page's last entry's `upper`, the last of the entry above the page.
 pub fn decode_page(buf: &[u8], head: &Head, upper: (&[KeyValue], bool)) -> Result<Vec<Entry>> {
     let mut i = In::new(buf);
     let mut entries = (0..i.u32()?)
@@ -1079,6 +1101,7 @@ pub fn decode_page(buf: &[u8], head: &Head, upper: (&[KeyValue], bool)) -> Resul
         .collect::<Result<Vec<_>>>()?;
     for k in 0..entries.len() {
         (entries[k].last, entries[k].open) = match entries.get(k + 1) {
+            Some(next) if next.shared => (next.first.clone(), false),
             Some(next) => below(&next.first, &head.level_text),
             None => (
                 padded(upper.0.to_vec(), head.level_text.len(), GREATEST),
@@ -1430,6 +1453,7 @@ mod tests {
     fn block(i: i64, rows: u32, child: u64) -> Entry {
         Entry {
             open: false,
+            shared: false,
             depth: 24,
             rows,
             dead: 0,
@@ -1613,6 +1637,7 @@ mod tests {
         let key = |k: i128| vec![KeyValue::Wide(k)];
         let e = Entry {
             open: false,
+            shared: false,
             depth: 3,
             rows: 256,
             dead: 0,

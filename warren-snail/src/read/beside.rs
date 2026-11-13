@@ -296,19 +296,23 @@ impl Snail {
             return Ok(Since::Deleted);
         }
         let mut seen = self.top_on(from, table, order)?;
-        let mut by_block: BTreeMap<Vec<usize>, Vec<&Row>> = BTreeMap::new();
+        // A key lies in each block of its run, one block but where blocks share it.
+        let mut by_run: BTreeMap<Vec<Vec<usize>>, Vec<&Row>> = BTreeMap::new();
         for r in rows {
             let key = key_of(table, order, r)?;
-            let mut path = Vec::new();
-            self.locate(&mut top, &head, &key, &mut path)?;
+            let run = self.blocks_of_key(&mut top, &head, &key)?;
             if let Some((sh, st)) = seen.as_mut().filter(|(_, st)| !st.entries.is_empty()) {
-                let mut sp = Vec::new();
-                self.locate(st, sh, &key, &mut sp)?;
-                if entry_at(st, &sp).child == entry_at(&top, &path).child {
+                let was = self.blocks_of_key(st, sh, &key)?;
+                let same = was.len() == run.len()
+                    && was
+                        .iter()
+                        .zip(&run)
+                        .all(|(w, p)| entry_at(st, w).child == entry_at(&top, p).child);
+                if same {
                     continue;
                 }
             }
-            by_block.entry(path).or_default().push(r);
+            by_run.entry(run).or_default().push(r);
         }
         let held =
             |r: &Row| -> Vec<Datum> { order.columns.iter().map(|&c| r[c].clone()).collect() };
@@ -317,23 +321,30 @@ impl Snail {
             .filter_map(|c| order.slot(c))
             .collect();
         let types: Vec<_> = order.columns.iter().map(|&c| table.columns[c].ty).collect();
-        for (path, rows) in by_block {
-            let map = read_map(&self.reader, entry_at(&top, &path), &head.level_text)?;
-            let columns = self.block_columns(table, order, &map)?;
-            let positions = map.rows() as usize;
-            let at = |p: usize| -> Vec<Datum> {
-                columns
+        for (run, rows) in by_run {
+            let mut blocks = Vec::with_capacity(run.len());
+            for path in &run {
+                let map = read_map(&self.reader, entry_at(&top, path), &head.level_text)?;
+                let columns = self.block_columns(table, order, &map)?;
+                let gone: HashSet<u32> = map.dead.iter().copied().collect();
+                blocks.push((map, columns, gone));
+            }
+            let at = |b: usize, p: usize| -> Vec<Datum> {
+                blocks[b]
+                    .1
                     .iter()
                     .zip(&types)
                     .map(|(v, &ty)| datum_typed(v, p, ty))
                     .collect()
             };
-            let gone: HashSet<u32> = map.dead.iter().copied().collect();
-            let dead = |p: usize| gone.contains(&(p as u32));
+            let dead = |b: usize, p: usize| blocks[b].2.contains(&(p as u32));
+            let each = || {
+                (0..blocks.len()).flat_map(|b| (0..blocks[b].0.rows() as usize).map(move |p| (b, p)))
+            };
             // How many live rows hold each row's values: of rows alike, each found is one of them.
             let mut live: HashMap<Vec<Datum>, usize> = HashMap::new();
-            for p in (0..positions).filter(|&p| !dead(p)) {
-                *live.entry(at(p)).or_default() += 1;
+            for (b, p) in each().filter(|&(b, p)| !dead(b, p)) {
+                *live.entry(at(b, p)).or_default() += 1;
             }
             for r in rows {
                 let values = held(r);
@@ -341,13 +352,14 @@ impl Snail {
                     *n -= 1;
                     continue;
                 }
-                let same_key = |p: usize| {
-                    let a = at(p);
+                let same_key = |b: usize, p: usize| {
+                    let a = at(b, p);
                     identity.iter().all(|&s| a[s] == values[s]) && a != values
                 };
-                let chained = |p: usize| map.chains.iter().any(|(c, _)| *c as usize == p);
-                let updated = (0..positions).any(|p| !dead(p) && same_key(p))
-                    || (0..positions).any(|p| dead(p) && chained(p) && at(p) == values);
+                let chained =
+                    |b: usize, p: usize| blocks[b].0.chains.iter().any(|(c, _)| *c as usize == p);
+                let updated = each().any(|(b, p)| !dead(b, p) && same_key(b, p))
+                    || each().any(|(b, p)| dead(b, p) && chained(b, p) && at(b, p) == values);
                 return Ok(if updated {
                     Since::Updated
                 } else {
@@ -376,40 +388,43 @@ impl Snail {
         if top.entries.is_empty() {
             return Ok(Vec::new());
         }
-        let mut by_block: BTreeMap<Vec<usize>, Vec<(&Row, usize)>> = BTreeMap::new();
+        let mut by_run: BTreeMap<Vec<Vec<usize>>, Vec<(&Row, usize)>> = BTreeMap::new();
         for &(r, n) in rows {
             let key = key_of(table, order, r)?;
-            let mut path = Vec::new();
-            self.locate(&mut top, &head, &key, &mut path)?;
-            by_block.entry(path).or_default().push((r, n));
+            let run = self.blocks_of_key(&mut top, &head, &key)?;
+            by_run.entry(run).or_default().push((r, n));
         }
         let held =
             |r: &Row| -> Vec<Datum> { order.columns.iter().map(|&c| r[c].clone()).collect() };
         let types: Vec<_> = order.columns.iter().map(|&c| table.columns[c].ty).collect();
         let mut keys = Vec::new();
-        for (path, rows) in by_block {
-            let map = read_map(&self.reader, entry_at(&top, &path), &head.level_text)?;
-            if map.chains.is_empty() {
-                continue;
-            }
-            let columns = self.block_columns(table, order, &map)?;
-            let dead: HashSet<u32> = map.dead.iter().copied().collect();
-            let at = |p: usize| -> Vec<Datum> {
-                columns
-                    .iter()
-                    .zip(&types)
-                    .map(|(v, &ty)| datum_typed(v, p, ty))
-                    .collect()
-            };
-            for (r, n) in rows {
-                let values = held(r);
-                keys.extend(
-                    map.chains
+        for (run, mut rows) in by_run {
+            for path in &run {
+                let map = read_map(&self.reader, entry_at(&top, path), &head.level_text)?;
+                if map.chains.is_empty() {
+                    continue;
+                }
+                let columns = self.block_columns(table, order, &map)?;
+                let dead: HashSet<u32> = map.dead.iter().copied().collect();
+                let at = |p: usize| -> Vec<Datum> {
+                    columns
                         .iter()
-                        .filter(|(p, _)| dead.contains(p) && at(*p as usize) == values)
-                        .take(n)
-                        .map(|(_, to)| to.clone()),
-                );
+                        .zip(&types)
+                        .map(|(v, &ty)| datum_typed(v, p, ty))
+                        .collect()
+                };
+                for (r, n) in rows.iter_mut() {
+                    let values = held(r);
+                    let before = keys.len();
+                    keys.extend(
+                        map.chains
+                            .iter()
+                            .filter(|(p, _)| dead.contains(p) && at(*p as usize) == values)
+                            .take(*n)
+                            .map(|(_, to)| to.clone()),
+                    );
+                    *n -= keys.len() - before;
+                }
             }
         }
         Ok(keys)
@@ -437,12 +452,17 @@ impl Snail {
             match self.top_on(&newest, table, order)? {
                 Some((head, mut top)) if !top.entries.is_empty() => {
                     for e in &effects {
-                        let mut path = Vec::new();
-                        self.locate(&mut top, &head, &e.key, &mut path)?;
-                        let b = lock::block_byte_of(key, oi, &entry_at(&top, &path).first);
-                        w.blocks.push(b);
-                        if e.lands {
-                            w.landed.push(b);
+                        // A row deleted may lie in any block of its key's run.
+                        let mut run = self.blocks_of_key(&mut top, &head, &e.key)?;
+                        if !e.delete {
+                            run.drain(..run.len() - 1);
+                        }
+                        for path in &run {
+                            let b = lock::block_byte_of(key, oi, &entry_at(&top, path).first);
+                            w.blocks.push(b);
+                            if e.lands {
+                                w.landed.push(b);
+                            }
                         }
                     }
                 }
@@ -671,9 +691,14 @@ impl Snail {
             head = first;
         } else {
             let mut by_block: BTreeMap<Vec<usize>, Vec<super::change::Effect>> = BTreeMap::new();
+            let mut taken = BTreeMap::new();
             for e in effects {
                 let mut path = Vec::new();
-                self.locate(&mut top, &head, &e.key, &mut path)?;
+                if e.delete {
+                    path = self.holding(&mut top, &head, (table, order), &e, &mut taken)?;
+                } else {
+                    self.locate(&mut top, &head, &e.key, &mut path)?;
+                }
                 by_block.entry(path).or_default().push(e);
             }
             for (path, effects) in by_block {

@@ -2619,6 +2619,7 @@ pub(crate) fn write_block(
     }
     let entry = Entry {
         open: false,
+        shared: false,
         depth: b.place.len() as u32,
         rows: b.rows() as u32,
         dead: 0,

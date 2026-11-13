@@ -1,7 +1,7 @@
 //! An order's blocks cut as its rows come in its order, each handed on as it closes: the cut `cut`
 //! makes of every row at once, made holding only the rows no closed block holds yet.
 
-use crate::cut::{PAGE, ROW_GROUP_ROWS};
+use crate::cut::{by_count, PAGE, ROW_GROUP_ROWS};
 use crate::places::{KeyValue, Sublevels};
 use crate::values::Values;
 use std::collections::VecDeque;
@@ -432,20 +432,23 @@ impl<'a> Closing<'a> {
         }
     }
 
-    /// A closed block's rows taken from those held.
+    /// A closed block's rows taken from those held, cut by count where they are more than a block
+    /// holds.
     fn hand_on(&mut self, b: Open) {
         debug_assert_eq!(b.start, self.kept);
-        let (from, to) = (b.start - self.held, b.end - self.held);
-        let rows: Vec<usize> = (from..to).collect();
         let leaves = self.bits.len();
-        self.closed.push_back(Closed {
-            start: b.start,
-            end: b.end,
-            depth: b.depth,
-            columns: self.columns.iter().map(|c| c.gather(&rows)).collect(),
-            keys: self.keys[from * self.stride..to * self.stride].to_vec(),
-            widths: self.widths[from * leaves..to * leaves].to_vec(),
-        });
+        for (start, end) in by_count(b.start, b.end) {
+            let (from, to) = (start - self.held, end - self.held);
+            let rows: Vec<usize> = (from..to).collect();
+            self.closed.push_back(Closed {
+                start,
+                end,
+                depth: b.depth,
+                columns: self.columns.iter().map(|c| c.gather(&rows)).collect(),
+                keys: self.keys[from * self.stride..to * self.stride].to_vec(),
+                widths: self.widths[from * leaves..to * leaves].to_vec(),
+            });
+        }
         self.kept = b.end;
         // The rows handed on are let go once they are half of those held.
         let gone = self.kept - self.held;
@@ -638,6 +641,20 @@ mod tests {
             .map(|i| if i % 500 == 7 { 5000 } else { 4 })
             .collect();
         let (whole, closed) = both(ddl, keys, &[widths], &[false], ROW_GROUP_ROWS);
+        assert_eq!(whole, closed);
+    }
+
+    #[test]
+    fn a_long_place_closes_cut_by_count() {
+        // An order not unique, a value's rows past a block's most between others.
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL);";
+        let mut data: Vec<i64> = (0..3000).collect();
+        data.extend(std::iter::repeat_n(5000, 140_000));
+        data.extend(6000..8000);
+        data.extend(std::iter::repeat_n(9000, crate::cut::BLOCK_ROWS + 1));
+        let widths = vec![4u64; data.len()];
+        let (whole, closed) = both(ddl, ints(data), &[widths], &[false], ROW_GROUP_ROWS);
+        assert!(whole.iter().all(|b| b.1 - b.0 <= crate::cut::BLOCK_ROWS));
         assert_eq!(whole, closed);
     }
 }

@@ -10,6 +10,16 @@ pub const ROW_GROUP_ROWS: usize = 1_048_576;
 /// The plain parquet library's data page, at most, in rows and in disk pages.
 pub const DATA_PAGE_ROWS: usize = 20_000;
 pub const DATA_PAGE_PAGES: usize = 256;
+/// The most rows a block holds: a tid's place in its block counts to 65,535.
+pub const BLOCK_ROWS: usize = 65_535;
+
+/// The rows `start..end` of a block, in as few blocks of at most `BLOCK_ROWS` as they take, each of
+/// about as many rows.
+pub(crate) fn by_count(start: usize, end: usize) -> impl Iterator<Item = (usize, usize)> {
+    let rows = end - start;
+    let n = rows.div_ceil(BLOCK_ROWS).max(1);
+    (0..n).map(move |i| (start + i * rows / n, start + (i + 1) * rows / n))
+}
 
 /// One block: its place (its key's value at each sublevel, down to its depth) and its rows in
 /// the order.
@@ -116,6 +126,9 @@ impl Widths {
 /// A part that fills no page joins the block beside it. Thin parts in a row join each other, and a
 /// run of them that fills a page is a block of its own. A run that fills none joins the block before
 /// it in the place, or the block after it where it comes first, unless that would pass a row group.
+///
+/// A block of more rows than a tid's place counts, a place equal on every sublevel or one no part of
+/// which fills, is cut by count, `by_count`, its blocks keeping its place.
 pub fn cut(keys: &Keys, sublevels: &Sublevels, widths: &Widths) -> Vec<Block> {
     cut_within(keys, sublevels, widths, ROW_GROUP_ROWS)
 }
@@ -139,7 +152,18 @@ pub(crate) fn cut_within(
         group,
     };
     go(&c, 0, keys.len(), 0, &mut place, &mut out);
-    out
+    if out.iter().all(|b| b.rows() <= BLOCK_ROWS) {
+        return out;
+    }
+    out.into_iter()
+        .flat_map(|b| {
+            by_count(b.start, b.end).map(move |(start, end)| Block {
+                place: b.place.clone(),
+                start,
+                end,
+            })
+        })
+        .collect()
 }
 
 /// What a cut reads: the rows' keys, the sublevels, each leaf's widths, and a row group's rows.
@@ -481,12 +505,58 @@ mod tests {
 
     #[test]
     fn a_thin_part_that_would_pass_a_row_group_stands_alone() {
-        // One value a row group's rows long cannot be cut, so the 100 after it stay a block of their
-        // own.
+        // One value a row group's rows long is no place a part can join, so the 100 after it stay a
+        // block of their own; the value's rows are cut by count.
         let mut data = vec![0i64; ROW_GROUP_ROWS];
         data.extend((0..100).map(|i| (1 << 20) + i));
         let rows: Vec<usize> = int_blocks(data).iter().map(|b| b.rows()).collect();
-        assert_eq!(rows, [ROW_GROUP_ROWS, 100]);
+        let mut cut: Vec<usize> = by_count(0, ROW_GROUP_ROWS).map(|(a, b)| b - a).collect();
+        cut.push(100);
+        assert_eq!(rows, cut);
+        assert_eq!(rows.len(), 18);
+    }
+
+    #[test]
+    fn a_long_place_is_cut_by_count() {
+        // An order not unique: every column with a B-tree, rows alike sharing a place.
+        let c = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL);").unwrap();
+        let t = &c.tables[0];
+        assert!(!t.orders[0].unique);
+        let sublevels = Sublevels::new(&t.orders[0], t, &[0]);
+        let blocks = |data: Vec<i64>| {
+            cut(
+                &Keys {
+                    stride: 1,
+                    data: ints(data),
+                },
+                &sublevels,
+                &Widths(vec![Width::Fixed(4)]),
+            )
+        };
+        // 200,000 rows of one value: four blocks of 50,000, each within a tid's 65,535.
+        let one: Vec<usize> = blocks(vec![7; 200_000]).iter().map(|b| b.rows()).collect();
+        assert_eq!(one, [50_000; 4]);
+        // 65,535 rows of one value stay one block; one more makes two.
+        assert_eq!(blocks(vec![7; BLOCK_ROWS]).len(), 1);
+        let two: Vec<usize> = blocks(vec![7; BLOCK_ROWS + 1]).iter().map(|b| b.rows()).collect();
+        assert_eq!(two, [32_768, 32_768]);
+        // Between other values, the place is cut by count and the rest as before: every block within
+        // a tid's rows, the rows in their order, the place in three blocks of about a third each.
+        let mut data: Vec<i64> = (0..3000).collect();
+        data.extend(std::iter::repeat_n(5000, 140_000));
+        data.extend(6000..8000);
+        let cut = blocks(data.clone());
+        assert!(cut.iter().all(|b| b.rows() <= BLOCK_ROWS));
+        assert!(cut.windows(2).all(|w| w[0].end == w[1].start));
+        assert_eq!((cut[0].start, cut.last().unwrap().end), (0, data.len()));
+        let long: Vec<&Block> = cut
+            .iter()
+            .filter(|b| data[b.start..b.end].contains(&5000))
+            .collect();
+        assert_eq!(long.len(), 3);
+        assert!(long
+            .iter()
+            .all(|b| b.rows() >= 46_000 && b.place == long[0].place));
     }
 
     /// Each row's plain bytes, summed from the first row.
