@@ -378,6 +378,9 @@ impl Typing<'_> {
         let [column, value, subs @ ..] = parts.as_slice() else {
             return Ok(None);
         };
+        if matches!(value, Expr::Function(f) if super::pipeline::function_name(f) == super::image::DEFAULTED) {
+            return Err(super::image::default_refused());
+        }
         let ty = self.type_of(column)?;
         let given = self.type_of(value)?;
         let mut sliced = false;
@@ -390,6 +393,9 @@ impl Typing<'_> {
                 s => vec![*s],
             };
             for b in bounds {
+                if matches!(b, Expr::Function(f) if super::pipeline::function_name(f) == super::image::OMITTED) {
+                    continue;
+                }
                 match self.type_of(b)? {
                     Some(t) if !t.is_integer() && !crate::catalog::assignable(t, ColumnType::Int4) => {
                         return Err(Error::coded("42804", "array subscript must have type integer"))
@@ -402,8 +408,14 @@ impl Typing<'_> {
             return Ok(None);
         };
         let named = super::pipeline::column_of(column).map(|(_, n)| n).unwrap_or_default();
+        let array = matches!(ty, ColumnType::Composed(r)
+            if matches!(r.def(), crate::composed::Composed::Array { .. }));
         let wanted = match (raw_element_of(ty), element_of(ty)) {
             (Some(el), _) => match sliced {
+                true => ty,
+                false => el,
+            },
+            (None, Some(el)) if array => match sliced {
                 true => ty,
                 false => el,
             },

@@ -1492,6 +1492,95 @@ fn rows_named(catalog: &Catalog, q: &Query) -> Result<Option<Query>> {
     Ok(changed.then_some(q))
 }
 
+/// An INSERT's question whose targets subscript a column, each such column's values written as the
+/// value their assignments make of NULL, in turn (`image::ASSIGNED`), each column once where it is
+/// first named, as PostgreSQL's parser writes them: a VALUES list's rows and a SELECT's list in
+/// place, any other question read as a table of its columns. How many values it gives is checked
+/// against the targets first; DEFAULT for a subscripted column refused.
+fn subscripts_written(table: &Table, targets: &[(usize, Option<String>)], q: &Query) -> Result<Query> {
+    use super::image::{parse_expr, ASSIGNED};
+    let width = width_of(&q.body)?;
+    if width > targets.len() {
+        return Err(Error::new("INSERT has more expressions than target columns"));
+    }
+    if width < targets.len() {
+        return Err(Error::new("INSERT has more target columns than expressions"));
+    }
+    let merged = |values: &[Expr]| -> Result<Vec<Expr>> {
+        if values.len() != width {
+            return Err(Error::new("VALUES lists must all be the same length"));
+        }
+        let mut out = Vec::with_capacity(width);
+        let mut done: Vec<usize> = Vec::new();
+        for (k, &(c, ref subs)) in targets.iter().enumerate() {
+            if done.contains(&c) {
+                continue;
+            }
+            done.push(c);
+            if subs.is_none() {
+                out.push(values[k].clone());
+                continue;
+            }
+            let mut made = format!(
+                "CAST(NULL AS {})",
+                super::typed::type_name(table.columns[c].ty)
+            );
+            for (p, (_, s)) in targets.iter().enumerate().filter(|(_, (d, _))| *d == c) {
+                if is_default(&values[p]) {
+                    return Err(super::image::default_refused());
+                }
+                let s = s.as_deref().unwrap_or_default();
+                made = format!("\"{ASSIGNED}\"({made}, {}, {s})", values[p]);
+            }
+            out.push(parse_expr(&made)?);
+        }
+        Ok(out)
+    };
+    let mut q = q.clone();
+    let whole = read_whole(&q);
+    match q.body.as_mut() {
+        SetExpr::Values(v) if !whole => {
+            for r in &mut v.rows {
+                r.content = merged(&r.content)?;
+            }
+            Ok(q)
+        }
+        SetExpr::Select(s) => {
+            let values: Vec<Expr> = s
+                .projection
+                .iter()
+                .map(|i| match i {
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                        e.clone()
+                    }
+                    _ => unreachable!("an item width_of takes"),
+                })
+                .collect();
+            s.projection = merged(&values)?
+                .into_iter()
+                .map(SelectItem::UnnamedExpr)
+                .collect();
+            Ok(q)
+        }
+        _ => {
+            let read: Vec<Expr> = (1..=width)
+                .map(|k| parse_expr(&format!("\"*SELECT*\".\"{k}\"")))
+                .collect::<std::result::Result<_, _>>()?;
+            let items: Vec<String> = merged(&read)?.iter().map(ToString::to_string).collect();
+            let names: Vec<String> = (1..=width).map(|k| format!("\"{k}\"")).collect();
+            let text = format!(
+                "SELECT {} FROM ({q}) AS \"*SELECT*\" ({})",
+                items.join(", "),
+                names.join(", ")
+            );
+            match super::image::parse_sql(&text)?.pop() {
+                Some(Sql::Query(q)) => Ok(*q),
+                _ => unreachable!("a question"),
+            }
+        }
+    }
+}
+
 /// An INSERT's question with each star of its SELECTs written as the columns it stands for, as
 /// PostgreSQL's parser writes it out: `*` every column of each table its FROM names, in turn,
 /// `t.*` those of the one table; none where a star stands over anything but the file's tables.
@@ -1775,17 +1864,30 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
         _ => return Err(Error::new("an INSERT names a table")),
     };
     let table = &catalog.tables[ti];
-    // The columns named, each in its turn: refused where it is not the table's, or named again.
-    let mut columns: Vec<usize> = Vec::with_capacity(i.columns.len());
+    // The columns named, each in its turn, with a subscripted one's subscripts: refused where it is
+    // not the table's, or named again but where every naming subscripts it.
+    let mut targets: Vec<(usize, Option<String>)> = Vec::with_capacity(i.columns.len());
     for n in &i.columns {
-        let c = column_index(table, n)?;
-        if columns.contains(&c) {
+        let (c, subs) = match super::image::subscripted_target(n) {
+            Some((name, subs)) => (column_index(table, &ObjectName::from(vec![name]))?, Some(subs)),
+            None => (column_index(table, n)?, None),
+        };
+        if targets
+            .iter()
+            .any(|(p, s)| *p == c && (s.is_none() || subs.is_none()))
+        {
             return Err(Error::new(format!(
                 "column \"{}\" specified more than once",
                 table.columns[c].name
             )));
         }
-        columns.push(c);
+        targets.push((c, subs));
+    }
+    let mut columns: Vec<usize> = Vec::with_capacity(targets.len());
+    for &(c, _) in &targets {
+        if !columns.contains(&c) {
+            columns.push(c);
+        }
     }
     if columns.is_empty() {
         columns = (0..table.own_columns().len()).collect();
@@ -1829,6 +1931,14 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
             &starred
         }
         None => q,
+    };
+    let assigned;
+    let q = match targets.iter().any(|(_, s)| s.is_some()) {
+        true => {
+            assigned = subscripts_written(table, &targets, q)?;
+            &assigned
+        }
+        false => q,
     };
     if q
         .with
@@ -2070,7 +2180,26 @@ fn sets_of(
     for a in assignments {
         let c = match &a.target {
             AssignmentTarget::ColumnName(n) => column_index(table, n)?,
-            AssignmentTarget::Tuple(_) => return Err(refused("an UPDATE of a tuple")),
+            // A list a row of as many values assigns is read as its columns' own assignments
+            // (`image::tuples_assigned`): what is left is refused as PostgreSQL refuses it, but a
+            // sub-SELECT, which 18.6 reads once a row for all its columns.
+            AssignmentTarget::Tuple(_) => {
+                return Err(match &a.value {
+                    Expr::Subquery(_) => refused(
+                        "a list of columns assigned from one sub-SELECT, read once a row for all \
+                         of them,",
+                    ),
+                    v if super::pipeline::row_parts(v).is_some() => Error::coded(
+                        "42601",
+                        "number of columns does not match number of values",
+                    ),
+                    _ => Error::coded(
+                        "0A000",
+                        "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() \
+                         expression",
+                    ),
+                })
+            }
         };
         if sets.iter().any(|(s, _)| *s == c) {
             return Err(Error::new(format!(

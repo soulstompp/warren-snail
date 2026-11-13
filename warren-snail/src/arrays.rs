@@ -633,6 +633,189 @@ pub fn sort(elem: ColumnType, a: &Item, descending: bool, nulls_first: bool) -> 
     })
 }
 
+fn subscript_error(why: &str) -> Error {
+    Error::coded("2202E", why)
+}
+
+/// A limit of PostgreSQL's passed, carrying its code.
+fn past_a_limit(e: Error) -> Error {
+    Error::coded("54000", e.to_string())
+}
+
+/// A dimension's new length or lower bound, refused where it passes int4, as `array_set_element`
+/// refuses it.
+fn int4_of(v: i64) -> Result<i32> {
+    i32::try_from(v).map_err(|_| past_a_limit(array_size_exceeded()))
+}
+
+/// A one-dimensional array's length and lower bound once it takes the places `lo` to `hi`: grown
+/// before its first and after its last, as `array_set_element` and `array_set_slice` grow it.
+fn grown(dim: i32, lb: i32, lo: i64, hi: i64) -> Result<(i32, i32)> {
+    let (mut dim, mut lb) = (i64::from(dim), i64::from(lb));
+    if lo < lb {
+        dim = i64::from(int4_of(i64::from(int4_of(lb - lo)?) + dim)?);
+        lb = lo;
+    }
+    if hi >= dim + lb {
+        let after = int4_of(i64::from(int4_of(hi - (dim + lb))?) + 1)?;
+        dim = i64::from(int4_of(dim + i64::from(after))?);
+    }
+    Ok((int4_of(dim)?, int4_of(lb)?))
+}
+
+/// The array with the element at `at` replaced by `value` (`array_set_element`): an array of no
+/// elements made one of one element, each lower bound its subscript; a one-dimensional array
+/// extended to take it, its new places between NULL; any other subscript outside its dimensions
+/// refused. A NULL array is read as one of no elements.
+pub fn element_set(a: &Item, at: &[i32], value: Item) -> Result<Item> {
+    let (elements, dims, lower) = parts(a).unwrap_or((&[], &[], &[]));
+    if at.is_empty() || at.len() > MAXDIM {
+        return Err(subscript_error("wrong number of array subscripts"));
+    }
+    if dims.is_empty() {
+        let dims = vec![1; at.len()];
+        check_bounds(&dims, at).map_err(past_a_limit)?;
+        return Ok(Item::Array {
+            elements: vec![value],
+            dims,
+            lower: at.to_vec(),
+        });
+    }
+    if dims.len() != at.len() {
+        return Err(subscript_error("wrong number of array subscripts"));
+    }
+    if let ([dim], [lb], [i]) = (dims, lower, at) {
+        let (new_dim, new_lb) = grown(*dim, *lb, i64::from(*i), i64::from(*i))?;
+        n_items(&[new_dim]).map_err(past_a_limit)?;
+        check_bounds(&[new_dim], &[new_lb]).map_err(past_a_limit)?;
+        let mut out = vec![Item::Null; new_dim as usize];
+        let from = (lb - new_lb) as usize;
+        out[from..from + elements.len()].clone_from_slice(elements);
+        out[(i - new_lb) as usize] = value;
+        return Ok(Item::Array {
+            elements: out,
+            dims: vec![new_dim],
+            lower: vec![new_lb],
+        });
+    }
+    let mut offset = 0usize;
+    for ((&i, &d), &l) in at.iter().zip(dims).zip(lower) {
+        if i < l || i64::from(i) >= i64::from(d) + i64::from(l) {
+            return Err(subscript_error("array subscript out of range"));
+        }
+        offset = offset * d as usize + (i - l) as usize;
+    }
+    let mut out = elements.to_vec();
+    out[offset] = value;
+    Ok(Item::Array {
+        elements: out,
+        dims: dims.to_vec(),
+        lower: lower.to_vec(),
+    })
+}
+
+/// The array with the slice at `at` replaced by the source's elements in storage order, its shape
+/// not read (`array_set_slice`): each bound left out the array's own; an array of no elements made
+/// of the slice, every bound given; a one-dimensional array extended to take it, its new places
+/// between NULL; a slice outside any other array refused; fewer source elements than the slice
+/// holds refused, more left. A NULL source leaves the array as it is; a NULL array is read as one
+/// of no elements.
+pub fn slice_set(a: &Item, at: &[(Option<i32>, Option<i32>)], source: &Item) -> Result<Item> {
+    let (elements, dims, lower) = parts(a).unwrap_or((&[], &[], &[]));
+    let Some((given, _, _)) = parts(source) else {
+        return Ok(match a {
+            Item::Null => empty(),
+            _ => a.clone(),
+        });
+    };
+    if dims.is_empty() {
+        let mut new_dims = Vec::with_capacity(at.len());
+        let mut new_lower = Vec::with_capacity(at.len());
+        for &(l, u) in at {
+            let (Some(l), Some(u)) = (l, u) else {
+                return Err(subscript_error(
+                    "array slice subscript must provide both boundaries\nDETAIL:  When assigning \
+                     to a slice of an empty array value, slice boundaries must be fully specified.",
+                ));
+            };
+            new_dims.push(int4_of(i64::from(int4_of(i64::from(u) - i64::from(l))?) + 1)?);
+            new_lower.push(l);
+        }
+        let n = n_items(&new_dims).map_err(past_a_limit)?;
+        if (given.len() as i64) < n {
+            return Err(subscript_error("source array too small"));
+        }
+        if n == 0 {
+            return Ok(empty());
+        }
+        check_bounds(&new_dims, &new_lower).map_err(past_a_limit)?;
+        return Ok(Item::Array {
+            elements: given[..n as usize].to_vec(),
+            dims: new_dims,
+            lower: new_lower,
+        });
+    }
+    if at.is_empty() || dims.len() < at.len() {
+        return Err(subscript_error("wrong number of array subscripts"));
+    }
+    // Each dimension's slice, a bound left out the dimension's own.
+    let mut lo = Vec::with_capacity(dims.len());
+    let mut hi = Vec::with_capacity(dims.len());
+    for k in 0..dims.len() {
+        let (l, u) = at.get(k).copied().unwrap_or((None, None));
+        let first = i64::from(lower[k]);
+        let last = first + i64::from(dims[k]) - 1;
+        let (l, u) = (l.map_or(first, i64::from), u.map_or(last, i64::from));
+        if l > u {
+            return Err(subscript_error("upper bound cannot be less than lower bound"));
+        }
+        if dims.len() > 1 && k < at.len() && (l < first || u > last) {
+            return Err(subscript_error("array subscript out of range"));
+        }
+        lo.push(l);
+        hi.push(u);
+    }
+    let (new_dims, new_lower) = match (dims, lower) {
+        ([dim], [lb]) => {
+            let (d, l) = grown(*dim, *lb, lo[0], hi[0])?;
+            (vec![d], vec![l])
+        }
+        _ => (dims.to_vec(), lower.to_vec()),
+    };
+    n_items(&new_dims).map_err(past_a_limit)?;
+    check_bounds(&new_dims, &new_lower).map_err(past_a_limit)?;
+    let wanted: i64 = lo.iter().zip(&hi).map(|(l, u)| u - l + 1).product();
+    if wanted > given.len() as i64 {
+        return Err(subscript_error("source array too small"));
+    }
+    // The old elements where they lie, NULL where nothing does, then the source's in turn over the
+    // slice.
+    let total: usize = new_dims.iter().map(|&d| d as usize).product();
+    let mut out = vec![Item::Null; total];
+    let from = (lower[0] - new_lower[0]) as usize;
+    out[from..from + elements.len()].clone_from_slice(elements);
+    let mut place = lo.clone();
+    for e in given.iter().take(wanted as usize) {
+        let mut offset = 0usize;
+        for k in 0..new_dims.len() {
+            offset = offset * new_dims[k] as usize + (place[k] - i64::from(new_lower[k])) as usize;
+        }
+        out[offset] = e.clone();
+        for k in (0..new_dims.len()).rev() {
+            place[k] += 1;
+            if place[k] <= hi[k] {
+                break;
+            }
+            place[k] = lo[k];
+        }
+    }
+    Ok(Item::Array {
+        elements: out,
+        dims: new_dims,
+        lower: new_lower,
+    })
+}
+
 /// The array without its last `n` items, each lower bound 1 (`trim_array`). Refused where `n` is
 /// negative or past the first dimension's length. The last subscript kept is an int4 as
 /// `trim_array` computes it, wrapping below its least: so that trimming every item of an array

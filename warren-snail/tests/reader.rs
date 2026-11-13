@@ -6156,3 +6156,260 @@ fn an_insert_s_rows_and_its_returning_expand_a_row() {
         (None, "name each column the INSERT's question returns".into())
     );
 }
+
+/// A snail holding arrays, at a path of the test's name.
+fn arrays_held(name: &str) -> Snail {
+    let path = tmp(&format!("reader-{name}.snail"));
+    let ddl = "CREATE SCHEMA pt;
+         CREATE TABLE pt.a (id integer PRIMARY KEY, a integer[], t text[], m integer[], \
+         d integer[] DEFAULT '{1,2,3}');";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute(
+        "INSERT INTO pt.a VALUES (1, '{1,2,3}', '{a,b}', '{{1,2},{3,4}}', '{9}'), \
+         (2, NULL, NULL, NULL, NULL), (3, '{}', '{}', '{}', '{}'), \
+         (4, '[0:1]={5,6}', '{x}', '{{1,2,3}}', '{}')",
+    )
+    .unwrap();
+    w
+}
+
+/// Each write in a transaction rolled back, its RETURNING's rows, or its refusal.
+fn written_back(w: &mut Snail, writes: &[&str]) -> Result<Vec<String>, (Option<&'static str>, String)> {
+    w.execute("BEGIN").unwrap();
+    let mut out = Vec::new();
+    for write in writes {
+        match w.execute(write) {
+            Ok(d) => {
+                if let Some(b) = d.answer {
+                    out.extend(w.text_of(&b).unwrap().into_iter().map(|r| {
+                        r.into_iter()
+                            .map(|v| v.unwrap_or_else(|| "NULL".into()))
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    }));
+                }
+            }
+            Err(e) => {
+                w.execute("ROLLBACK").unwrap();
+                return Err((e.sqlstate(), e.to_string()));
+            }
+        }
+    }
+    w.execute("ROLLBACK").unwrap();
+    Ok(out)
+}
+
+/// An array's element or slice assigned as 18.6's array subscripting assigns it: the array extended
+/// past either end, NULL between; made from NULL or from no elements, each lower bound the
+/// subscript; a slice's bound left out the array's own; and refused as 18.6 refuses each.
+#[test]
+fn an_array_s_element_or_slice_is_assigned_as_postgresql_assigns_it() {
+    let mut w = arrays_held("array-assigned");
+    let ok = |r: &[&str]| Ok(r.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let no = |code: &'static str, words: &str| Err((Some(code), words.to_string()));
+    let at = |set: &str, id: i32, column: &str| format!("UPDATE pt.a SET {set} WHERE id = {id} RETURNING {column}");
+    for (writes, want) in [
+        (
+            vec![at("a[1] = 10", 1, "a"), at("a[5] = 50", 1, "a"), at("a[0] = 0", 1, "a"), at("a[-2] = -2", 1, "a")],
+            ok(&["{10,2,3}", "{10,2,3,NULL,50}", "[0:5]={0,10,2,3,NULL,50}", "[-2:5]={-2,NULL,0,10,2,3,NULL,50}"]),
+        ),
+        (
+            vec![at("a[1] = 1", 2, "a"), at("t[3] = 'c'", 2, "t"), at("a[2] = 2", 3, "a"), at("a[1] = NULL", 2, "a")],
+            ok(&["{1}", "[3:3]={c}", "[2:2]={2}", "{NULL}"]),
+        ),
+        (
+            vec![
+                at("a[2:3] = '{20,30}'", 1, "a"),
+                at("a[2:5] = '{20,30,40,50}'", 1, "a"),
+                at("a[:2] = '{8,9}'", 1, "a"),
+                at("a[4:] = '{8,9}'", 1, "a"),
+                at("a[:] = '{4,5,6,7,8,9}'", 1, "a"),
+                at("a[8:9] = '{8,9}'", 1, "a"),
+                at("a[-1:0] = '{-1,0,99}'", 1, "a"),
+            ],
+            ok(&[
+                "{1,20,30}",
+                "{1,20,30,40,50}",
+                "{8,9,30,40,50}",
+                "{8,9,30,8,9}",
+                "{4,5,6,7,8}",
+                "{4,5,6,7,8,NULL,NULL,8,9}",
+                "[-1:9]={-1,0,4,5,6,7,8,NULL,NULL,8,9}",
+            ]),
+        ),
+        (
+            vec![
+                at("a[1:2] = '{1,2}'", 2, "a"),
+                at("a[3:4] = '{1,2}'", 3, "a"),
+                at("a[1:2] = NULL", 1, "a"),
+                at("a[1:2] = '{{7,8}}'", 1, "a"),
+            ],
+            ok(&["{1,2}", "[3:4]={1,2}", "{1,2,3}", "{7,8,3}"]),
+        ),
+        (vec![at("a[1:1] = NULL::int[]", 2, "a")], ok(&["{}"])),
+        (vec![at("a[-2147483648] = 1", 2, "a")], ok(&["[-2147483648:-2147483648]={1}"])),
+        (
+            vec![
+                at("m[1][2] = 9", 1, "m"),
+                at("m[1:2][1] = '{7,8}'", 1, "m"),
+                at("m[2:2] = '{5,6}'", 1, "m"),
+                at("m[1:1][1:2] = '{8,9}'", 4, "m"),
+                at("m[1:2][1:1] = '{7,8}'", 2, "m"),
+            ],
+            ok(&["{{1,9},{3,4}}", "{{7,9},{8,4}}", "{{7,9},{5,6}}", "{{8,9,3}}", "{{7},{8}}"]),
+        ),
+        (
+            vec![
+                at("a[1] = 1.5", 1, "a"),
+                at("t[2] = 7", 1, "t"),
+                at("a[1] = 1, a[2] = a[1] + 100", 1, "a"),
+                at("a[2:3] = ARRAY[1.5, 2.5]", 1, "a"),
+                at("a['2'] = 9", 1, "a"),
+                at("a[2.6] = 8", 1, "a"),
+                at("a[1:1] = '{9}', a[3] = 7", 1, "a"),
+                at("a[200000000] = 1", 3, "a"),
+                at("a[3] = 7", 4, "a"),
+            ],
+            ok(&[
+                "{2,2,3}",
+                "{a,7}",
+                "{1,102,3}",
+                "{1,2,3}",
+                "{1,9,3}",
+                "{1,9,8}",
+                "{9,9,7}",
+                "[200000000:200000000]={1}",
+                "[0:3]={5,6,NULL,7}",
+            ]),
+        ),
+        (
+            vec!["INSERT INTO pt.a (id, a) VALUES (1, '{0}') ON CONFLICT (id) DO UPDATE SET a[4] = 4 RETURNING a".into()],
+            ok(&["{1,2,3,4}"]),
+        ),
+        (vec![at("a[2:3] = '{20}'", 1, "a")], no("2202E", "source array too small")),
+        (vec![at("a[1:2] = '{}'", 1, "a")], no("2202E", "source array too small")),
+        (vec![at("a[3:2] = '{20}'", 1, "a")], no("2202E", "upper bound cannot be less than lower bound")),
+        (
+            vec![at("a[:2] = '{1,2}'", 2, "a")],
+            no(
+                "2202E",
+                "array slice subscript must provide both boundaries\nDETAIL:  When assigning to a \
+                 slice of an empty array value, slice boundaries must be fully specified.",
+            ),
+        ),
+        (vec![at("a[NULL] = 1", 1, "a")], no("22004", "array subscript in assignment must not be null")),
+        (vec![at("a[NULL:2] = '{1,2}'", 1, "a")], no("22004", "array subscript in assignment must not be null")),
+        (vec![at("a[1][1] = 5", 1, "a")], no("2202E", "wrong number of array subscripts")),
+        (vec![at("a[1:2][1:1] = '{7,8}'", 1, "a")], no("2202E", "wrong number of array subscripts")),
+        (vec![at("m[1] = 9", 1, "m")], no("2202E", "wrong number of array subscripts")),
+        (vec![at("m[3][1] = 9", 1, "m")], no("2202E", "array subscript out of range")),
+        (vec![at("m[1:1][4:5] = '{8,9}'", 4, "m")], no("2202E", "array subscript out of range")),
+        (vec![at("a[1] = 'x'", 1, "a")], no("22P02", "invalid input syntax for type integer: \"x\"")),
+        (vec![at("a['x'] = 9", 1, "a")], no("22P02", "invalid input syntax for type integer: \"x\"")),
+        (vec![at("a[true] = 9", 1, "a")], no("42804", "array subscript must have type integer")),
+        (vec![at("a[2147483647] = 1", 1, "a")], no("54000", "array size exceeds the maximum allowed (134217727)")),
+        (vec![at("a[0:2147483647] = '{1}'", 1, "a")], no("54000", "array size exceeds the maximum allowed (134217727)")),
+        (vec![at("a[2147483647] = 1", 3, "a")], no("54000", "array lower bound is too large: 2147483647")),
+        (vec![at("a[1] = DEFAULT", 1, "a")], no("0A000", "cannot set an array element to DEFAULT")),
+        (
+            vec![at("a[1] = now()", 1, "a")],
+            no(
+                "42804",
+                "subscripted assignment to \"a\" requires type integer but expression is of type \
+                 timestamp with time zone\nHINT:  You will need to rewrite or cast the expression.",
+            ),
+        ),
+        (
+            vec![at("a[1:2] = 5", 1, "a")],
+            no(
+                "42804",
+                "subscripted assignment to \"a\" requires type integer[] but expression is of type \
+                 integer\nHINT:  You will need to rewrite or cast the expression.",
+            ),
+        ),
+        (vec![at("a[1] = 1, a = '{2}'", 1, "a")], no("42601", "multiple assignments to same column \"a\"")),
+    ] {
+        let writes: Vec<&str> = writes.iter().map(String::as_str).collect();
+        assert_eq!(written_back(&mut w, &writes), want, "{writes:?}");
+    }
+}
+
+/// An INSERT's subscripted column assigned into NULL, its assignments to one column in their order,
+/// as 18.6 assigns them; a list of columns in parentheses a SET assigns from a row, each its value.
+#[test]
+fn an_insert_s_subscripted_column_and_a_set_s_list_are_assigned_in_turn() {
+    let mut w = arrays_held("insert-assigned");
+    let ok = |r: &[&str]| Ok(r.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let no = |code: &'static str, words: &str| Err((Some(code), words.to_string()));
+    for (write, want) in [
+        ("INSERT INTO pt.a (id, a[2]) VALUES (9, 5) RETURNING id, a", ok(&["9|[2:2]={5}"])),
+        ("INSERT INTO pt.a (id, a[1], a[2]) VALUES (9, 5, 6) RETURNING id, a", ok(&["9|{5,6}"])),
+        ("INSERT INTO pt.a (id, a[1:2]) VALUES (9, '{7,8}') RETURNING id, a", ok(&["9|{7,8}"])),
+        ("INSERT INTO pt.a (id, a[1]) SELECT 9, 10 RETURNING id, a", ok(&["9|{10}"])),
+        ("INSERT INTO pt.a (id, a[1]) VALUES (9, 5), (10, NULL) RETURNING id, a", ok(&["9|{5}", "10|{NULL}"])),
+        ("INSERT INTO pt.a (id, d[1]) VALUES (9, 5) RETURNING id, d", ok(&["9|{5}"])),
+        ("INSERT INTO pt.a (id, a[2:3], t[1]) VALUES (9, ARRAY[1, 2], 'q') RETURNING id, a, t", ok(&["9|[2:3]={1,2}|{q}"])),
+        ("INSERT INTO pt.a (id, a[1], t[1], a[2]) VALUES (9, 1, 'q', 2) RETURNING a, t", ok(&["{1,2}|{q}"])),
+        ("INSERT INTO pt.a (id, m[1][2]) VALUES (9, 5) RETURNING m", ok(&["[1:1][2:2]={{5}}"])),
+        ("INSERT INTO pt.a (id, a[0:1]) VALUES (10, '{1,2,3}') RETURNING a", ok(&["[0:1]={1,2}"])),
+        (
+            "INSERT INTO pt.a (id, a[2]) SELECT id + 10, a[1] FROM pt.a WHERE id < 3 ORDER BY id RETURNING id, a",
+            ok(&["11|[2:2]={1}", "12|[2:2]={NULL}"]),
+        ),
+        (
+            "INSERT INTO pt.a (id, a[1]) SELECT 20, 1 UNION ALL SELECT 21, 2 RETURNING id, a",
+            ok(&["20|{1}", "21|{2}"]),
+        ),
+        ("INSERT INTO pt.a (id, a[1], a) VALUES (9, 5, '{1}')", no("42701", "column \"a\" specified more than once")),
+        ("INSERT INTO pt.a (id, id[1]) VALUES (9, 1)", no("42701", "column \"id\" specified more than once")),
+        ("INSERT INTO pt.a (id, nosuch[1]) VALUES (9, 1)", no("42703", "column \"nosuch\" of relation \"a\" does not exist")),
+        ("INSERT INTO pt.a (id, a[1]) VALUES (9, DEFAULT)", no("0A000", "cannot set an array element to DEFAULT")),
+        ("INSERT INTO pt.a (id, a[1]) VALUES (9, 1, 2)", no("42601", "INSERT has more expressions than target columns")),
+        (
+            "INSERT INTO pt.a (id, a[:1]) VALUES (9, '{1}')",
+            no(
+                "2202E",
+                "array slice subscript must provide both boundaries\nDETAIL:  When assigning to a \
+                 slice of an empty array value, slice boundaries must be fully specified.",
+            ),
+        ),
+        // A list of columns in parentheses.
+        ("UPDATE pt.a SET (a, t) = ('{1}', '{x}') WHERE id = 1 RETURNING id, a, t", ok(&["1|{1}|{x}"])),
+        ("UPDATE pt.a SET (a, t) = ROW('{1}', '{x}') WHERE id = 1 RETURNING id, a, t", ok(&["1|{1}|{x}"])),
+        ("UPDATE pt.a SET (a, t) = (DEFAULT, '{x}') WHERE id = 1 RETURNING id, a, t", ok(&["1|NULL|{x}"])),
+        ("UPDATE pt.a SET (a) = ROW('{1}') WHERE id = 1 RETURNING id, a", ok(&["1|{1}"])),
+        ("UPDATE pt.a SET (a[1], a[3]) = (10, 30) WHERE id = 1 RETURNING id, a", ok(&["1|{10,2,30}"])),
+        ("UPDATE pt.a SET (d, a[1]) = (DEFAULT, 5) WHERE id = 1 RETURNING id, a, d", ok(&["1|{5,2,3}|{1,2,3}"])),
+        (
+            "UPDATE pt.a x SET (a[2], t[1]) = (x.id * 10, x.t[2]) WHERE id = 1 RETURNING id, a, t",
+            ok(&["1|{1,10,3}|{b,b}"]),
+        ),
+        ("UPDATE pt.a SET (a[1:2]) = ROW('{7,8}') WHERE id = 1 RETURNING id, a", ok(&["1|{7,8,3}"])),
+        (
+            "UPDATE pt.a SET (a, t) = ('{1}') WHERE id = 1",
+            no("0A000", "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression"),
+        ),
+        (
+            "UPDATE pt.a SET (a) = ('{1}') WHERE id = 1",
+            no("0A000", "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression"),
+        ),
+        (
+            "UPDATE pt.a SET (a, t) = ('{1}', '{x}', 3) WHERE id = 1",
+            no("42601", "number of columns does not match number of values"),
+        ),
+        ("UPDATE pt.a SET (a, a[1]) = ('{1}', 2) WHERE id = 1", no("42601", "multiple assignments to same column \"a\"")),
+    ] {
+        assert_eq!(written_back(&mut w, &[write]), want, "{write}");
+    }
+    // A list a sub-SELECT assigns, which 18.6 reads once a row for all its columns: the snail's own.
+    assert_eq!(
+        written_back(&mut w, &["UPDATE pt.a SET (a, t) = (SELECT a, t FROM pt.a WHERE id = 4) WHERE id = 1"]),
+        Err((
+            None,
+            "a list of columns assigned from one sub-SELECT, read once a row for all of them, is not \
+             written"
+                .to_string()
+        ))
+    );
+}

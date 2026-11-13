@@ -5685,31 +5685,55 @@ fn eval_whole(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
                 return Err(Error::new("a subscripted assignment is not read"));
             };
             // Each subscript read first, a NULL refused, as PostgreSQL checks them before the
-            // assignment.
-            let mut at = Vec::new();
-            let mut sliced = false;
+            // assignment: a slice's bounds, one left out none, or an index.
+            let mut each: Vec<Subscript> = Vec::with_capacity(subs.len());
             for s in subs {
-                let bounds = match s {
+                let (bounds, slice) = match s {
                     Expr::Function(g) if function_name(g) == super::image::SLICED => {
-                        sliced = true;
-                        parts_of(s)
+                        (parts_of(s), true)
                     }
-                    s => vec![*s],
+                    s => (vec![*s], false),
                 };
+                let mut read = Vec::with_capacity(bounds.len());
                 for b in bounds {
+                    if matches!(b, Expr::Function(g) if function_name(g) == super::image::OMITTED) {
+                        read.push(None);
+                        continue;
+                    }
                     match ev(b)? {
-                        Value::Null if !sliced => {
+                        Value::Null => {
                             return Err(Error::coded(
                                 "22004",
                                 "array subscript in assignment must not be null",
                             ))
                         }
-                        Value::Null => at.push(None),
-                        v => at.push(Some(int_of(&v)?)),
+                        v => read.push(Some(int_of(&v, quoted(b))? as i32)),
                     }
                 }
+                each.push(match (slice, read.as_slice()) {
+                    (true, [l, u]) => Subscript::Slice(*l, *u),
+                    (false, [Some(i)]) => Subscript::Index(*i),
+                    _ => return Err(Error::new("a subscripted assignment is not read")),
+                });
             }
-            raw_assigned(ev(column)?, ev(value)?, &at, sliced, quoted(value))?
+            let array = frame.type_of(column).filter(|t| {
+                matches!(t, ColumnType::Composed(r)
+                    if matches!(r.def(), crate::composed::Composed::Array { .. }))
+            });
+            match array {
+                Some(ty) => array_assigned(ty, ev(column)?, ev(value)?, &each, quoted(value))?,
+                None => {
+                    let sliced = each.iter().any(|s| matches!(s, Subscript::Slice(..)));
+                    let at: Vec<Option<i64>> = each
+                        .iter()
+                        .flat_map(|s| match *s {
+                            Subscript::Slice(l, u) => vec![l.map(i64::from), u.map(i64::from)],
+                            Subscript::Index(i) => vec![Some(i64::from(i))],
+                        })
+                        .collect();
+                    raw_assigned(ev(column)?, ev(value)?, &at, sliced, quoted(value))?
+                }
+            }
         }
         Expr::Function(f) => {
             let name = function_name(f);
@@ -6451,16 +6475,70 @@ fn type_named(t: &sqlparser::ast::DataType) -> String {
     }
 }
 
-/// A subscript read as an integer.
-fn int_of(v: &Value) -> Result<i64> {
+/// A subscript read as an integer, `quoted` by integer's input.
+fn int_of(v: &Value, quoted: bool) -> Result<i64> {
     match v {
         Value::Int(i) if i32::try_from(*i).is_ok() => Ok(*i),
         Value::Int(_) => Err(Error::new("integer out of range")),
-        v => match part_value(ColumnType::Int4, &part_of(ColumnType::Int4, v.clone(), false)?) {
+        v => match part_value(ColumnType::Int4, &part_of(ColumnType::Int4, v.clone(), quoted)?) {
             Value::Int(i) => Ok(i),
             _ => Err(Error::coded("42804", "array subscript must have type integer")),
         },
     }
+}
+
+/// One subscript of an assignment: an index, or a slice's bounds, one left out none.
+#[derive(Clone, Copy)]
+enum Subscript {
+    Index(i32),
+    Slice(Option<i32>, Option<i32>),
+}
+
+/// A value of an array type with an element or a slice assigned, as PostgreSQL's array subscripting
+/// assigns it (`arrays::element_set`, `arrays::slice_set`): an element taken by the element type's
+/// assignment, a slice's source by the array type's, `quoted` read by its input; an index beside a
+/// slice read as the slice from 1 to it.
+fn array_assigned(
+    ty: ColumnType,
+    container: Value,
+    value: Value,
+    each: &[Subscript],
+    quoted: bool,
+) -> Result<Value> {
+    let array = match container {
+        Value::Null => crate::composed::Item::Null,
+        Value::Composed(_, c) => c.item.clone(),
+        other => {
+            return Err(Error::coded(
+                "42804",
+                format!(
+                    "cannot subscript type {} because it does not support subscripting",
+                    kind_name(&other)
+                ),
+            ))
+        }
+    };
+    let item = if each.iter().any(|s| matches!(s, Subscript::Slice(..))) {
+        let at: Vec<(Option<i32>, Option<i32>)> = each
+            .iter()
+            .map(|s| match *s {
+                Subscript::Slice(l, u) => (l, u),
+                Subscript::Index(i) => (Some(1), Some(i)),
+            })
+            .collect();
+        crate::arrays::slice_set(&array, &at, &part_of(ty, value, quoted)?)?
+    } else {
+        let at: Vec<i32> = each
+            .iter()
+            .map(|s| match *s {
+                Subscript::Index(i) => i,
+                Subscript::Slice(..) => unreachable!("no slice among them"),
+            })
+            .collect();
+        let element = super::typed::element_of(ty).expect("an array's element type");
+        crate::arrays::element_set(&array, &at, part_of(element, value, quoted)?)?
+    };
+    Ok(composed(ty, item))
 }
 
 /// A value of a fixed-length type with one element assigned, as PostgreSQL's raw subscripting

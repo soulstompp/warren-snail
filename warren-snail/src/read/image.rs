@@ -49,8 +49,15 @@ pub(crate) fn tokens(sql: &str) -> std::result::Result<Vec<TokenWithSpan>, Token
     if sql.len() > 5 && sql.to_ascii_lowercase().contains("table") {
         tokens = table_queries(tokens);
     }
-    if sql.contains('[') && sql.to_ascii_lowercase().contains("set") {
+    let lower = sql.to_ascii_lowercase();
+    if lower.contains("set") && sql.contains('(') {
+        tokens = tuples_assigned(tokens)?;
+    }
+    if sql.contains('[') && lower.contains("set") {
         tokens = subscripts_assigned(tokens)?;
+    }
+    if sql.contains('[') && lower.contains("insert") {
+        tokens = columns_subscripted(tokens);
     }
     if sql.contains('*') && sql.contains(')') && sql.contains('.') {
         tokens = rows_expanded(tokens);
@@ -214,9 +221,316 @@ fn table_queries(mut t: Vec<TokenWithSpan>) -> Vec<TokenWithSpan> {
 }
 
 /// The name of the call an UPDATE's subscripted assignment is read as: the column, the value, then
-/// each subscript, or a slice's bounds inside a call of `SLICED`.
+/// each subscript, or a slice's bounds inside a call of `SLICED`, a bound left out a call of
+/// `OMITTED`.
 pub(super) const ASSIGNED: &str = "\u{3}assigned";
 pub(super) const SLICED: &str = "\u{3}sliced";
+pub(super) const OMITTED: &str = "\u{3}omitted";
+/// The value of a subscripted assignment written DEFAULT, which PostgreSQL refuses.
+pub(super) const DEFAULTED: &str = "\u{3}default";
+/// What begins and parts an INSERT's subscripted target column, read as one name: the column, then
+/// its subscripts as arguments of `ASSIGNED`.
+pub(super) const SUBSCRIPTED: char = '\u{3}';
+
+/// The refusal of DEFAULT assigned to a subscripted column.
+pub(super) fn default_refused() -> Error {
+    Error::coded("0A000", "cannot set an array element to DEFAULT")
+}
+
+/// An INSERT's target column, read from the name `columns_subscripted` writes: the column's name,
+/// and its subscripts as arguments of `ASSIGNED`, joined; none for a column not subscripted.
+pub(super) fn subscripted_target(n: &sqlparser::ast::ObjectName) -> Option<(sqlparser::ast::Ident, String)> {
+    let [part] = n.0.as_slice() else {
+        return None;
+    };
+    let mut parts = part.as_ident()?.value.strip_prefix(SUBSCRIPTED)?.splitn(2, SUBSCRIPTED);
+    let (column, subs) = (parts.next()?, parts.next()?);
+    let column = match column.strip_prefix('"') {
+        Some(q) => sqlparser::ast::Ident::with_quote('"', q.trim_end_matches('"').replace("\"\"", "\"")),
+        None => sqlparser::ast::Ident::new(column),
+    };
+    Some((column, subs.to_string()))
+}
+
+/// Each subscripted column an INSERT names, `p[0]`, read as one name holding the column and its
+/// subscripts (`subscripted_target`): sqlparser reads no subscript there.
+fn columns_subscripted(mut t: Vec<TokenWithSpan>) -> Vec<TokenWithSpan> {
+    let solid: Vec<usize> = (0..t.len())
+        .filter(|&i| !matches!(t[i].token, Token::Whitespace(_)))
+        .collect();
+    let word = |i: usize, k: Keyword| matches!(&t[i].token, Token::Word(w) if w.quote_style.is_none() && w.keyword == k);
+    let Some(into) = (1..solid.len())
+        .find(|&j| word(solid[j], Keyword::INTO) && word(solid[j - 1], Keyword::INSERT))
+    else {
+        return t;
+    };
+    // The column list: after the table's name and its alias, before the rows.
+    let mut j = into + 1;
+    while solid.get(j).is_some_and(|&i| match &t[i].token {
+        Token::Word(w) => {
+            w.quote_style.is_some()
+                || !matches!(
+                    w.keyword,
+                    Keyword::VALUES
+                        | Keyword::SELECT
+                        | Keyword::WITH
+                        | Keyword::DEFAULT
+                        | Keyword::TABLE
+                )
+        }
+        Token::Period => true,
+        _ => false,
+    }) {
+        j += 1;
+    }
+    if !solid.get(j).is_some_and(|&i| t[i].token == Token::LParen) {
+        return t;
+    }
+    let mut swaps: Vec<(usize, usize, String)> = Vec::new();
+    let mut k = j + 1;
+    while let Some(&c) = solid.get(k) {
+        let Token::Word(_) = &t[c].token else { break };
+        let mut n = k + 1;
+        let mut subs = Vec::new();
+        while solid.get(n).is_some_and(|&s| t[s].token == Token::LBracket) {
+            let mut depth = 0i32;
+            let Some(m) = (n..solid.len()).find(|&m| {
+                match t[solid[m]].token {
+                    Token::LBracket => depth += 1,
+                    Token::RBracket => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            }) else {
+                return t;
+            };
+            let inner: String = t[solid[n] + 1..solid[m]].iter().map(|x| x.token.to_string()).collect();
+            subs.push(subscript_arg(&inner));
+            n = m + 1;
+        }
+        if !subs.is_empty() {
+            let name = format!(
+                "{SUBSCRIPTED}{}{SUBSCRIPTED}{}",
+                t[c].token,
+                subs.join(", ")
+            );
+            swaps.push((c, solid.get(n).copied().unwrap_or(t.len()), name));
+        }
+        match solid.get(n) {
+            Some(&s) if t[s].token == Token::Comma => k = n + 1,
+            _ => break,
+        }
+    }
+    for (from, to, name) in swaps.into_iter().rev() {
+        let span = t[from].span;
+        let named = Token::Word(Word {
+            value: name,
+            quote_style: Some('"'),
+            keyword: Keyword::NoKeyword,
+        });
+        t.splice(from..to, [TokenWithSpan::new(named, span)]);
+    }
+    t
+}
+
+/// Each SET of an UPDATE, or of ON CONFLICT DO UPDATE, assigning a list of columns in parentheses
+/// from a row of as many values, `(a, b) = (1, 2)` or `= ROW(1, 2)`, read as PostgreSQL's parser
+/// reads it, each column assigned its value in turn: `a = 1, b = 2`. Any other source, a sub-SELECT
+/// among them, is left as it is, each column's subscripts left out, to be refused as PostgreSQL
+/// refuses it.
+fn tuples_assigned(t: Vec<TokenWithSpan>) -> std::result::Result<Vec<TokenWithSpan>, TokenizerError> {
+    let solid: Vec<usize> = (0..t.len())
+        .filter(|&i| !matches!(t[i].token, Token::Whitespace(_)))
+        .collect();
+    let word = |i: usize, k: Keyword| matches!(&t[i].token, Token::Word(w) if w.quote_style.is_none() && w.keyword == k);
+    let text = |from: usize, to: usize| -> String {
+        t[from..to].iter().map(|x| x.token.to_string()).collect()
+    };
+    // The place among `solid` of the parenthesis closing the one at `open`, and each item between
+    // them at its depth, by its first and last places.
+    let closing = |open: usize| -> Option<(usize, Vec<(usize, usize)>)> {
+        let mut depth = 0i32;
+        let mut items = Vec::new();
+        let mut from = open + 1;
+        for m in open..solid.len() {
+            match t[solid[m]].token {
+                Token::LParen | Token::LBracket => depth += 1,
+                Token::RParen | Token::RBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if from < m {
+                            items.push((from, m));
+                        }
+                        return Some((m, items));
+                    }
+                }
+                Token::Comma if depth == 1 => {
+                    items.push((from, m));
+                    from = m + 1;
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    let mut swaps: Vec<(usize, usize, String)> = Vec::new();
+    for j in 0..solid.len() {
+        if update_of(&t, &solid, j).is_none() {
+            continue;
+        }
+        let mut k = j + 1;
+        while let Some(&c) = solid.get(k) {
+            // An assignment of one column: to a comma at its depth, or a word ending the list.
+            if t[c].token != Token::LParen {
+                let mut depth = 0i32;
+                while let Some(&s) = solid.get(k) {
+                    match &t[s].token {
+                        Token::LParen | Token::LBracket => depth += 1,
+                        Token::RParen | Token::RBracket => depth -= 1,
+                        Token::Comma | Token::SemiColon if depth == 0 => break,
+                        Token::Word(w)
+                            if depth == 0
+                                && w.quote_style.is_none()
+                                && matches!(w.keyword, Keyword::WHERE | Keyword::FROM | Keyword::RETURNING) =>
+                        {
+                            break
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+            } else {
+                let Some((m, targets)) = closing(k) else { break };
+                if !solid.get(m + 1).is_some_and(|&e| t[e].token == Token::Eq) {
+                    break;
+                }
+                let at = m + 2;
+                let row = if solid.get(at).is_some_and(|&r| word(r, Keyword::ROW))
+                    && solid.get(at + 1).is_some_and(|&p| t[p].token == Token::LParen)
+                {
+                    closing(at + 1).map(|(end, values)| (end, values, true))
+                } else if solid.get(at).is_some_and(|&p| t[p].token == Token::LParen) {
+                    closing(at).map(|(end, values)| (end, values, false))
+                } else {
+                    None
+                };
+                let query = |v: &[(usize, usize)]| {
+                    v.first().is_some_and(|&(f, _)| {
+                        matches!(&t[solid[f]].token, Token::Word(w) if w.quote_style.is_none()
+                            && matches!(w.keyword, Keyword::SELECT | Keyword::WITH | Keyword::VALUES | Keyword::TABLE))
+                            || t[solid[f]].token == Token::LParen
+                    })
+                };
+                let end = match &row {
+                    Some((end, values, explicit))
+                        if values.len() == targets.len()
+                            && (*explicit || values.len() > 1)
+                            && !query(values) =>
+                    {
+                        let made: Vec<String> = targets
+                            .iter()
+                            .zip(values)
+                            .map(|(&(tf, tl), &(vf, vl))| {
+                                format!(
+                                    "{} = {}",
+                                    text(solid[tf], solid[tl - 1] + 1).trim(),
+                                    text(solid[vf], solid[vl - 1] + 1).trim()
+                                )
+                            })
+                            .collect();
+                        swaps.push((c, solid[*end] + 1, made.join(", ")));
+                        *end
+                    }
+                    other => {
+                        // Left as it is, each column without its subscripts.
+                        for &(tf, tl) in &targets {
+                            if tl > tf + 1 && t[solid[tf + 1]].token == Token::LBracket {
+                                swaps.push((solid[tf] + 1, solid[tl - 1] + 1, String::new()));
+                            }
+                        }
+                        match other {
+                            Some((end, _, _)) => *end,
+                            None => break,
+                        }
+                    }
+                };
+                k = end + 1;
+            }
+            match solid.get(k) {
+                Some(&s) if t[s].token == Token::Comma => k += 1,
+                _ => break,
+            }
+        }
+    }
+    if swaps.is_empty() {
+        return Ok(t);
+    }
+    swaps.sort_by_key(|s| std::cmp::Reverse(s.0));
+    let mut t = t;
+    for (from, to, with) in swaps {
+        let span = t[from].span;
+        let made: Vec<TokenWithSpan> = Tokenizer::new(&PostgreSqlDialect {}, &with)
+            .tokenize()?
+            .into_iter()
+            .map(|token| TokenWithSpan::new(token, span))
+            .collect();
+        t.splice(from..to, made);
+    }
+    Ok(t)
+}
+
+/// The place among `solid` of the UPDATE whose SET stands at `j`, an UPDATE's own or ON CONFLICT DO
+/// UPDATE's; none where `j` is no such SET.
+fn update_of(t: &[TokenWithSpan], solid: &[usize], j: usize) -> Option<usize> {
+    let word = |i: usize, k: Keyword| matches!(&t[i].token, Token::Word(w) if w.quote_style.is_none() && w.keyword == k);
+    if !word(solid[j], Keyword::SET) {
+        return None;
+    }
+    let mut k = j;
+    while k > 0 && k + 8 >= j {
+        k -= 1;
+        let p = solid[k];
+        if word(p, Keyword::UPDATE) {
+            return Some(k);
+        }
+        if !matches!(&t[p].token, Token::Word(_) | Token::Period | Token::Mul) {
+            return None;
+        }
+    }
+    None
+}
+
+/// A subscript's text between its brackets as an argument of `ASSIGNED`: an index in parentheses,
+/// a slice a call of `SLICED` on its bounds, each a call of OMITTED where it is left out.
+fn subscript_arg(inner: &str) -> String {
+    let mut d = 0i32;
+    let mut colon = None;
+    for (ci, ch) in inner.char_indices() {
+        match ch {
+            '(' | '[' => d += 1,
+            ')' | ']' => d -= 1,
+            ':' if d == 0 && !inner[ci..].starts_with("::") && !inner[..ci].ends_with(':') => {
+                colon = Some(ci);
+                break;
+            }
+            _ => {}
+        }
+    }
+    match colon {
+        Some(ci) => {
+            let bound = |s: &str| match s.trim() {
+                "" => format!("\"{OMITTED}\"()"),
+                b => format!("({b})"),
+            };
+            format!(
+                "\"{SLICED}\"({}, {})",
+                bound(&inner[..ci]),
+                bound(&inner[ci + 1..])
+            )
+        }
+        None => format!("({inner})"),
+    }
+}
 
 /// Each subscripted column an UPDATE's SET, or ON CONFLICT DO UPDATE's, assigns, read as PostgreSQL
 /// reads it, the column given the value the assignment makes of it: `SET p[0] = 1` as `SET p =
@@ -263,28 +577,8 @@ fn subscripts_assigned(t: Vec<TokenWithSpan>) -> std::result::Result<Vec<TokenWi
     // Each SET of an UPDATE, after the table it names, or of ON CONFLICT DO UPDATE, and the name
     // the table written goes by.
     let mut sets = Vec::new();
-    for (j, &i) in solid.iter().enumerate() {
-        if !word(i, Keyword::SET) {
-            continue;
-        }
-        let mut k = j;
-        let mut found = None;
-        while k > 0 {
-            k -= 1;
-            let p = solid[k];
-            if word(p, Keyword::UPDATE) {
-                found = Some(k);
-                break;
-            }
-            match &t[p].token {
-                Token::Word(_) | Token::Period | Token::Mul => {}
-                _ => break,
-            }
-            if k + 8 < j {
-                break;
-            }
-        }
-        let Some(u) = found else { continue };
+    for j in 0..solid.len() {
+        let Some(u) = update_of(&t, &solid, j) else { continue };
         let named = match u.checked_sub(1).filter(|&d| word(solid[d], Keyword::DO)) {
             // The INSERT's own table.
             Some(d) => (1..d)
@@ -332,38 +626,7 @@ fn subscripts_assigned(t: Vec<TokenWithSpan>) -> std::result::Result<Vec<TokenWi
                     }
                 }
                 let Some(m) = close else { break };
-                let inner = text(open + 1, solid[m]);
-                // A slice's bounds, each NULL where it is left out.
-                let mut d = 0i32;
-                let mut colon = None;
-                for (ci, ch) in inner.char_indices() {
-                    match ch {
-                        '(' | '[' => d += 1,
-                        ')' | ']' => d -= 1,
-                        ':' if d == 0
-                            && !inner[ci..].starts_with("::")
-                            && !inner[..ci].ends_with(':') =>
-                        {
-                            colon = Some(ci);
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                subs.push(match colon {
-                    Some(ci) => {
-                        let bound = |s: &str| match s.trim() {
-                            "" => "NULL".to_string(),
-                            b => format!("({b})"),
-                        };
-                        format!(
-                            "\"{SLICED}\"({}, {})",
-                            bound(&inner[..ci]),
-                            bound(&inner[ci + 1..])
-                        )
-                    }
-                    None => format!("({inner})"),
-                });
+                subs.push(subscript_arg(&text(open + 1, solid[m])));
                 n = m + 1;
             }
             let Some(&eq) = solid.get(n) else { break };
@@ -395,12 +658,16 @@ fn subscripts_assigned(t: Vec<TokenWithSpan>) -> std::result::Result<Vec<TokenWi
                 end += 1;
             }
             let last = solid.get(end).copied().unwrap_or(t.len());
+            let value = text(solid[n] + 1, last).trim().to_string();
             list.push(One {
                 from: c,
                 to: last,
                 column,
+                value: match value.eq_ignore_ascii_case("default") && !subs.is_empty() {
+                    true => format!("\"{DEFAULTED}\"()"),
+                    false => value,
+                },
                 subs,
-                value: text(solid[n] + 1, last).trim().to_string(),
             });
             match solid.get(end) {
                 Some(&s) if t[s].token == Token::Comma => k = end + 1,
