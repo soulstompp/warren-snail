@@ -219,10 +219,28 @@ const NOT_JOINED: [(&str, &[&str]); 2] = [
     ),
 ];
 
-/// The first 300 rows asking that no row meets: those of the keys a multiple of 13 and those
-/// whose key is NULL, in the order they came.
+/// The rows asking that no row meets, 345: those of the keys a multiple of 13 and those whose key
+/// is NULL, in the order they came, as PostgreSQL 18.6's `string_agg(f.id::text, ',' ORDER BY
+/// f.id)` gives them.
 const UNMET: &str = "13,26,39,52,65,78,91,97,104,117,130,143,156,169,182,194,195,208,221,234,\
-                     247,260,273,286,291,299";
+    247,260,273,286,291,299,312,325,338,351,364,377,388,390,403,416,429,442,455,468,481,485,494,\
+    507,520,533,546,559,572,582,585,598,611,624,637,650,663,676,679,689,702,715,728,741,754,767,\
+    776,780,793,806,819,832,845,858,871,873,884,897,910,923,936,949,962,970,975,988,1001,1014,\
+    1027,1040,1053,1066,1067,1079,1092,1105,1118,1131,1144,1157,1164,1170,1183,1196,1209,1222,\
+    1235,1248,1261,1274,1287,1300,1313,1326,1339,1352,1358,1365,1378,1391,1404,1417,1430,1443,\
+    1455,1456,1469,1482,1495,1500,1513,1526,1539,1552,1565,1578,1591,1604,1617,1630,1643,1649,\
+    1656,1669,1682,1695,1708,1721,1734,1746,1747,1760,1773,1786,1799,1812,1825,1838,1843,1851,\
+    1864,1877,1890,1903,1916,1929,1940,1942,1955,1968,1981,1994,2007,2020,2033,2037,2046,2059,\
+    2072,2085,2098,2111,2124,2134,2137,2150,2163,2176,2189,2202,2215,2228,2231,2241,2254,2267,\
+    2280,2293,2306,2319,2328,2332,2345,2358,2371,2384,2397,2410,2423,2425,2436,2449,2462,2475,\
+    2488,2501,2514,2522,2527,2540,2553,2566,2579,2592,2605,2618,2619,2631,2644,2657,2670,2683,\
+    2696,2709,2716,2722,2735,2748,2761,2774,2787,2800,2813,2826,2839,2852,2865,2878,2891,2904,\
+    2910,2917,2930,2943,2956,2969,2982,2995,3000,3007,3013,3026,3039,3052,3065,3078,3091,3104,\
+    3117,3130,3143,3156,3169,3182,3195,3201,3208,3221,3234,3247,3260,3273,3286,3298,3299,3312,\
+    3325,3338,3351,3364,3377,3390,3395,3403,3416,3429,3442,3455,3468,3481,3492,3494,3507,3520,\
+    3533,3546,3559,3572,3585,3589,3598,3611,3624,3637,3650,3663,3676,3686,3689,3702,3715,3728,\
+    3741,3754,3767,3780,3783,3793,3806,3819,3832,3845,3858,3871,3880,3884,3897,3910,3923,3936,\
+    3949,3962,3975,3977,3988";
 
 #[test]
 fn an_exists_tied_by_equalities_answers_as_postgresql_does() {
@@ -257,14 +275,13 @@ fn past_the_room_an_exists_s_keys_are_cut_on_their_hash_and_each_read_back_once(
 #[test]
 fn rows_an_exists_keeps_come_in_the_order_they_came() {
     let path = snail("order");
-    let q = "SELECT f.id FROM j.f f WHERE f.id <= 300 \
-             AND NOT EXISTS (SELECT 1 FROM j.e e WHERE e.k = f.k)";
+    // Every row asking, several chunks of them, read past the room of 4 KiB too.
+    let q = "SELECT f.id FROM j.f f WHERE NOT EXISTS (SELECT 1 FROM j.e e WHERE e.k = f.k)";
     let expected: Vec<&str> = UNMET.split(',').collect();
     for room in [None, Some(4 << 10)] {
         same(&path, room, q, &expected);
     }
-    // As PostgreSQL 18.6 aggregates them in that order.
     let q = "SELECT string_agg(f.id::text, ',' ORDER BY f.id) FROM j.f f \
-             WHERE f.id <= 300 AND NOT EXISTS (SELECT 1 FROM j.e e WHERE e.k = f.k)";
+             WHERE NOT EXISTS (SELECT 1 FROM j.e e WHERE e.k = f.k)";
     same(&path, Some(4 << 10), q, &[UNMET]);
 }
