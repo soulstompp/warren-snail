@@ -5676,6 +5676,9 @@ fn eval_whole(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
                 .unwrap_or_else(|| super::image::anonymous(&fields));
             composed(ty, crate::composed::Item::Record(items))
         }
+        Expr::Function(f) if function_name(f) == super::image::EXPANDED => {
+            return Err(super::image::expansion_refused())
+        }
         Expr::Function(f) if function_name(f) == super::image::ASSIGNED => {
             let parts = parts_of(e);
             let [column, value, subs @ ..] = parts.as_slice() else {
@@ -11313,8 +11316,11 @@ fn compares_no_constant(e: &Expr) -> bool {
 /// Whether a question over the snail's tables reads one's whole row, which only the pipeline reads:
 /// a bare name none of their columns bears that names one of them, by its alias or its name, or a
 /// star where an expression or a call's argument stands: of one of them, its whole row; of none,
-/// refused there in PostgreSQL's words.
+/// refused there in PostgreSQL's words. A row's expansion, `(x).*`, is read there too.
 pub fn reads_whole_rows(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
+    if super::image::expands_rows(q) {
+        return true;
+    }
     let SetExpr::Select(s) = q.body.as_ref() else {
         return false;
     };

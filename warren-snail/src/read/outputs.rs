@@ -385,11 +385,16 @@ fn arms_typed_alike(sub: &Query, catalog: &Catalog) -> bool {
     })
 }
 
-/// The name each item of a SELECT gives its column; none for a star.
+/// The name each item of a SELECT gives its column; none for a star or a row's expansion.
 fn own_names(s: &Select) -> Vec<Option<String>> {
     s.projection
         .iter()
         .map(|i| match i {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. }
+                if super::image::expanded(e).is_some() =>
+            {
+                None
+            }
             SelectItem::UnnamedExpr(e) => Some(pipeline::default_name(e)),
             SelectItem::ExprWithAlias { alias, .. } => Some(ident(alias)),
             _ => None,

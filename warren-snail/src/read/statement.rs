@@ -1348,6 +1348,150 @@ fn read_whole(q: &Query) -> bool {
         || !q.locks.is_empty()
 }
 
+/// An INSERT's question with each row's expansion, `(x).*`, its SELECTs' lists and its VALUES lists
+/// hold written out as PostgreSQL's parser writes it: x's fields, `(x).f` named f, x typed over the
+/// file's tables a SELECT's FROM names; of a table's name no column bears, its star. A SELECT whose
+/// FROM names anything else keeps its expansion; none where nothing is written out.
+fn rows_named(catalog: &Catalog, q: &Query) -> Result<Option<Query>> {
+    use sqlparser::ast::{FunctionArgExpr, SelectItemQualifiedWildcardKind as Kind};
+    fn body(catalog: &Catalog, b: &mut SetExpr, changed: &mut bool) -> Result<()> {
+        let s = match b {
+            SetExpr::SetOperation { left, right, .. } => {
+                body(catalog, left, changed)?;
+                return body(catalog, right, changed);
+            }
+            SetExpr::Query(q) => return body(catalog, &mut q.body, changed),
+            SetExpr::Values(v) => {
+                if let Some(rows) = super::image::values_written(&v.rows, catalog.release)? {
+                    for (r, written) in v.rows.iter_mut().zip(rows) {
+                        r.content = written;
+                    }
+                    *changed = true;
+                }
+                return Ok(());
+            }
+            SetExpr::Select(s) => s,
+            _ => return Ok(()),
+        };
+        let expansion = |i: &SelectItem| match i {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                super::image::expanded(e).cloned()
+            }
+            _ => None,
+        };
+        if !s.projection.iter().any(|i| expansion(i).is_some()) {
+            return Ok(());
+        }
+        // Each table of its FROM, by the name it goes by, and its columns, typed.
+        let mut tables: Vec<String> = Vec::new();
+        let mut columns: Vec<(Option<String>, String, Option<ColumnType>)> = Vec::new();
+        for t in &s.from {
+            for f in std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)) {
+                let TableFactor::Table {
+                    name, alias, args: None, ..
+                } = f
+                else {
+                    return Ok(());
+                };
+                let Ok(ti) = table_index(catalog, name) else {
+                    return Ok(());
+                };
+                if alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
+                    return Ok(());
+                }
+                let by = match alias {
+                    Some(a) => ident(&a.name),
+                    None => {
+                        let n = object_name(name);
+                        n.rsplit('.').next().unwrap_or(&n).to_string()
+                    }
+                };
+                columns.extend(
+                    catalog.tables[ti]
+                        .own_columns()
+                        .iter()
+                        .map(|c| (Some(by.clone()), c.name.clone(), Some(c.ty))),
+                );
+                tables.push(by);
+            }
+        }
+        let naming = |q: Option<&str>, n: &str| {
+            super::pipeline::naming(
+                columns.iter().map(|(cq, cn, _)| (cq.as_deref(), cn.as_str())),
+                q,
+                n,
+            )
+            .len()
+        };
+        let mut out = Vec::with_capacity(s.projection.len());
+        for item in std::mem::take(&mut s.projection) {
+            let x = match expansion(&item) {
+                None => {
+                    out.push(item);
+                    continue;
+                }
+                Some(FunctionArgExpr::QualifiedWildcard(n)) => {
+                    out.push(SelectItem::QualifiedWildcard(Kind::ObjectName(n), Default::default()));
+                    continue;
+                }
+                Some(FunctionArgExpr::Expr(x)) => x,
+                Some(other) => return Err(Error::new(format!("({other}).* is not read"))),
+            };
+            let mut x = &x;
+            while let Expr::Nested(inner) = x {
+                x = inner;
+            }
+            if let Expr::Identifier(i) = x {
+                let n = ident(i);
+                if naming(None, &n) == 0 && tables.contains(&n) {
+                    let star = ObjectName::from(vec![i.clone()]);
+                    out.push(SelectItem::QualifiedWildcard(Kind::ObjectName(star), Default::default()));
+                    continue;
+                }
+            }
+            let types = super::pipeline::typed_on(x, &columns, catalog.release)?;
+            if let Some(fields) =
+                super::image::fields_written(x, types.get(&(x as *const Expr)).copied())?
+            {
+                out.extend(fields.into_iter().map(|(expr, name)| SelectItem::ExprWithAlias {
+                    expr,
+                    alias: Ident::with_quote('"', name),
+                }));
+                continue;
+            }
+            if let Some((q, n)) = super::pipeline::column_of(x) {
+                match (naming(q.as_deref(), &n), q) {
+                    (1, _) => {}
+                    (0, Some(q)) if !tables.contains(&q) => {
+                        return Err(Error::new(format!(
+                            "missing FROM-clause entry for table \"{q}\""
+                        )))
+                    }
+                    (0, Some(q)) => {
+                        return Err(Error::new(format!("column {q}.{n} does not exist")))
+                    }
+                    (0, None) => {
+                        return Err(Error::new(format!("column \"{n}\" does not exist")))
+                    }
+                    _ => {
+                        return Err(Error::new(format!(
+                            "column reference \"{n}\" is ambiguous"
+                        )))
+                    }
+                }
+            }
+            return Err(super::image::fields_unknown(x));
+        }
+        s.projection = out;
+        *changed = true;
+        Ok(())
+    }
+    let mut q = q.clone();
+    let mut changed = false;
+    body(catalog, &mut q.body, &mut changed)?;
+    Ok(changed.then_some(q))
+}
+
 /// An INSERT's question with each star of its SELECTs written as the columns it stands for, as
 /// PostgreSQL's parser writes it out: `*` every column of each table its FROM names, in turn,
 /// `t.*` those of the one table; none where a star stands over anything but the file's tables.
@@ -1451,16 +1595,27 @@ fn bare(q: &Query) -> Option<Query> {
     Some(bare(&b).unwrap_or(b))
 }
 
+/// An INSERT's SELECT whose list still holds a star or a row's expansion, its FROM naming more than
+/// the file's tables, refused: how many columns it gives is not known before its rows are read.
+fn each_named(s: &sqlparser::ast::Select) -> Result<()> {
+    let named = |p: &SelectItem| match p {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+            super::image::expanded(e).is_none()
+        }
+        _ => false,
+    };
+    match s.projection.iter().all(named) {
+        true => Ok(()),
+        false => Err(Error::new("name each column the INSERT's question returns")),
+    }
+}
+
 /// How many columns a question's rows hold: its first arm's, an arm of a set operation holding
 /// another number refused as PostgreSQL's parser refuses it.
 fn width_of(body: &SetExpr) -> Result<usize> {
     match body {
         SetExpr::Select(s) => {
-            if s.projection.iter().any(|p| {
-                !matches!(p, SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. })
-            }) {
-                return Err(Error::new("name each column the INSERT's question returns"));
-            }
+            each_named(s)?;
             Ok(s.projection.len())
         }
         SetExpr::Values(v) => Ok(v.rows.first().map_or(0, |r| r.content.len())),
@@ -1659,6 +1814,14 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
         }
         None => q,
     };
+    let named;
+    let q = match rows_named(catalog, q)? {
+        Some(n) => {
+            named = n;
+            &named
+        }
+        None => q,
+    };
     let starred;
     let q = match stars_named(catalog, q) {
         Some(s) => {
@@ -1752,14 +1915,15 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
             }
         }
         SetExpr::Select(s) => {
+            each_named(s)?;
             let columns = filled(&columns, s.projection.len(), !i.columns.is_empty())?;
             let mut fill = vec![Fill::Default; table.columns.len()];
             let mut kept = Vec::new();
             let texts = made_text(q, s);
             for (k, (&c, item)) in columns.iter().zip(&s.projection).enumerate() {
-                let e = match item {
-                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
-                    _ => return Err(Error::new("name each column the INSERT's question returns")),
+                let (SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. }) = item
+                else {
+                    unreachable!("an item each_named takes")
                 };
                 let col = &table.columns[c];
                 if texts.contains(&k)

@@ -52,6 +52,9 @@ pub(crate) fn tokens(sql: &str) -> std::result::Result<Vec<TokenWithSpan>, Token
     if sql.contains('[') && sql.to_ascii_lowercase().contains("set") {
         tokens = subscripts_assigned(tokens)?;
     }
+    if sql.contains('*') && sql.contains(')') && sql.contains('.') {
+        tokens = rows_expanded(tokens);
+    }
     if sql.contains(".*") && sql.contains("::") {
         tokens = star_cast(tokens);
     }
@@ -456,6 +459,177 @@ fn subscripts_assigned(t: Vec<TokenWithSpan>) -> std::result::Result<Vec<TokenWi
         t.splice(from..to, made);
     }
     Ok(t)
+}
+
+/// The name of the call a row's expansion, `(x).*`, is read as, its row the one argument: written out
+/// as the row's fields where a select list, a ROW or a VALUES list holds it, once the types it reads
+/// are known (`fields_written`), and refused anywhere else, as PostgreSQL refuses it.
+pub(super) const EXPANDED: &str = "\u{3}expanded";
+
+/// Each `(x).*` read as a call of `EXPANDED` on `x`: sqlparser reads no star after a parenthesis. A
+/// star after a call's parentheses is left, as PostgreSQL's grammar reads none there.
+fn rows_expanded(mut t: Vec<TokenWithSpan>) -> Vec<TokenWithSpan> {
+    loop {
+        let solid: Vec<usize> = (0..t.len())
+            .filter(|&i| !matches!(t[i].token, Token::Whitespace(_)))
+            .collect();
+        let found = (2..solid.len()).find_map(|k| {
+            if t[solid[k]].token != Token::Mul
+                || t[solid[k - 1]].token != Token::Period
+                || t[solid[k - 2]].token != Token::RParen
+            {
+                return None;
+            }
+            let mut depth = 0i32;
+            let open = (0..=k - 2).rev().find(|&j| {
+                match t[solid[j]].token {
+                    Token::RParen => depth += 1,
+                    Token::LParen => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            })?;
+            let called = open > 0
+                && matches!(&t[solid[open - 1]].token,
+                    Token::Word(w) if w.quote_style.is_some() || w.keyword == Keyword::NoKeyword);
+            (!called).then_some((solid[open], solid[k - 2], solid[k]))
+        });
+        let Some((open, close, star)) = found else {
+            return t;
+        };
+        t.drain(close + 1..=star);
+        let name = Token::Word(Word {
+            value: EXPANDED.into(),
+            quote_style: Some('"'),
+            keyword: Keyword::NoKeyword,
+        });
+        let span = t[open].span;
+        t.insert(open, TokenWithSpan::new(name, span));
+    }
+}
+
+/// The row an expression expands, `x` of `(x).*`, through its parentheses; none where it expands
+/// none.
+pub(super) fn expanded(e: &Expr) -> Option<&FunctionArgExpr> {
+    let mut e = e;
+    while let Expr::Nested(x) = e {
+        e = x;
+    }
+    let Expr::Function(f) = e else {
+        return None;
+    };
+    let [part] = f.name.0.as_slice() else {
+        return None;
+    };
+    if part.as_ident()?.value != EXPANDED {
+        return None;
+    }
+    let FunctionArguments::List(l) = &f.args else {
+        return None;
+    };
+    match l.args.as_slice() {
+        [FunctionArg::Unnamed(a)] => Some(a),
+        _ => None,
+    }
+}
+
+/// Whether a statement expands a row anywhere.
+pub(super) fn expands_rows<V: sqlparser::ast::Visit>(v: &V) -> bool {
+    sqlparser::ast::visit_expressions(v, |e| match expanded(e) {
+        Some(_) => std::ops::ControlFlow::Break(()),
+        None => std::ops::ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
+/// PostgreSQL's refusal of a row's expansion where it stands for no list of values.
+pub(super) fn expansion_refused() -> Error {
+    Error::coded("0A000", "row expansion via \"*\" is not supported here")
+}
+
+/// The values a row's expansion stands for, each field of the row's composite type in its order,
+/// `(x).f`, with its name; refused where the type is no composite, or a field is a literal of no
+/// type, as PostgreSQL refuses them; none where the type is not known.
+pub(super) fn fields_written(x: &Expr, ty: Option<ColumnType>) -> Result<Option<Vec<(Expr, String)>>> {
+    let Some(ty) = ty else {
+        return Ok(None);
+    };
+    let ColumnType::Composed(r) = ty else {
+        return Err(not_composite(ty));
+    };
+    let Composed::Record { fields, .. } = r.def() else {
+        return Err(not_composite(ty));
+    };
+    if fields.iter().any(|f| f.domain.as_deref() == Some("unknown")) {
+        return Err(Error::coded(
+            "XX000",
+            "failed to find conversion function from unknown to text",
+        ));
+    }
+    let row = match x {
+        Expr::Nested(_) => x.clone(),
+        _ => Expr::Nested(Box::new(x.clone())),
+    };
+    Ok(Some(
+        fields
+            .iter()
+            .map(|f| {
+                let field = Expr::CompoundFieldAccess {
+                    root: Box::new(row.clone()),
+                    access_chain: vec![sqlparser::ast::AccessExpr::Dot(Expr::Identifier(
+                        sqlparser::ast::Ident::with_quote('"', f.name.clone()),
+                    ))],
+                };
+                (field, f.name.clone())
+            })
+            .collect(),
+    ))
+}
+
+/// A VALUES list's rows with each row's expansion they hold written out as its fields' values, its
+/// row typed over no column; none where no row holds one.
+pub(super) fn values_written(
+    rows: &[sqlparser::ast::Parens<Vec<Expr>>],
+    release: u8,
+) -> Result<Option<Vec<Vec<Expr>>>> {
+    if !rows.iter().any(|r| r.content.iter().any(|e| expanded(e).is_some())) {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let mut row = Vec::with_capacity(r.content.len());
+        for e in &r.content {
+            let Some(a) = expanded(e) else {
+                row.push(e.clone());
+                continue;
+            };
+            let FunctionArgExpr::Expr(x) = a else {
+                return Err(expansion_refused());
+            };
+            let types = super::pipeline::typed_on(x, &[], release)?;
+            match fields_written(x, types.get(&(x as *const Expr)).copied())? {
+                Some(fields) => row.extend(fields.into_iter().map(|(f, _)| f)),
+                None => return Err(fields_unknown(x)),
+            }
+        }
+        out.push(row);
+    }
+    Ok(Some(out))
+}
+
+/// The refusal of a row's expansion whose row's type the snail does not resolve before any row.
+pub(super) fn fields_unknown(x: &Expr) -> Error {
+    Error::new(format!(
+        "({x}).*: the type of {x} is not known before its rows are read, so neither are its \
+         fields: it is not read"
+    ))
+}
+
+fn not_composite(ty: ColumnType) -> Error {
+    Error::coded(
+        "42809",
+        format!("type {} is not composite", super::typed::type_name(ty)),
+    )
 }
 
 /// What marks a call as carrying an operator before ANY, SOME or ALL: its name is this character and

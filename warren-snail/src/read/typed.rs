@@ -924,6 +924,13 @@ impl Typing<'_> {
             Expr::Function(f) if super::pipeline::function_name(f) == super::image::ASSIGNED => {
                 self.assigned(super::pipeline::parts_of(e))?
             }
+            // A row's expansion no list of values holds: its row typed first.
+            Expr::Function(f) if super::pipeline::function_name(f) == super::image::EXPANDED => {
+                for x in super::pipeline::parts_of(e) {
+                    self.type_of(x)?;
+                }
+                return Err(super::image::expansion_refused());
+            }
             Expr::Function(f) => {
                 let name = super::pipeline::function_name(f);
                 // GROUPING (…): an integer, a bit for each argument.

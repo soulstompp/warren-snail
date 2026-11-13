@@ -5993,3 +5993,166 @@ fn a_relation_s_star_reads_its_whole_row() {
         ],
     );
 }
+
+/// A snail holding composite columns, at a path of the test's name.
+fn composites(name: &str) -> Snail {
+    let path = tmp(&format!("reader-{name}.snail"));
+    let ddl = "CREATE SCHEMA cp;
+         CREATE TYPE cp.pair AS (a integer, b text);
+         CREATE TYPE cp.nest AS (p cp.pair, n integer);
+         CREATE TABLE cp.c (id integer PRIMARY KEY, v cp.pair, w integer);
+         CREATE TABLE cp.t (a integer, b text);
+         CREATE TABLE cp.n (id integer PRIMARY KEY, x cp.nest, ps cp.pair[]);";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    for sql in [
+        "INSERT INTO cp.c VALUES (1, ROW(1, 'x'), 10), (2, ROW(2, 'y'), 20), (3, NULL, 30), \
+         (4, ROW(NULL, 'z'), 40)",
+        "INSERT INTO cp.n VALUES (1, ROW(ROW(5, 'q'), 6), ARRAY[ROW(7, 'r')::cp.pair, \
+         ROW(8, 's')::cp.pair]), (2, NULL, NULL)",
+    ] {
+        w.execute(sql).unwrap();
+    }
+    w
+}
+
+/// A row's expansion, `(x).*`, written out as x's fields, each `(x).f` named f, where a select list,
+/// a ROW or a VALUES list holds it; of a relation's name, the relation's columns; refused anywhere
+/// else, and over no composite, as 18.6 refuses it.
+#[test]
+fn a_row_s_expansion_is_its_fields_in_a_list_of_values() {
+    let mut w = composites("expanded");
+    let all = ["1|x", "2|y", "NULL|NULL", "NULL|z"];
+    answered(
+        &mut w,
+        &[
+            ("SELECT (v).* FROM cp.c ORDER BY id", &all),
+            ("SELECT id, (v).* FROM cp.c ORDER BY id", &["1|1|x", "2|2|y", "3|NULL|NULL", "4|NULL|z"]),
+            ("SELECT (v).*, (v).a FROM cp.c ORDER BY id", &["1|x|1", "2|y|2", "NULL|NULL|NULL", "NULL|z|NULL"]),
+            ("SELECT (c.v).* FROM cp.c c ORDER BY id", &all),
+            ("SELECT ( v ) . * FROM cp.c ORDER BY id", &all),
+            ("SELECT ((v).*) FROM cp.c ORDER BY id", &all),
+            ("SELECT (v).* AS q FROM cp.c ORDER BY id", &all),
+            ("SELECT (cp.c.v).* FROM cp.c ORDER BY id", &all),
+            ("SELECT (ROW(1, 'x')::cp.pair).*", &["1|x"]),
+            ("SELECT (NULL::cp.pair).*", &["NULL|NULL"]),
+            ("SELECT ('(3,w)'::cp.pair).*", &["3|w"]),
+            ("SELECT (ROW(1, 2)).*", &["1|2"]),
+            ("SELECT (r).* FROM (SELECT ROW(1, 'x'::text) AS r) s", &["1|x"]),
+            ("SELECT * FROM (SELECT (v).* FROM cp.c) s ORDER BY a NULLS FIRST, b", &["NULL|z", "NULL|NULL", "1|x", "2|y"]),
+            ("SELECT (x).* FROM (SELECT v AS x FROM cp.c) s ORDER BY 1, 2", &["1|x", "2|y", "NULL|z", "NULL|NULL"]),
+            ("SELECT a FROM (SELECT (v).* FROM cp.c) s WHERE b = 'y'", &["2"]),
+            ("SELECT count(*) FROM (SELECT (v).* FROM cp.c) s", &["4"]),
+            ("WITH q AS (SELECT (v).* FROM cp.c) SELECT b FROM q ORDER BY b", &["x", "y", "z", "NULL"]),
+            ("WITH w AS (SELECT v FROM cp.c) SELECT (v).* FROM w ORDER BY 1, 2", &["1|x", "2|y", "NULL|z", "NULL|NULL"]),
+            ("SELECT (v).* FROM cp.c WHERE (v).a > 1", &["2|y"]),
+            ("SELECT (v).* FROM cp.c ORDER BY (v).b", &["1|x", "2|y", "NULL|z", "NULL|NULL"]),
+            ("SELECT DISTINCT (v).* FROM cp.c ORDER BY 1, 2", &["1|x", "2|y", "NULL|z", "NULL|NULL"]),
+            ("SELECT (v).* FROM cp.c ORDER BY 1 LIMIT 2", &["1|x", "2|y"]),
+            ("SELECT (v).* FROM cp.c GROUP BY v ORDER BY 1 NULLS FIRST, 2", &["NULL|z", "NULL|NULL", "1|x", "2|y"]),
+            ("SELECT (v).*, count(*) FROM cp.c GROUP BY v ORDER BY 1 NULLS FIRST, 2", &["NULL|z|1", "NULL|NULL|1", "1|x|1", "2|y|1"]),
+            (
+                "SELECT (v).* FROM cp.c UNION ALL SELECT 9, 'n' ORDER BY 1 NULLS FIRST, 2",
+                &["NULL|z", "NULL|NULL", "1|x", "2|y", "9|n"],
+            ),
+            (
+                "(SELECT (v).* FROM cp.c WHERE id = 1) UNION (SELECT (v).* FROM cp.c WHERE id = 2) ORDER BY 1",
+                &["1|x", "2|y"],
+            ),
+            ("SELECT id FROM cp.c WHERE (2, 'y') IN (SELECT (v).* FROM cp.c) ORDER BY id", &["1", "2", "3", "4"]),
+            ("SELECT id FROM cp.c c WHERE EXISTS (SELECT (c.v).* FROM cp.t) ORDER BY id", &[]),
+            (
+                "SELECT (c1.v).*, (c2.v).* FROM cp.c c1 JOIN cp.c c2 ON c2.id = c1.id + 1 ORDER BY c1.id",
+                &["1|x|2|y", "2|y|NULL|NULL", "NULL|NULL|NULL|z"],
+            ),
+            // A relation's name, or its star, is its columns; a field selected by a relation's name
+            // is the field.
+            ("SELECT (c).* FROM cp.c c ORDER BY id", &["1|(1,x)|10", "2|(2,y)|20", "3|NULL|30", "4|(,z)|40"]),
+            ("SELECT (c.*).* FROM cp.c c WHERE id = 1", &["1|(1,x)|10"]),
+            ("SELECT (s).* FROM (SELECT c FROM cp.c c WHERE id = 2) s", &["(2,\"(2,y)\",20)"]),
+            ("SELECT (s.c).* FROM (SELECT c FROM cp.c c WHERE id = 2) s", &["2|(2,y)|20"]),
+            ("SELECT (x).n FROM cp.n ORDER BY id", &["6", "NULL"]),
+            ("SELECT (x).* FROM cp.n ORDER BY id", &["(5,q)|6", "NULL|NULL"]),
+            ("SELECT ((x).p).* FROM cp.n ORDER BY id", &["5|q", "NULL|NULL"]),
+            ("SELECT ((x).p).a, (x).* FROM cp.n ORDER BY id", &["5|(5,q)|6", "NULL|NULL|NULL"]),
+            ("SELECT ((n).x).* FROM cp.n n WHERE id = 1", &["(5,q)|6"]),
+            ("SELECT (ps[1]).* FROM cp.n ORDER BY id", &["7|r", "NULL|NULL"]),
+            // Inside ROW, in any clause, and in a VALUES list.
+            ("SELECT row_to_json(ROW((v).*)) FROM cp.c WHERE id = 1", &["{\"f1\":1,\"f2\":\"x\"}"]),
+            ("SELECT ROW((v).*, w) FROM cp.c ORDER BY id", &["(1,x,10)", "(2,y,20)", "(,,30)", "(,z,40)"]),
+            ("SELECT ROW((c).*) FROM cp.c c WHERE id = 1", &["(1,\"(1,x)\",10)"]),
+            ("SELECT id FROM cp.c WHERE ROW((v).*) IS NOT NULL ORDER BY id", &["1", "2"]),
+            ("VALUES ((ROW(1, 'x')::cp.pair).*)", &["1|x"]),
+        ],
+    );
+    let not_here = (Some("0A000"), "row expansion via \"*\" is not supported here".to_string());
+    for (sql, want) in [
+        ("SELECT id FROM cp.c WHERE (v).* IS NULL", not_here.clone()),
+        ("SELECT (v).*::text FROM cp.c", not_here.clone()),
+        ("SELECT ARRAY[(v).*] FROM cp.c", not_here.clone()),
+        ("SELECT coalesce((v).*) FROM cp.c", not_here.clone()),
+        ("SELECT (v).* FROM cp.c ORDER BY (v).*", not_here.clone()),
+        ("SELECT 1 FROM cp.c HAVING count((v).*) > 0", not_here),
+        ("SELECT (w).* FROM cp.c", (Some("42809"), "type integer is not composite".into())),
+        ("SELECT ((v).a).* FROM cp.c", (Some("42809"), "type integer is not composite".into())),
+        ("SELECT (ps).* FROM cp.n", (Some("42809"), "type cp.pair[] is not composite".into())),
+        ("SELECT (nosuch).* FROM cp.c", (Some("42703"), "column \"nosuch\" does not exist".into())),
+        (
+            "SELECT (v).* FROM cp.c c1 JOIN cp.c c2 USING (id)",
+            (Some("42702"), "column reference \"v\" is ambiguous".into()),
+        ),
+        (
+            "SELECT (cp.c).* FROM cp.c",
+            (Some("42P01"), "missing FROM-clause entry for table \"cp\"".into()),
+        ),
+        (
+            "SELECT (SELECT (c.v).* FROM cp.c d WHERE d.id = 1) FROM cp.c c",
+            (Some("42601"), "subquery must return only one column".into()),
+        ),
+        (
+            "SELECT (ROW(1, 'x')).*",
+            (Some("XX000"), "failed to find conversion function from unknown to text".into()),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), want, "{sql}");
+    }
+}
+
+/// An INSERT's rows and its RETURNING expand a row as a question's select list does, over the
+/// file's tables; over a subquery, its width not known before its rows, the snail's own refusal.
+#[test]
+fn an_insert_s_rows_and_its_returning_expand_a_row() {
+    let mut w = composites("expanded-insert");
+    w.execute("BEGIN").unwrap();
+    for sql in [
+        "INSERT INTO cp.t SELECT (v).* FROM cp.c",
+        "INSERT INTO cp.t SELECT (ROW(7, 'k')::cp.pair).*",
+        "INSERT INTO cp.t VALUES ((ROW(3, 'v')::cp.pair).*)",
+        "INSERT INTO cp.t SELECT (v).* FROM cp.c WHERE id = 1 UNION ALL SELECT (v).* FROM cp.c WHERE id = 2",
+    ] {
+        w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    answered(
+        &mut w,
+        &[(
+            "SELECT * FROM cp.t ORDER BY a NULLS FIRST, b",
+            &["NULL|z", "NULL|NULL", "1|x", "1|x", "2|y", "2|y", "3|v", "7|k"],
+        )],
+    );
+    answered(
+        &mut w,
+        &[(
+            "INSERT INTO cp.c VALUES (6, ROW(6, 'g'), 60) RETURNING (v).* AS q, (c).*",
+            &["6|g|6|(6,g)|60"],
+        )],
+    );
+    assert_eq!(
+        refused(&mut w, "INSERT INTO cp.t (a) SELECT (v).* FROM cp.c"),
+        (Some("42601"), "INSERT has more expressions than target columns".into())
+    );
+    w.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        refused(&mut w, "INSERT INTO cp.t SELECT (x).* FROM (SELECT v AS x FROM cp.c) s"),
+        (None, "name each column the INSERT's question returns".into())
+    );
+}

@@ -3964,6 +3964,8 @@ fn whole_rows(
         bound: Vec<Vec<String>>,
         made: Vec<(*const Expr, ColumnType)>,
         refused: Option<Error>,
+        // The field names a composite's fields are selected by, which name no relation.
+        fields: HashSet<*const Expr>,
     }
     impl Rows<'_> {
         // In parentheses, a value compared as a composite is, not a row constructor's fields one
@@ -4033,11 +4035,22 @@ fn whole_rows(
             self.bound.pop();
             ControlFlow::Continue(())
         }
+        fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+            if let Expr::CompoundFieldAccess { access_chain, .. } = e {
+                for a in access_chain {
+                    if let sqlparser::ast::AccessExpr::Dot(x) = a {
+                        self.fields.insert(x as *const Expr);
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
         fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
             if self.depth != 0 {
                 return ControlFlow::Continue(());
             }
             match e {
+                Expr::Identifier(_) if self.fields.contains(&(e as *const Expr)) => {}
                 Expr::Identifier(i) => {
                     if let Some((row, ty)) = (self.row_of)(&crate::catalog::ident(i)) {
                         *e = self.whole(row, ty);
@@ -4117,6 +4130,7 @@ fn whole_rows(
         bound: Vec::new(),
         made: Vec::new(),
         refused: None,
+        fields: HashSet::new(),
     };
     for item in &mut s.projection {
         if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
@@ -4269,6 +4283,241 @@ fn starred(projection: &mut Vec<SelectItem>, from: &From, catalog: &Catalog) -> 
     Ok(())
 }
 
+/// What a row's expansion, `(x).*`, stands for: a relation's star, or x's fields, each with its name.
+enum Expanded {
+    Star(ObjectName),
+    Fields(Vec<(Expr, String)>),
+}
+
+/// Each row's expansion a step's select list holds written out, as PostgreSQL's parser writes it:
+/// of a relation's name no column bears, or of its star, the relation's star; else x's fields,
+/// `(x).f` named f; and each a ROW of the step holds, as those values. The stars are written before
+/// the step's stars are read (`rows` none), the fields once its whole rows are (`rows` theirs), x
+/// typed over the FROM's columns, those of the query around it and those rows, each whole row a
+/// field reads given its type. One whose type is not known is refused: a column's by its name where
+/// no one column bears it, in PostgreSQL's words.
+fn rows_written_out(
+    q: &mut Query,
+    from: &From,
+    catalog: &Catalog,
+    outer: Option<&Outer>,
+    release: u8,
+    rows: Option<&mut Vec<(*const Expr, ColumnType)>>,
+) -> Result<()> {
+    use sqlparser::ast::{SelectItemQualifiedWildcardKind as Kind, VisitMut, VisitorMut};
+    use std::ops::ControlFlow;
+    let mut columns = from.typed();
+    if let Some(o) = outer {
+        columns.extend(o.columns.iter().map(|c| (c.qualifier.clone(), c.name.clone(), c.ty)));
+    }
+    let mut leaves = Vec::new();
+    for n in &from.items {
+        n.leaves(&mut leaves);
+    }
+    let naming = |q: Option<&str>, n: &str| {
+        pipeline::naming(
+            columns.iter().map(|(cq, cn, _)| (cq.as_deref(), cn.as_str())),
+            q,
+            n,
+        )
+    };
+    let fields_too = rows.is_some();
+    let seeded: Vec<(*const Expr, ColumnType)> = rows.as_deref().cloned().unwrap_or_default();
+    // The whole rows the fields written read, each with its type.
+    let held: std::cell::RefCell<Vec<(Expr, ColumnType)>> = Default::default();
+    let written = |a: &FunctionArgExpr| -> Result<Option<Expanded>> {
+        let x = match a {
+            FunctionArgExpr::QualifiedWildcard(n) => return Ok(Some(Expanded::Star(n.clone()))),
+            FunctionArgExpr::Expr(x) => x,
+            other => return Err(Error::new(format!("({other}).* is not read"))),
+        };
+        let mut x = x;
+        while let Expr::Nested(inner) = x {
+            x = inner;
+        }
+        if let Expr::Identifier(i) = x {
+            let n = crate::catalog::ident(i);
+            if naming(None, &n).is_empty()
+                && leaves.iter().any(|l| l.leaf_named() == Some(n.as_str()))
+            {
+                return Ok(Some(Expanded::Star(ObjectName::from(vec![i.clone()]))));
+            }
+        }
+        if !fields_too {
+            return Ok(None);
+        }
+        let mut typing = typed::Typing {
+            columns: &columns,
+            release,
+            types: seeded.iter().copied().collect(),
+        };
+        let ty = typing.type_of(x)?;
+        if let Some(fields) = super::image::fields_written(x, ty)? {
+            let _ = sqlparser::ast::visit_expressions(x, |e| {
+                let at = e as *const Expr;
+                if let Some((_, t)) = seeded.iter().find(|(p, _)| *p == at) {
+                    held.borrow_mut().push((e.clone(), *t));
+                }
+                ControlFlow::<()>::Continue(())
+            });
+            return Ok(Some(Expanded::Fields(fields)));
+        }
+        if let Some((q, n)) = pipeline::column_of(x) {
+            match (naming(q.as_deref(), &n).len(), q) {
+                (1, _) => {}
+                (0, Some(q))
+                    if !columns
+                        .iter()
+                        .any(|(cq, _, _)| pipeline::answers_to(cq.as_deref(), &q)) =>
+                {
+                    return Err(from.no_entry(catalog, &q))
+                }
+                (0, q) => return Err(from.no_column(catalog, q.as_deref(), &n)),
+                _ => return Err(Error::new(format!("column reference \"{n}\" is ambiguous"))),
+            }
+        }
+        Err(super::image::fields_unknown(x))
+    };
+    if let SetExpr::Select(s) = q.body.as_mut() {
+        let mut items = Vec::with_capacity(s.projection.len());
+        for item in std::mem::take(&mut s.projection) {
+            let found = match &item {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    super::image::expanded(e)
+                }
+                _ => None,
+            };
+            match found.map(&written).transpose()?.flatten() {
+                None => items.push(item),
+                Some(Expanded::Star(n)) => items.push(SelectItem::QualifiedWildcard(
+                    Kind::ObjectName(n),
+                    Default::default(),
+                )),
+                Some(Expanded::Fields(fields)) => {
+                    items.extend(fields.into_iter().map(|(expr, name)| {
+                        SelectItem::ExprWithAlias {
+                            expr,
+                            alias: Ident::with_quote('"', name),
+                        }
+                    }))
+                }
+            }
+        }
+        s.projection = items;
+    }
+    // Each ROW of the step's own, its expansions written out as their values.
+    struct Rows<'w> {
+        written: &'w dyn Fn(&FunctionArgExpr) -> Result<Option<Expanded>>,
+        depth: usize,
+        refused: Option<Error>,
+    }
+    impl Rows<'_> {
+        // The values an expansion stands for; none where it is left as it is, or refused.
+        fn values(&mut self, a: &FunctionArgExpr) -> Result<Option<Vec<FunctionArgExpr>>> {
+            Ok(match (self.written)(a)? {
+                Some(Expanded::Star(n)) => Some(vec![FunctionArgExpr::QualifiedWildcard(n)]),
+                Some(Expanded::Fields(f)) => {
+                    Some(f.into_iter().map(|(e, _)| FunctionArgExpr::Expr(e)).collect())
+                }
+                None => None,
+            })
+        }
+    }
+    impl VisitorMut for Rows<'_> {
+        type Break = ();
+        fn pre_visit_query(&mut self, _q: &mut Query) -> ControlFlow<()> {
+            self.depth += 1;
+            ControlFlow::Continue(())
+        }
+        fn post_visit_query(&mut self, _q: &mut Query) -> ControlFlow<()> {
+            self.depth -= 1;
+            ControlFlow::Continue(())
+        }
+        fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+            if self.depth != 1 {
+                return ControlFlow::Continue(());
+            }
+            match e {
+                Expr::Function(f) if pipeline::function_name(f) == "row" => {
+                    let FunctionArguments::List(l) = &mut f.args else {
+                        return ControlFlow::Continue(());
+                    };
+                    let mut args = Vec::with_capacity(l.args.len());
+                    for a in std::mem::take(&mut l.args) {
+                        let found = match &a {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => {
+                                super::image::expanded(x)
+                            }
+                            _ => None,
+                        };
+                        match found.map(|x| self.values(x)).transpose() {
+                            Ok(Some(Some(v))) => {
+                                args.extend(v.into_iter().map(FunctionArg::Unnamed))
+                            }
+                            Ok(_) => args.push(a),
+                            Err(e) => {
+                                self.refused.get_or_insert(e);
+                                return ControlFlow::Break(());
+                            }
+                        }
+                    }
+                    l.args = args;
+                }
+                Expr::Tuple(xs) => {
+                    let mut out = Vec::with_capacity(xs.len());
+                    for x in std::mem::take(xs) {
+                        let Some(a) = super::image::expanded(&x) else {
+                            out.push(x);
+                            continue;
+                        };
+                        match self.values(a) {
+                            Ok(Some(v)) => out.extend(v.into_iter().map(|v| match v {
+                                FunctionArgExpr::QualifiedWildcard(n) => Expr::QualifiedWildcard(
+                                    n,
+                                    sqlparser::ast::helpers::attached_token::AttachedToken::empty(),
+                                ),
+                                FunctionArgExpr::Expr(e) => e,
+                                _ => unreachable!("a row's values or a star"),
+                            })),
+                            Ok(None) => out.push(x),
+                            Err(e) => {
+                                self.refused.get_or_insert(e);
+                                return ControlFlow::Break(());
+                            }
+                        }
+                    }
+                    *xs = out;
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut visitor = Rows {
+        written: &written,
+        depth: 0,
+        refused: None,
+    };
+    let _ = q.visit(&mut visitor);
+    if let Some(e) = visitor.refused {
+        return Err(e);
+    }
+    // Each whole row a field written reads, given its type.
+    let held = held.into_inner();
+    if let Some(rows) = rows.filter(|_| !held.is_empty()) {
+        let _ = sqlparser::ast::visit_expressions(q, |e| {
+            let at = e as *const Expr;
+            if !rows.iter().any(|(p, _)| *p == at) {
+                if let Some((_, t)) = held.iter().find(|(h, _)| h == e) {
+                    rows.push((at, *t));
+                }
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    }
+    Ok(())
+}
+
 /// A VALUES list made: each column typed as select_common_type types its values, each value in it,
 /// a scalar subquery's among them.
 fn values_step(
@@ -4282,7 +4531,11 @@ fn values_step(
     let SetExpr::Values(v) = step.query.body.as_ref() else {
         unreachable!("a VALUES step")
     };
-    let rows: Vec<&Vec<Expr>> = v.rows.iter().map(|r| &r.content).collect();
+    let written = super::image::values_written(&v.rows, release)?;
+    let rows: Vec<&Vec<Expr>> = match &written {
+        Some(w) => w.iter().collect(),
+        None => v.rows.iter().map(|r| &r.content).collect(),
+    };
     let n = rows.first().map_or(0, |r| r.len());
     // Each row's values are read before its length is, none a set-returning function's.
     for r in &rows {
@@ -5877,10 +6130,18 @@ fn laid(
             }
         }
     }
+    let expands = super::image::expands_rows(&step.query);
+    if expands {
+        rows_written_out(&mut step.query, &from, catalog, outer, release, None)?;
+    }
     if let SetExpr::Select(s) = step.query.body.as_mut() {
         starred(&mut s.projection, &from, catalog)?;
     }
-    let rows_read = whole_rows(&mut step.query, &from, catalog, outer)?;
+    let mut rows_read = whole_rows(&mut step.query, &from, catalog, outer)?;
+    if expands {
+        let rows = Some(&mut rows_read);
+        rows_written_out(&mut step.query, &from, catalog, outer, release, rows)?;
+    }
     from.outer_at = from.columns.len();
     if let Some(o) = outer {
         from.columns.extend(o.columns.iter().cloned());

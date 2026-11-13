@@ -928,8 +928,37 @@ fn returning_list(
         });
         e.to_string()
     };
+    // A row's expansion of the row written, or of old's or new's, where no column bears the name:
+    // its star.
+    let star_of = |item: &SelectItem| -> Option<SelectItem> {
+        let (SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. }) = item else {
+            return None;
+        };
+        let n = match super::image::expanded(e)? {
+            sqlparser::ast::FunctionArgExpr::QualifiedWildcard(n) => n.clone(),
+            sqlparser::ast::FunctionArgExpr::Expr(x) => {
+                let mut x = x;
+                while let Expr::Nested(inner) = x {
+                    x = inner;
+                }
+                let Expr::Identifier(i) = x else {
+                    return None;
+                };
+                let named = ident(i);
+                let row = named == alias || side_of(i).is_some();
+                if !row || t.own_columns().iter().any(|c| c.name == named) {
+                    return None;
+                }
+                sqlparser::ast::ObjectName::from(vec![i.clone()])
+            }
+            _ => return None,
+        };
+        Some(SelectItem::QualifiedWildcard(Kind::ObjectName(n), Default::default()))
+    };
     let mut out = Vec::new();
     for item in items {
+        let starred = star_of(item);
+        let item = starred.as_ref().unwrap_or(item);
         match item {
             SelectItem::Wildcard(_) => out.extend(spread(None)),
             SelectItem::QualifiedWildcard(Kind::ObjectName(n), _) => {
