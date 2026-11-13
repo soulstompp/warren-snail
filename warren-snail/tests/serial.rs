@@ -31,8 +31,13 @@ const C: i32 = 17600;
 const D: i32 = 17616;
 
 fn made(name: &str) -> PathBuf {
+    made_of(name, DDL)
+}
+
+/// `DDL`'s table and rows, declared by `ddl`.
+fn made_of(name: &str, ddl: &str) -> PathBuf {
     let path = tmp(&format!("serial-{name}.snail"));
-    let catalog = Catalog::parse(DDL).unwrap();
+    let catalog = Catalog::parse(ddl).unwrap();
     let table = catalog.table("s.t").unwrap();
     let columns = table
         .columns
@@ -126,6 +131,41 @@ fn write_skew_fails_the_second_to_commit_at_its_commit() {
     let mut c = Snail::open(&path).unwrap();
     assert_eq!(read(&mut c, B), -1);
     assert_eq!(read(&mut c, A), i64::from(A));
+}
+
+/// On a table with no key a read fixing every column of its order by `=` reads a place, any number
+/// of rows alike: it marks the blocks it reads, as any other read, never a row and its block's gaps.
+/// Two transactions each read a row of its own block by every column and delete a row beside the
+/// other's: with the key each read marks its row and both commit; with none the second to commit is
+/// refused. 18.6 answers both so (`tmp/line5/marks.sql`): with its primary key, and with no index,
+/// its sequential scan marking the relation.
+#[test]
+fn a_keyless_read_marks_blocks_not_rows() {
+    let keyless = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL);";
+    for (form, ddl, refused) in [("keyed", DDL, false), ("keyless", keyless, true)] {
+        let path = made_of(&format!("marks-{form}"), ddl);
+        let (mut a, mut b) = (open(&path), open(&path));
+        run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+        run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+        let point = |x: i32| format!("SELECT count(*) FROM s.t t WHERE t.id = {x} AND t.v = {x}");
+        assert_eq!(one(&run(&mut a, &point(A)).answer.unwrap()), 1, "{form}");
+        assert_eq!(one(&run(&mut b, &point(B)).answer.unwrap()), 1, "{form}");
+        run(&mut a, &format!("DELETE FROM s.t WHERE id = {}", B + 16));
+        run(&mut b, &format!("DELETE FROM s.t WHERE id = {}", A + 16));
+        run(&mut a, "COMMIT");
+        match b.execute("COMMIT") {
+            Err(e) if refused => assert_eq!(
+                reason(&e),
+                "Canceled on identification as a pivot, during commit attempt.",
+                "{form}"
+            ),
+            Ok(_) if !refused => {}
+            other => panic!("{form}: {other:?}"),
+        }
+        let mut c = Snail::open(&path).unwrap();
+        let left = one(&c.ask("SELECT count(*) FROM s.t", None).unwrap().0);
+        assert_eq!(left, i64::from(ROWS) - if refused { 1 } else { 2 }, "{form}");
+    }
 }
 
 #[test]
