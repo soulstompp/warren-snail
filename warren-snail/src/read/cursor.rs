@@ -429,8 +429,10 @@ impl Cursor {
         if !matches!(first.as_str(), "SELECT" | "VALUES" | "WITH" | "TABLE") {
             return Err(Error::new(format!("syntax error at or near \"{first}\"")));
         }
-        // A cursor on one table keeps each row's key there, for WHERE CURRENT OF.
-        let keyed = cursor_keys(catalog, &d.question);
+        // A cursor on one table keeps each row's key there, for WHERE CURRENT OF: without FOR
+        // UPDATE or SHARE, only where its rows come along one of the table's orders, as
+        // PostgreSQL's plan sorts any other.
+        let keyed = cursor_keys(catalog, &d.question, locking);
         // Where the round can stop early, a block of the table at a time along its order, the
         // cursor reads only the blocks FETCH needs, on a snail of its own holding the generation
         // the declaration read.
@@ -488,8 +490,13 @@ impl Cursor {
     }
 
     /// The table a cursor's question reads alone, with no grouping, its key's columns, and the
-    /// question with those columns after its own; none for any other question.
-    fn cursor_keys(catalog: &crate::catalog::Catalog, question: &str) -> Option<(usize, Vec<usize>, String)> {
+    /// question with those columns after its own; none for any other question, nor, unless it
+    /// locks its rows, for one whose ORDER BY no order of the table gives.
+    fn cursor_keys(
+        catalog: &crate::catalog::Catalog,
+        question: &str,
+        locking: bool,
+    ) -> Option<(usize, Vec<usize>, String)> {
         use sqlparser::ast::{SelectItem, SetExpr, Statement as Sql, TableFactor};
         let parsed = super::image::parse_sql(question).ok()?;
         let [Sql::Query(q)] = parsed.as_slice() else {
@@ -530,6 +537,13 @@ impl Cursor {
             .as_ref()
             .map(|a| crate::catalog::ident(&a.name))
             .unwrap_or_else(|| n.rsplit('.').next().unwrap_or(&n).to_string());
+        if let Some(sqlparser::ast::OrderByKind::Expressions(items)) =
+            q.order_by.as_ref().map(|o| &o.kind)
+        {
+            if !locking && !items.is_empty() && !along_an_order(table, s, items, &by, &n) {
+                return None;
+            }
+        }
         // Each named apart from the question's own columns, a `*`'s among them, so that ORDER BY
         // reads a name as the question gives it.
         let mut q2 = (**q).clone();
@@ -811,6 +825,113 @@ fn unique_key(table: &crate::catalog::Table) -> Option<Vec<usize>> {
         .find(|o| o.constraint.as_ref().is_some_and(|k| k.primary))
         .or_else(|| table.orders.iter().find(plain))?;
     Some(o.levels.iter().map(|l| l.column()).collect())
+}
+
+/// Whether a question's ORDER BY comes from reading one of its table's B-tree orders forward or
+/// backward: each item a column of the table, as the select list or the FROM names it, and each in
+/// turn a level of the order in its direction and its NULLs' place, or every one in the opposite of
+/// both. The order a table is given where its DDL names none is no index's, nor is a partial one.
+fn along_an_order(
+    table: &crate::catalog::Table,
+    s: &sqlparser::ast::Select,
+    items: &[sqlparser::ast::OrderByExpr],
+    by: &str,
+    full: &str,
+) -> bool {
+    use crate::catalog::{ident, Level, Method};
+    use sqlparser::ast::{Expr, SelectItem, Value};
+    fn column_of(table: &crate::catalog::Table, by: &str, full: &str, e: &Expr) -> Option<usize> {
+        let named = |n: &str| table.own_columns().iter().position(|c| c.name == n);
+        match e {
+            Expr::Nested(x) => column_of(table, by, full, x),
+            Expr::Identifier(i) => named(&ident(i)),
+            Expr::CompoundIdentifier(p) => {
+                let names: Vec<String> = p.iter().map(ident).collect();
+                let (column, relation) = names.split_last()?;
+                let relation = relation.join(".");
+                (relation == by || relation == full)
+                    .then(|| named(column))
+                    .flatten()
+            }
+            _ => None,
+        }
+    }
+    // Each column of the select list, by its name, and the table's column it reads where it is one.
+    let mut listed: Vec<(Option<String>, Option<usize>)> = Vec::new();
+    for item in &s.projection {
+        match item {
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => listed.extend(
+                table
+                    .own_columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (Some(c.name.clone()), Some(i))),
+            ),
+            SelectItem::UnnamedExpr(e) => listed.push((
+                match e {
+                    Expr::Identifier(i) => Some(ident(i)),
+                    Expr::CompoundIdentifier(p) => p.last().map(ident),
+                    _ => None,
+                },
+                column_of(table, by, full, e),
+            )),
+            SelectItem::ExprWithAlias { expr, alias } => {
+                listed.push((Some(ident(alias)), column_of(table, by, full, expr)))
+            }
+            _ => listed.push((None, None)),
+        }
+    }
+    // A number is a column of the select list by its place, a bare name the one it names before
+    // any of the FROM's.
+    let column = |o: &sqlparser::ast::OrderByExpr| -> Option<usize> {
+        match &o.expr {
+            Expr::Value(v) => match &v.value {
+                Value::Number(n, _) => listed.get(n.parse::<usize>().ok()?.checked_sub(1)?)?.1,
+                _ => None,
+            },
+            Expr::Identifier(i) => match listed.iter().find(|(n, _)| *n == Some(ident(i))) {
+                Some((_, c)) => *c,
+                None => column_of(table, by, full, &o.expr),
+            },
+            e => column_of(table, by, full, e),
+        }
+    };
+    let wanted: Option<Vec<(usize, bool, bool)>> = items
+        .iter()
+        .map(|o| {
+            let desc = super::ordering::along_a_key(&o.options)?;
+            Some((column(o)?, desc, o.options.nulls_first.unwrap_or(desc)))
+        })
+        .collect();
+    let Some(wanted) = wanted else {
+        return false;
+    };
+    table
+        .orders
+        .iter()
+        .filter(|o| {
+            matches!(o.method, Method::Btree)
+                && o.predicate.is_none()
+                && !o.given()
+                && o.levels.len() >= wanted.len()
+        })
+        .any(|o| {
+            // Each level as its index writes it: its column, DESC, and NULLS FIRST.
+            let level = |i: usize| match o.levels[i] {
+                Level::Column(c) => Some((
+                    c,
+                    o.desc[i],
+                    if o.desc[i] { !o.nulls_first[i] } else { o.nulls_first[i] },
+                )),
+                _ => None,
+            };
+            [false, true].into_iter().any(|back| {
+                wanted
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &(c, d, n))| level(i) == Some((c, d ^ back, n ^ back)))
+            })
+        })
 }
 
 /// Whether a statement's text holds the words CURRENT OF, in any case, white space between them: a
