@@ -26,11 +26,115 @@ impl VisitorMut for Pushing {
     type Break = ();
 
     fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<()> {
-        if let Some((sorted, condition)) = what_moves(q, self.release) {
-            moved(q, sorted, condition);
+        // A star over pg_settings alone is its columns, each of which is computed.
+        if let SetExpr::Select(s) = q.body.as_mut() {
+            for t in &mut s.from {
+                if let TableFactor::Derived { subquery, .. } = &mut t.relation {
+                    if let SetExpr::Select(inner) = subquery.body.as_mut() {
+                        outputs::settings_starred(inner);
+                    }
+                }
+            }
+        }
+        if let Some(m) = what_moves(q, self.release) {
+            moved(q, m);
+        } else if let Some(mut inlined) = inlined(q, self.release) {
+            if let Some(m) = what_moves(&inlined, self.release) {
+                moved(&mut inlined, m);
+                *q = inlined;
+            }
         }
         ControlFlow::Continue(())
     }
+}
+
+/// What of a query moves into the subquery it reads alone: its cut, where it has one, its ORDER BY
+/// by the subquery's columns' places, where it moves with the cut, and its WHERE's condition.
+struct Moves {
+    cut: bool,
+    sorted: Vec<OrderByExpr>,
+    condition: Option<Expr>,
+}
+
+/// A query reading a WITH query alone, the WITH query read in its place as a subquery, as
+/// PostgreSQL's planner reads one read once and not MATERIALIZED, writing nothing and calling
+/// nothing that may be volatile; none for any other.
+fn inlined(q: &Query, release: u8) -> Option<Query> {
+    let with = q.with.as_ref().filter(|w| !w.recursive)?;
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return None;
+    };
+    if s.from.len() != 1 || !s.from[0].joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table {
+        name,
+        alias,
+        args: None,
+        ..
+    } = &s.from[0].relation
+    else {
+        return None;
+    };
+    let [sqlparser::ast::ObjectNamePart::Identifier(n)] = name.0.as_slice() else {
+        return None;
+    };
+    let named = ident(n);
+    let at = with
+        .cte_tables
+        .iter()
+        .position(|c| ident(&c.alias.name) == named)?;
+    let cte = &with.cte_tables[at];
+    if cte.materialized.is_some() || !matches!(cte.query.body.as_ref(), SetExpr::Select(_)) {
+        return None;
+    }
+    // Read once in the whole statement.
+    let mut times = 0;
+    let _ = sqlparser::ast::visit_relations(q, |r| {
+        if matches!(r.0.as_slice(), [sqlparser::ast::ObjectNamePart::Identifier(i)] if ident(i) == named)
+        {
+            times += 1;
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    let volatile = sqlparser::ast::visit_expressions(&cte.query, |x| match x {
+        Expr::Function(f) if super::own::may_be_volatile(&pipeline::function_name(f), release) || pipeline::draws(x) => {
+            ControlFlow::Break(())
+        }
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break();
+    if times != 1 || volatile {
+        return None;
+    }
+    let mut out = q.clone();
+    let columns = match alias.as_ref().filter(|a| !a.columns.is_empty()) {
+        Some(a) => a.columns.clone(),
+        None => cte.alias.columns.clone(),
+    };
+    let alias = sqlparser::ast::TableAlias {
+        explicit: true,
+        name: alias.as_ref().map_or_else(|| n.clone(), |a| a.name.clone()),
+        columns,
+        at: None,
+    };
+    let subquery = cte.query.clone();
+    if let Some(w) = out.with.as_mut() {
+        w.cte_tables.remove(at);
+        if w.cte_tables.is_empty() {
+            out.with = None;
+        }
+    }
+    let SetExpr::Select(s) = out.body.as_mut() else {
+        return None;
+    };
+    s.from[0].relation = TableFactor::Derived {
+        lateral: false,
+        subquery,
+        alias: Some(alias),
+        sample: None,
+    };
+    Some(out)
 }
 
 /// Whether a SELECT groups, returns each row once or makes a window or a set: any of which its
@@ -80,9 +184,9 @@ fn alone(s: &Select) -> Option<(&Query, Option<String>, Vec<String>)> {
     }
 }
 
-/// What of a query's cut moves into the subquery it reads alone: the subquery's ORDER BY, by its
-/// columns' places, and the condition its WHERE takes; none where nothing moves.
-fn what_moves(q: &Query, release: u8) -> Option<(Vec<OrderByExpr>, Option<Expr>)> {
+/// What of a query moves into the subquery it reads alone (`Moves`); none where nothing moves.
+/// With no cut, its WHERE alone moves, and only into a subquery that computes what it reads.
+fn what_moves(q: &Query, release: u8) -> Option<Moves> {
     let cuts = match &q.limit_clause {
         Some(LimitClause::LimitOffset {
             limit: Some(l),
@@ -93,7 +197,7 @@ fn what_moves(q: &Query, release: u8) -> Option<(Vec<OrderByExpr>, Option<Expr>)
         _ => q.fetch.is_some(),
     };
     let fetch_ties = q.fetch.as_ref().is_some_and(|f| f.with_ties || f.percent);
-    if !cuts
+    if q.limit_clause.is_some() && !cuts
         || fetch_ties
         || !q.locks.is_empty()
         || q.for_clause.is_some()
@@ -106,7 +210,7 @@ fn what_moves(q: &Query, release: u8) -> Option<(Vec<OrderByExpr>, Option<Expr>)
     let SetExpr::Select(s) = q.body.as_ref() else {
         return None;
     };
-    if folds(s) {
+    if folds(s) || !cuts && s.selection.is_none() {
         return None;
     }
     let (sub, alias, renames) = alone(s)?;
@@ -129,8 +233,8 @@ fn what_moves(q: &Query, release: u8) -> Option<(Vec<OrderByExpr>, Option<Expr>)
                 })
         }
         _ => false,
-    };
-    if !computes && s.selection.is_none() {
+    } || outputs::settings_alone(sub);
+    if !computes && (s.selection.is_none() || !cuts) {
         return None;
     }
     // The subquery's columns, by the names they go by, and what makes each where it is one SELECT.
@@ -163,6 +267,7 @@ fn what_moves(q: &Query, release: u8) -> Option<(Vec<OrderByExpr>, Option<Expr>)
     // Its ORDER BY, each key one of the subquery's columns by its name or by its place in the
     // select list, made the subquery's by that column's place.
     let sorted: Vec<OrderByExpr> = match &q.order_by {
+        _ if !cuts => Vec::new(),
         None => Vec::new(),
         Some(OrderBy {
             kind: OrderByKind::Expressions(os),
@@ -244,7 +349,11 @@ fn what_moves(q: &Query, release: u8) -> Option<(Vec<OrderByExpr>, Option<Expr>)
             Some(w)
         }
     };
-    Some((sorted, condition))
+    Some(Moves {
+        cut: cuts,
+        sorted,
+        condition,
+    })
 }
 
 /// The place of the subquery's column an expression names, alone or after the subquery's alias;
@@ -321,10 +430,17 @@ impl VisitorMut for Substitute<'_> {
     }
 }
 
-/// A query's cut, its ORDER BY by places and its condition moved into the subquery it reads alone.
-fn moved(q: &mut Query, sorted: Vec<OrderByExpr>, condition: Option<Expr>) {
-    let limit = q.limit_clause.take();
-    let fetch = q.fetch.take();
+/// What moves of a query, moved into the subquery it reads alone.
+fn moved(q: &mut Query, m: Moves) {
+    let Moves {
+        cut,
+        sorted,
+        condition,
+    } = m;
+    let (limit, fetch) = match cut {
+        true => (q.limit_clause.take(), q.fetch.take()),
+        false => (None, None),
+    };
     let SetExpr::Select(s) = q.body.as_mut() else {
         return;
     };
@@ -334,8 +450,10 @@ fn moved(q: &mut Query, sorted: Vec<OrderByExpr>, condition: Option<Expr>) {
     let TableFactor::Derived { subquery, .. } = &mut s.from[0].relation else {
         return;
     };
-    subquery.limit_clause = limit;
-    subquery.fetch = fetch;
+    if cut {
+        subquery.limit_clause = limit;
+        subquery.fetch = fetch;
+    }
     if !sorted.is_empty() {
         subquery.order_by = Some(OrderBy {
             kind: OrderByKind::Expressions(sorted),

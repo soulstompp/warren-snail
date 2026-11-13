@@ -2776,8 +2776,7 @@ fn folded(w: &sqlparser::tokenizer::Word) -> String {
 /// The words of a text as sqlparser's tokenizer reads them: a bare word folded, a quoted one as it
 /// is.
 pub(super) fn words(text: &str) -> Vec<String> {
-    sqlparser::tokenizer::Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, text)
-        .tokenize()
+    displayed_tokens(text)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|t| match t {
@@ -2786,6 +2785,26 @@ pub(super) fn words(text: &str) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// The tokens of a text sqlparser printed: a `--` there is two signs it printed together (`- -5` is
+/// printed `--5`), never a comment, so what follows it on the line is read as well.
+fn displayed_tokens(text: &str) -> Option<Vec<sqlparser::tokenizer::Token>> {
+    use sqlparser::tokenizer::{Token, Whitespace};
+    let tokens = sqlparser::tokenizer::Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, text)
+        .tokenize()
+        .ok()?;
+    let mut out = Vec::with_capacity(tokens.len());
+    for t in tokens {
+        match t {
+            Token::Whitespace(Whitespace::SingleLineComment { comment, prefix }) if prefix == "--" => {
+                out.extend([Token::Minus, Token::Minus]);
+                out.extend(displayed_tokens(&comment)?);
+            }
+            t => out.push(t),
+        }
+    }
+    Some(out)
 }
 
 /// The columns a text can mean, as sqlparser's tokenizer reads it.
@@ -2807,10 +2826,7 @@ impl Named {
         use sqlparser::keywords::Keyword;
         use sqlparser::tokenizer::Token;
         let mut named = Named::default();
-        let Ok(tokens) =
-            sqlparser::tokenizer::Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, text)
-                .tokenize()
-        else {
+        let Some(tokens) = displayed_tokens(text) else {
             named.unread = true;
             return named;
         };
@@ -6784,11 +6800,6 @@ pub(super) fn checked(catalog: &Catalog, q: &Query) -> Result<Vec<String>> {
         .iter()
         .map(|f| f.name().clone())
         .collect())
-}
-
-/// The types of the columns a question returns, read over a catalog whose tables hold no rows.
-pub(super) fn types_of(catalog: &Catalog, q: &Query) -> Result<Vec<Option<ColumnType>>> {
-    Ok(answered(&Empty(catalog), q, &[], false)?.0.types)
 }
 
 /// Several snails' tables, each read from the snail that holds it: `at` names, for each table of

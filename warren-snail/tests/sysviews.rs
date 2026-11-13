@@ -467,3 +467,74 @@ fn pg_settings_shows_what_the_session_set() {
         ]
     );
 }
+
+#[test]
+fn pg_settings_through_a_subquery_refuses_only_the_values_its_question_reads() {
+    let mut snail = Snail::open(&written("sv-settings-sub", 18)).unwrap();
+    for (q, want) in [
+        ("SELECT name FROM (SELECT * FROM pg_settings) s WHERE name = 'work_mem'", vec![s(&["work_mem"])]),
+        ("SELECT count(*)::text FROM (SELECT * FROM pg_settings) s", vec![s(&["399"])]),
+        (
+            "WITH s AS (SELECT * FROM pg_settings) SELECT name FROM s WHERE name = 'work_mem'",
+            vec![s(&["work_mem"])],
+        ),
+        ("SELECT setting FROM (SELECT * FROM pg_settings) s WHERE name = 'work_mem'", vec![s(&["4096"])]),
+        (
+            "WITH s AS (SELECT name, setting FROM pg_settings) SELECT setting FROM s WHERE name = 'work_mem'",
+            vec![s(&["4096"])],
+        ),
+        (
+            "SELECT s.name, s.setting FROM (SELECT name, setting FROM pg_settings WHERE context = 'user') s \
+             WHERE s.name = 'work_mem'",
+            vec![s(&["work_mem", "4096"])],
+        ),
+        (
+            "SELECT count(*)::text FROM (SELECT name, setting FROM pg_settings) s WHERE name LIKE 'enable%'",
+            vec![s(&["24"])],
+        ),
+        (
+            "WITH s AS MATERIALIZED (SELECT * FROM pg_settings) SELECT name FROM s WHERE name = 'work_mem'",
+            vec![s(&["work_mem"])],
+        ),
+        (
+            "SELECT name FROM (SELECT name, setting FROM pg_settings) s ORDER BY name LIMIT 2",
+            vec![s(&["DateStyle"]), s(&["IntervalStyle"])],
+        ),
+        (
+            "SELECT name, unit FROM (SELECT * FROM pg_settings WHERE name = 'work_mem') s",
+            vec![s(&["work_mem", "kB"])],
+        ),
+        // A star beside a join USING or NATURAL: the merged columns once, first.
+        (
+            "SELECT * FROM (SELECT name FROM pg_settings) a JOIN (SELECT name, vartype FROM pg_settings) b \
+             USING (name) WHERE name = 'work_mem'",
+            vec![s(&["work_mem", "integer"])],
+        ),
+        (
+            "SELECT * FROM (SELECT name FROM pg_settings WHERE name = 'work_mem') a NATURAL JOIN \
+             (SELECT name, vartype FROM pg_settings) b",
+            vec![s(&["work_mem", "integer"])],
+        ),
+        (
+            "SELECT * FROM (SELECT name, vartype FROM pg_settings WHERE name = 'work_mem') a JOIN \
+             (SELECT name, unit FROM pg_settings) b USING (name)",
+            vec![s(&["work_mem", "integer", "kB"])],
+        ),
+        (
+            "SELECT * FROM (SELECT name, vartype FROM pg_settings WHERE name = 'work_mem') a FULL JOIN \
+             (SELECT name, unit FROM pg_settings WHERE name = 'work_mem') b USING (name)",
+            vec![s(&["work_mem", "integer", "kB"])],
+        ),
+    ] {
+        assert_eq!(rows(&mut snail, q), want, "{q}");
+    }
+    // pg_settings' own star beside them: its columns, the merged name first.
+    let q = "SELECT * FROM pg_settings a JOIN (SELECT name FROM pg_settings) b USING (name) \
+             WHERE name = 'work_mem'";
+    let (b, _) = snail.ask(q, None).unwrap_or_else(|e| panic!("{q}: {}", e.0));
+    let schema = b.schema();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names.len(), 17, "{names:?}");
+    assert_eq!(names[..3], ["name", "setting", "unit"], "{names:?}");
+    assert_eq!(b.num_rows(), 1);
+}

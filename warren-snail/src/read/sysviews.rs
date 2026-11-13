@@ -583,8 +583,115 @@ pub(crate) fn settings_values(q: &mut Query, visible: &[String]) -> Result<()> {
         Ok(items)
     };
     let mut projection = Vec::with_capacity(s.projection.len());
+    // A star over joins USING or NATURAL: each join's merged columns once, first, then each side's
+    // others, as PostgreSQL's parser writes the star out.
+    let joined = |t: &TableWithJoins| -> Result<Vec<(String, SelectItem)>> {
+        let leaf = |f: &TableFactor| -> Result<Vec<(String, SelectItem)>> {
+            let unknown = || {
+                Error::new(
+                    "* is not read beside pg_settings here: a server's own setting's values are \
+                     refused where they are read, so name each column",
+                )
+            };
+            let (by, names) = match f {
+                TableFactor::Table { name, alias, .. } => {
+                    let n = crate::catalog::object_name(name);
+                    let by = match alias {
+                        Some(a) => crate::catalog::ident(&a.name),
+                        None => n.rsplit('.').next().unwrap_or(&n).to_string(),
+                    };
+                    if by != relation {
+                        return Err(unknown());
+                    }
+                    let items = columns(&by)?;
+                    let names = super::settings::columns().map(|(c, _)| c.to_string());
+                    return Ok(names.into_iter().zip(items).collect());
+                }
+                TableFactor::Derived {
+                    subquery,
+                    alias: Some(a),
+                    ..
+                } => {
+                    let renames: Vec<String> =
+                        a.columns.iter().map(|c| crate::catalog::ident(&c.name)).collect();
+                    let names = super::outputs::names_of(subquery, &renames).ok_or_else(unknown)?;
+                    (crate::catalog::ident(&a.name), names)
+                }
+                _ => return Err(unknown()),
+            };
+            let q = super::relations::quote(&by);
+            names
+                .into_iter()
+                .map(|c| {
+                    let item = select_list(&format!("{q}.{}", super::relations::quote(&c)))?;
+                    Ok((c, item.into_iter().next().ok_or_else(unknown)?))
+                })
+                .collect()
+        };
+        let mut out = leaf(&t.relation)?;
+        for j in &t.joins {
+            let right = leaf(&j.relation)?;
+            let (constraint, side) = match &j.join_operator {
+                JoinOperator::Join(c) | JoinOperator::Inner(c) => (Some(c), 0),
+                JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => (Some(c), 0),
+                JoinOperator::Right(c) | JoinOperator::RightOuter(c) => (Some(c), 1),
+                JoinOperator::FullOuter(c) => (Some(c), 2),
+                _ => (None, 0),
+            };
+            let merged: Vec<String> = match constraint {
+                Some(JoinConstraint::Using(names)) => names
+                    .iter()
+                    .filter_map(|n| n.0.last().and_then(|p| p.as_ident()).map(crate::catalog::ident))
+                    .collect(),
+                Some(JoinConstraint::Natural) => out
+                    .iter()
+                    .map(|(n, _)| n.clone())
+                    .filter(|n| right.iter().any(|(r, _)| r == n))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let item_of = |list: &[(String, SelectItem)], n: &str| {
+                list.iter().find(|(c, _)| c == n).map(|(_, i)| i.clone())
+            };
+            let expr_of = |i: &SelectItem| match i {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    e.to_string()
+                }
+                other => other.to_string(),
+            };
+            let mut next = Vec::new();
+            for m in &merged {
+                let (Some(l), Some(r)) = (item_of(&out, m), item_of(&right, m)) else {
+                    return Err(Error::new(format!(
+                        "column \"{m}\" specified in USING clause does not exist"
+                    )));
+                };
+                let item = match side {
+                    0 => l,
+                    1 => r,
+                    _ => select_list(&format!(
+                        "COALESCE({}, {}) AS {}",
+                        expr_of(&l),
+                        expr_of(&r),
+                        super::relations::quote(m)
+                    ))?
+                    .remove(0),
+                };
+                next.push((m.clone(), item));
+            }
+            next.extend(out.into_iter().filter(|(c, _)| !merged.contains(c)));
+            next.extend(right.into_iter().filter(|(c, _)| !merged.contains(c)));
+            out = next;
+        }
+        Ok(out)
+    };
     for item in std::mem::take(&mut s.projection) {
         match &item {
+            SelectItem::Wildcard(_) if merged => {
+                for t in &s.from {
+                    projection.extend(joined(t)?.into_iter().map(|(_, i)| i));
+                }
+            }
             SelectItem::Wildcard(_) => {
                 for (by, settings) in &from {
                     match (by, settings) {

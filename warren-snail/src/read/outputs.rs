@@ -84,7 +84,14 @@ impl VisitorMut for Dropping<'_> {
             let Some(natural) = reads.natural_names(self.catalog) else {
                 continue;
             };
-            if reads.star || !in_place || refs.is_empty() || volatile(&cte.query, release) {
+            // A WITH query made apart leaves only pg_settings' value columns unmade, which make
+            // nothing 18.6 refuses.
+            let apart = !in_place && settings_alone(&cte.query);
+            if reads.star
+                || !in_place && !apart
+                || refs.is_empty()
+                || volatile(&cte.query, release)
+            {
                 continue;
             }
             let renames: Vec<String> = cte.alias.columns.iter().map(|c| ident(&c.name)).collect();
@@ -94,7 +101,7 @@ impl VisitorMut for Dropping<'_> {
                 refs: &refs,
                 renames: &renames,
             };
-            left_unmade(&mut cte.query, &read, self.catalog);
+            left_unmade(&mut cte.query, &read, self.catalog, apart);
         }
         let mut i = 0;
         while let Some(TableFactor::Derived { subquery, .. }) = nth_derived(q, i) {
@@ -124,7 +131,7 @@ impl VisitorMut for Dropping<'_> {
                 refs: &refs,
                 renames: &[],
             };
-            left_unmade(subquery, &read, self.catalog);
+            left_unmade(subquery, &read, self.catalog, false);
         }
         ControlFlow::Continue(())
     }
@@ -216,7 +223,7 @@ fn factors_of(t: &mut TableWithJoins) -> Vec<&mut TableFactor> {
 
 /// Each output of a subquery nothing reads under any of the names it goes by, written to be left
 /// unmade.
-fn left_unmade(sub: &mut Query, read: &Read, catalog: &Catalog) {
+fn left_unmade(sub: &mut Query, read: &Read, catalog: &Catalog, values_only: bool) {
     if read.refs.iter().any(|(a, _)| read.reads.whole.contains(a)) {
         return;
     }
@@ -230,45 +237,151 @@ fn left_unmade(sub: &mut Query, read: &Read, catalog: &Catalog) {
     let arms = whole && union_all(&sub.body) && arms_typed_alike(sub, catalog);
     match sub.body.as_mut() {
         SetExpr::Select(s) => {
+            let settings = settings_starred(s);
             let names = own_names(s);
-            unmade_items(s, &names, &sorted, &read, release);
+            unmade_items(s, &names, &sorted, &read, release, settings, values_only);
         }
-        body @ SetExpr::SetOperation { .. } if arms => {
+        body @ SetExpr::SetOperation { .. } if arms && !values_only => {
             let mut selects = Vec::new();
             selects_of(body, &mut selects);
             // An arm's columns go by the first arm's names.
             let names = selects.first().map(|s| own_names(s)).unwrap_or_default();
             for s in selects {
-                unmade_items(s, &names, &[], &read, release);
+                let settings = settings_starred(s);
+                unmade_items(s, &names, &[], &read, release, settings, false);
             }
         }
         _ => {}
     }
 }
 
+/// Whether a SELECT reads pg_settings alone, whose value columns are each a setting's value read
+/// through the refusal of a server's own (`sysviews::settings_values`): its star then written as
+/// pg_settings' columns, as PostgreSQL's parser writes it out.
+pub(super) fn settings_starred(s: &mut Select) -> bool {
+    let alone = s.from.len() == 1 && s.from[0].joins.is_empty();
+    let named = match &s.from.first().map(|t| &t.relation) {
+        Some(TableFactor::Table {
+            name, args: None, ..
+        }) if alone => {
+            let n = crate::catalog::object_name(name);
+            super::sysviews::view_named(&n).as_deref() == Some("pg_catalog.pg_settings")
+        }
+        _ => false,
+    };
+    if !named {
+        return false;
+    }
+    let star = |i: &SelectItem| matches!(i, SelectItem::Wildcard(o) if *o == Default::default());
+    if s.projection.iter().any(star) {
+        let mut out = Vec::new();
+        for item in std::mem::take(&mut s.projection) {
+            match star(&item) {
+                true => out.extend(
+                    super::settings::columns()
+                        .iter()
+                        .map(|(c, _)| SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(*c)))),
+                ),
+                false => out.push(item),
+            }
+        }
+        s.projection = out;
+    }
+    true
+}
+
+/// Whether a query is one SELECT reading pg_settings alone.
+pub(super) fn settings_alone(q: &Query) -> bool {
+    match q.body.as_ref() {
+        SetExpr::Select(s) => settings_starred(&mut s.as_ref().clone()),
+        _ => false,
+    }
+}
+
 /// Whether each arm of a set operation, read alone, gives its columns the types the operation
 /// gives them: only then are its arms read as subqueries of their own, each leaving its outputs.
+/// Each arm's columns are typed over the file's tables its FROM names, a literal of no type taking
+/// the operation's; an arm over anything else is not known so.
 fn arms_typed_alike(sub: &Query, catalog: &Catalog) -> bool {
-    let types = |q: &Query| -> Option<Vec<Option<crate::catalog::ColumnType>>> {
-        let types = super::relations::types_of(catalog, q).ok()?;
-        Some(types.into_iter().map(|t| t.map(super::typed::unmodified)).collect())
-    };
-    let Some(whole) = types(sub) else {
-        return false;
+    use crate::catalog::ColumnType;
+    let arm_types = |s: &Select| -> Option<Vec<Option<ColumnType>>> {
+        let mut columns: Vec<(Option<String>, String, Option<ColumnType>)> = Vec::new();
+        for t in &s.from {
+            for f in std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)) {
+                let TableFactor::Table {
+                    name,
+                    alias,
+                    args: None,
+                    ..
+                } = f
+                else {
+                    return None;
+                };
+                let n = crate::catalog::object_name(name);
+                let table = catalog.table(&n).or_else(|| {
+                    catalog
+                        .tables
+                        .iter()
+                        .find(|x| !n.contains('.') && x.name.rsplit('.').next() == Some(n.as_str()))
+                })?;
+                if alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
+                    return None;
+                }
+                let by = match alias {
+                    Some(a) => ident(&a.name),
+                    None => n.rsplit('.').next().unwrap_or(&n).to_string(),
+                };
+                columns.extend(
+                    table
+                        .own_columns()
+                        .iter()
+                        .map(|c| (Some(by.clone()), c.name.clone(), Some(c.ty))),
+                );
+            }
+        }
+        s.projection
+            .iter()
+            .map(|i| match i {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    let types = pipeline::typed_on(e, &columns, catalog.release).ok()?;
+                    match types.get(&(e as *const Expr)) {
+                        Some(t) => Some(Some(super::typed::unmodified(*t))),
+                        // Only a literal is of no type.
+                        None if pipeline::quoted(e)
+                            || matches!(e, Expr::Value(v) if v.value == Value::Null) =>
+                        {
+                            Some(None)
+                        }
+                        None => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect()
     };
     let mut body = sub.body.as_ref().clone();
     let mut selects = Vec::new();
     selects_of(&mut body, &mut selects);
-    selects.into_iter().all(|s| {
-        let arm = Query {
-            body: Box::new(SetExpr::Select(Box::new(s.clone()))),
-            ..sub.clone()
-        };
-        // A literal of no type takes the operation's.
-        types(&arm).is_some_and(|t| {
-            t.len() == whole.len()
-                && t.iter().zip(&whole).all(|(a, w)| a.is_none() || a == w)
-        })
+    let Some(arms) = selects
+        .iter()
+        .map(|s| arm_types(s))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let width = arms.first().map_or(0, Vec::len);
+    if arms.iter().any(|a| a.len() != width) {
+        return false;
+    }
+    (0..width).all(|c| {
+        let column: Vec<Option<ColumnType>> = arms.iter().map(|a| a[c]).collect();
+        match super::typed::common_type(&column, "UNION") {
+            Ok(whole) => {
+                let whole = super::typed::unmodified(whole);
+                column.iter().all(|t| t.is_none_or(|t| t == whole))
+            }
+            Err(_) => false,
+        }
     })
 }
 
@@ -305,7 +418,13 @@ fn unmade_items(
     sorted: &[Expr],
     read: &dyn Fn(usize, &str) -> bool,
     release: u8,
+    settings: bool,
+    values_only: bool,
 ) {
+    // A value column of pg_settings is read through its refusal: computed, though written alone.
+    let value = |e: &Expr| {
+        settings && column_of(e).is_some_and(|c| super::settings::VALUES.contains(&c.as_str()))
+    };
     if matches!(s.distinct, Some(Distinct::Distinct)) {
         return;
     }
@@ -369,7 +488,10 @@ fn unmade_items(
                 || matches!(k, Expr::Identifier(x) if ident(x) == own)
         };
         if unmade_already(e)
-            || read_as_written(e) && !column_of(e).is_some_and(|c| computed.contains(&c))
+            || read_as_written(e)
+                && !column_of(e).is_some_and(|c| computed.contains(&c))
+                && !value(e)
+            || values_only && !value(e)
             || read(i, &own)
             || keyed.iter().any(by_it)
             || pipeline::holds_set(e)
