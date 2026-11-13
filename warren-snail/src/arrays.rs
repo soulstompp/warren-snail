@@ -1,6 +1,7 @@
 //! The array functions as `arrayfuncs.c`, `array_userfuncs.c` and `varlena.c` compute them: an
-//! array's shape, finding, removing and replacing its elements, putting its items in order,
-//! drawing them, an array as text and text as an array, and the arrays `array_agg` makes of
+//! array's shape, finding, removing and replacing its elements, an element or a slice assigned,
+//! putting its items in order, drawing them, an array as text and text as an array, and the arrays
+//! `array_agg` makes of
 //! arrays; `parse_ident` as `misc.c` reads a name; an aclitem array as `acl.c` makes and unfolds
 //! one, and an options array as `foreign.c` unfolds one.
 //!
