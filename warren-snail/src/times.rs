@@ -272,9 +272,11 @@ type D<T> = std::result::Result<T, Dterr>;
 
 fn parse_error(e: Dterr, s: &str, datatype: &str) -> Error {
     match e {
-        Dterr::FieldOverflow | Dterr::MdFieldOverflow => {
-            Error::new(format!("date/time field value out of range: \"{s}\""))
-        }
+        Dterr::FieldOverflow => Error::new(format!("date/time field value out of range: \"{s}\"")),
+        Dterr::MdFieldOverflow => Error::new(format!(
+            "date/time field value out of range: \"{s}\"\nHINT:  Perhaps you need a different \
+             \"DateStyle\" setting."
+        )),
         Dterr::TzdispOverflow => {
             Error::new(format!("time zone displacement out of range: \"{s}\""))
         }
@@ -4291,7 +4293,8 @@ mod tests {
             ),
             (
                 "2024-13-01",
-                "date/time field value out of range: \"2024-13-01\"",
+                "date/time field value out of range: \"2024-13-01\"\nHINT:  Perhaps you need a \
+                 different \"DateStyle\" setting.",
             ),
             ("12:00", "invalid input syntax for type date: \"12:00\""),
             (

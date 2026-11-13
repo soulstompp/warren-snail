@@ -5599,6 +5599,37 @@ fn a_malformed_literal_is_refused_with_its_code_and_detail() {
 }
 
 #[test]
+fn a_month_or_a_day_out_of_range_is_refused_with_the_datestyle_hint() {
+    let mut w = snail("datestyle-hint");
+    let hinted = |s: &str| {
+        (
+            Some("22008"),
+            format!(
+                "date/time field value out of range: \"{s}\"\nHINT:  Perhaps you need a different \
+                 \"DateStyle\" setting."
+            ),
+        )
+    };
+    let plain = |s: &str| (Some("22008"), format!("date/time field value out of range: \"{s}\""));
+    for (sql, want) in [
+        ("SELECT '2000-13-01'::date FROM dn.a WHERE false", hinted("2000-13-01")),
+        ("SELECT '2000-00-01'::date", hinted("2000-00-01")),
+        ("SELECT '2000-01-32'::date", hinted("2000-01-32")),
+        ("SELECT '2000-01-00'::date", hinted("2000-01-00")),
+        ("SELECT 'Jan 32 2000'::date", hinted("Jan 32 2000")),
+        ("SELECT '13/01/2000'::date", hinted("13/01/2000")),
+        ("SELECT '2000-13-01 00:00'::timestamp", hinted("2000-13-01 00:00")),
+        ("SELECT '2000-13-01 00:00'::timestamptz", hinted("2000-13-01 00:00")),
+        ("SELECT date '2000-13-01'", hinted("2000-13-01")),
+        ("SELECT '2000-02-30'::date", plain("2000-02-30")),
+        ("SELECT '2000-01-01 25:00'::timestamp", plain("2000-01-01 25:00")),
+        ("SELECT to_date('2000 13', 'YYYY MM')", plain("2000 13")),
+    ] {
+        assert_eq!(refused(&mut w, sql), want, "{sql}");
+    }
+}
+
+#[test]
 fn an_arm_s_sorted_literal_is_text_before_its_set_operation_is_typed() {
     let mut w = snail("sorted-literal");
     let unmatched = |op: &str, a: &str, b: &str| {

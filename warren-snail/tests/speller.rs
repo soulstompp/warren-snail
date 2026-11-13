@@ -120,7 +120,8 @@ fn each_refusal_carries_postgresqls_sqlstate_in_its_words() {
         (
             "INSERT INTO s.f (id, d) VALUES (1, '2026-13-01')",
             "22008",
-            "date/time field value out of range: \"2026-13-01\"",
+            "date/time field value out of range: \"2026-13-01\"\nHINT:  Perhaps you need a \
+             different \"DateStyle\" setting.",
         ),
         (
             "INSERT INTO s.f (id, iv) VALUES (1, 'x')",
