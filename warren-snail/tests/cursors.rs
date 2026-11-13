@@ -116,4 +116,11 @@ fn a_cursor_without_for_update_is_current_only_along_an_order() {
         current(&mut w, "SELECT * FROM w.n", true, keyless),
         taken("1|u")
     );
+    // Refused as an invalid cursor state, 18.6's SQLSTATE.
+    w.execute("BEGIN").unwrap();
+    w.execute(&format!("DECLARE k CURSOR FOR {sorted}")).unwrap();
+    w.execute("FETCH 1 FROM k").unwrap();
+    let e = w.execute(UPDATE).unwrap_err();
+    assert_eq!(e.sqlstate(), Some("24000"), "{e}");
+    w.execute("ROLLBACK").unwrap();
 }
