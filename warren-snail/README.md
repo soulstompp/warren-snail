@@ -46,7 +46,8 @@ cargo install --locked warren-snail --no-default-features --features standalone 
 A snail is the file you name; past 1 GiB, Parquet's size for one file of huge data, it goes on
 into `<file>.1`, `<file>.2` and on beside it. The snail is those files and nothing else: deleting
 them deletes it. A snail made since 0.2.0 is of format 9, which 0.1.0 and 0.1.1 do not open; one
-either made, of format 7 or 8, is opened and written in its own format.
+either made, of format 7 or 8, is refused by name when it is opened: `out` it with 0.1.x and
+`write` it afresh with 0.2.0.
 
 ## A first snail
 
@@ -425,8 +426,7 @@ changes with it, as PostgreSQL's READ COMMITTED has it. A statement that waited 
 the rows it found again in their newest versions, and only those still meeting its conditions.
 Writers that wait in a ring, each for a block the next holds, fail one of their transactions with
 `deadlock detected`; a transaction one of whose statements failed takes nothing but its end, which
-rolls it back. A writer of 0.1.0 and one of a later version never write one snail at once: their
-block locks lie on different bytes. A read that pays a page or more of a block only for its dead
+rolls it back. A read that pays a page or more of a block only for its dead
 rows, or for rows written after its last, on a snail open to write, leaves it to the writer's next
 commit, which prunes it: the block is written again, in order and without its dead rows. A read
 alone commits nothing, as PostgreSQL's commits nothing; the blocks it found wait for the writer's
@@ -452,8 +452,6 @@ PostgreSQL's words (`could not serialize access due to concurrent update`, or `d
 holds is waited for, as PostgreSQL's unique check waits, and refused once that writer commits. What it
 keeps of its rows until its commit counts in each round's room. A row changed and changed back since
 the snapshot, or set to the value it held, is no change to the snail, where PostgreSQL refuses it.
-A snail of format 7 or 8 holds a block in one version: a row written into a block another wrote since
-the snapshot is refused by name, with the way across.
 
 ### SERIALIZABLE
 
@@ -476,9 +474,8 @@ would commit, as one that scanned the table is refused: two `UPDATE`s by key of 
 mark it, each its own scan, and the second to commit is refused; two `INSERT`s of one block read
 nothing, and both commit. A marked read costs no page: the marks are locks on bytes past the file's pages. A committed transaction's lie in records
 its root names, about a page a commit, while a round older than its commit runs; one that only read
-writes them only where a transaction that can write at the level is open. The level is refused by
-name on a snail of format 7 or 8, with the way across, and on a snail marked a replica, in PostgreSQL's
-words. Across several snails opened together it holds as on one: the transaction takes its snapshot on
+writes them only where a transaction that can write at the level is open. The level is refused on
+a snail marked a replica, in PostgreSQL's words. Across several snails opened together it holds as on one: the transaction takes its snapshot on
 all of them at one moment, its marks and edges lie in each of their files, the test walks every file
 the transactions it meets write, so a cycle through two snails is refused in the same words, and
 commits take one order from a clock their roots share.
@@ -620,7 +617,7 @@ records them as `snails`.
 **Where it stops.** The snails hold no two tables of one name, as one database holds none.
 `--order` is refused beside `--with`. In `exec`, each statement writes the snail that holds its
 table, an `INSERT … SELECT` reading that snail alone, and no DDL is run. A transaction that writes
-several snails commits them together, each of format 9, the first it wrote deciding: read together,
+several snails commits them together, the first it wrote deciding: read together,
 they stand all as they were before the commit, or all as it left them.
 
 ## Files past 1 GiB
@@ -642,11 +639,11 @@ and its pages lie in.
 
 **What it writes.** The root names each order's directory, each money column's `lc_monetary`, the
 catalog and where each sequence stands. While that fits the root's one page, the root holds it, as
-it always has. Once it would not, in a file of format 9, it goes into lists of pages the root names:
+it always has. Once it would not, it goes into lists of pages the root names:
 the tables' orders and money columns, keyed by table, the top of their list in the root; the
 catalog's text, a page a chunk; the sequences, by name. A commit writes again only the pages of a
 list it changed, and those above them, each to a fresh page, then the root, which stays one small
-write. A file of format 7 or 8 refuses a schema its root does not hold, by name.
+write.
 
 **The read it cancels.** A round on one table of thousands reads the root, its table's directory
 and its pages, never a page of another table's. An open snail keeps the pages of the lists it read,
@@ -728,8 +725,7 @@ followers', and `carry::apply` lands the leader's commits while a stray writer t
 
 **Where it stops.** A snail marked a replica of one source is refused another's mark until it is
 cleared; marking it as it is marked, or clearing a mark it does not hold, writes nothing. `recut`
-carries the mark; `write` makes no snail where a replica lies. A snail of format 7 or 8 holds no
-mark. The mark names a writer, and a source's name is presented by whoever writes it: PostgreSQL's
+carries the mark; `write` makes no snail where a replica lies. The mark names a writer, and a source's name is presented by whoever writes it: PostgreSQL's
 privileges, or the file's own, say who may write at all.
 
 ## A question read as it goes: the pipeline

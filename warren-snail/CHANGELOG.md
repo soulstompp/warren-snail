@@ -12,9 +12,10 @@ at once, and a snail written inside a host that decides its commits.
   std's method parts from it, glibc's C.UTF-8 classes and case, its monetary data and, under
   `collations`, ICU's and glibc's collation, each called as PostgreSQL calls it. The file's byte
   locks are taken through `nix`, `errno` read through `errno`.
-- **Format 9.** A snail written by 0.2.0 is of format 9, which 0.1.0 and 0.1.1 do not open. A snail
-  of format 7 or 8 is opened and written in its own format, and what that format cannot hold is
-  refused by name.
+- **Format 9, and only format 9.** A snail written by 0.2.0 is of format 9, which 0.1.0 and 0.1.1
+  do not open. A snail of format 7 or 8, as 0.1.0 and 0.1.1 made it, is refused by name when it is
+  opened, saying the way across: *made by 0.1.x: `out` it with 0.1.x and `write` it afresh with
+  0.2.0*. Its rows move whole: `write` takes the Parquet files 0.1.x's `out` puts out.
 - **A `numeric(p, s)` lies as two columns,** its decimal and whether it is NaN, which PostgreSQL's
   `numeric` may hold: `write` and `blocks` name them `total.value` and `total.nan` for a column
   `total`. An answer's `numeric(p, s)` column is an Arrow struct of the two,
@@ -152,7 +153,7 @@ at once, and a snail written inside a host that decides its commits.
   READ COMMITTED, and READ UNCOMMITTED run as it, REPEATABLE READ and SERIALIZABLE, each as
   PostgreSQL has it, and READ ONLY and DEFERRABLE, named by `BEGIN`, `START TRANSACTION`, `SET
   TRANSACTION` and `SET SESSION CHARACTERISTICS AS TRANSACTION`.
-- SERIALIZABLE in a file of format 9: PostgreSQL's monitor on the snail's places. Each transaction's
+- SERIALIZABLE: PostgreSQL's monitor on the snail's places. Each transaction's
   committed set composes as one serial order, one that would not is refused, SQLSTATE 40001, in
   PostgreSQL's words; a committed transaction's marks lie in records its root names; a host's own
   monitor is told instead, by `carry::Monitor` and `Snail::monitored_by`, and the file keeps none.
@@ -181,11 +182,10 @@ at once, and a snail written inside a host that decides its commits.
   `room::Sizes` naming its bytes and, by `written_to`, a `room::RoundFile` of the host's for the rows
   past them, and hands its answer out a batch at a time (`read::Answering`). `Priced`'s tables say the
   bytes a round holds of each.
-- Any number of tables in a file of format 9. Where the root would not hold the tables' orders,
-  their money columns' `lc_monetary`, the catalog and the sequences, they lie in pages the root names,
-  and a commit writes again only the pages of the tables it wrote; `Root::is_cut` says which. 0.1.1
-  refused a file whose root could not hold its tables; a file of format 7 or 8 still refuses it, by
-  name.
+- Any number of tables. Where the root would not hold the tables' orders, their money columns'
+  `lc_monetary`, the catalog and the sequences, they lie in pages the root names, and a commit writes
+  again only the pages of the tables it wrote; `Root::is_cut` says which. 0.1.1 refused a file whose
+  root could not hold its tables.
 - Followers: `Snail::carried_by`, `carry::Commit`, `carry::apply` and `carry::copy` carry each
   commit to other copies of the file.
 - A host that decides its commits: `Snail::open_carried`, `Snail::open_judged`, `carry::Judge`,
