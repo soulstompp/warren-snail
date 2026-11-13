@@ -2263,17 +2263,19 @@ impl Snail {
     }
 
     /// Each row a write lands in a table with no column of a B-tree numbered as it arrives: the
-    /// table's last number's plus one, in the statement's order. A row an UPDATE writes keeps the
-    /// number it found.
+    /// table's last number's plus one, in the statement's order. A row an UPDATE writes is numbered
+    /// so too, its new version landing past the rows the statement leaves.
     fn arrived(&mut self, table: usize, changes: &mut [Change]) -> Result<()> {
         let t = &self.catalog.tables[table];
         let Some(a) = t.arrival() else {
             return Ok(());
         };
-        if !changes
-            .iter()
-            .any(|c| matches!(c, Change::Insert(r) if r[a] == Datum::Null))
-        {
+        let lands = |c: &Change| match c {
+            Change::Insert(r) => r[a] == Datum::Null,
+            Change::Replace(..) => true,
+            Change::Delete(_) => false,
+        };
+        if !changes.iter().any(lands) {
             return Ok(());
         }
         let last = format!(
@@ -2287,9 +2289,9 @@ impl Snail {
             _ => 0,
         };
         for c in changes {
-            if let Change::Insert(r) = c {
-                if r[a] == Datum::Null {
-                    next += 1;
+            if lands(&*c) {
+                next += 1;
+                if let Change::Insert(r) | Change::Replace(_, r) = c {
                     r[a] = Datum::Int(next);
                 }
             }

@@ -945,7 +945,7 @@ fn a_table_with_no_b_tree_column_lies_in_arrival() {
         rows(&mut w, "SELECT j::text AS j FROM s.w"),
         ["[3]", "[1]", "[2]"]
     );
-    // Each statement's rows past the last, in its order; an UPDATE keeps its row's number. (Rows
+    // Each statement's rows past the last, in its order; an UPDATE numbers its row anew so. (Rows
     // a block holds past its sorted ones are read after them until a writer prunes it, so the
     // number is read by its name, as the snail's own finders read it.)
     changed(&mut w, "INSERT INTO s.w VALUES ('[0]'), ('[9]')");
@@ -962,7 +962,7 @@ fn a_table_with_no_b_tree_column_lies_in_arrival() {
     );
     assert_eq!(
         rows(&mut w, &numbered),
-        ["[4]|2", "[2]|3", "[0]|4", "[9]|5", "[5]|6", "[6]|7"]
+        ["[2]|3", "[0]|4", "[9]|5", "[5]|6", "[4]|7", "[6]|8"]
     );
     assert_eq!(
         rows(&mut w, "SELECT j::text AS j FROM s.w ORDER BY 1"),
@@ -1016,6 +1016,50 @@ fn a_table_with_no_b_tree_column_lies_in_arrival() {
         ),
         ["(0,0)|5|{\"a\":1}", "(5,5)|7|{\"b\":3}"]
     );
+}
+
+/// An UPDATE of a table with no column of a B-tree numbers each row it writes anew, past the last,
+/// in the statement's order: its new version lists after the rows the statement leaves, as 18.6's
+/// new version of a row of a heap does, an UPDATE writing the same value among them. Every answer
+/// is 18.6's, in its order (`tmp/line5/r66.sql`).
+#[test]
+fn an_update_numbers_its_row_anew_past_the_last() {
+    let path = declared(
+        "update-anew",
+        NOB,
+        &[
+            "INSERT INTO s.w VALUES ('[3]'), ('[1]'), ('[2]')",
+            "INSERT INTO s.w VALUES ('[0]'), ('[9]')",
+            "INSERT INTO s.w VALUES ('[5]')",
+        ],
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    let listed = |w: &mut Snail| rows(w, "SELECT j::text AS j FROM s.w");
+    let four = "UPDATE s.w SET j = '[4]' WHERE ctid = \
+                (SELECT ctid FROM s.w WHERE j::text = '[1]' LIMIT 1)";
+    assert_eq!(changed(&mut w, four), 1);
+    assert_eq!(listed(&mut w), ["[3]", "[2]", "[0]", "[9]", "[5]", "[4]"]);
+    let three = "DELETE FROM s.w WHERE ctid = (SELECT ctid FROM s.w WHERE j::text = '[3]' LIMIT 1)";
+    assert_eq!(changed(&mut w, three), 1);
+    changed(&mut w, "INSERT INTO s.w VALUES ('[6]')");
+    assert_eq!(listed(&mut w), ["[2]", "[0]", "[9]", "[5]", "[4]", "[6]"]);
+    assert_eq!(changed(&mut w, "UPDATE s.w SET j = j"), 6);
+    assert_eq!(listed(&mut w), ["[2]", "[0]", "[9]", "[5]", "[4]", "[6]"]);
+    let two = "UPDATE s.w SET j = '[7]' WHERE j::text IN ('[0]', '[5]')";
+    assert_eq!(changed(&mut w, two), 2);
+    assert_eq!(listed(&mut w), ["[2]", "[9]", "[4]", "[6]", "[7]", "[7]"]);
+    assert_eq!(changed(&mut w, "UPDATE s.w SET j = '[2]' WHERE j::text = '[2]'"), 1);
+    assert_eq!(listed(&mut w), ["[9]", "[4]", "[6]", "[7]", "[7]", "[2]"]);
+    // Rows alike and NULLs beside a point.
+    changed(
+        &mut w,
+        "INSERT INTO s.nob VALUES ('(1,2)', '{\"a\": 1}'), ('(3,4)', '{\"a\": 2}'), (NULL, NULL)",
+    );
+    let nob = |w: &mut Snail| rows(w, "SELECT p::text AS p, j::text AS j FROM s.nob");
+    changed(&mut w, "UPDATE s.nob SET j = '{\"b\": 1}' WHERE p ~= point '(1,2)'");
+    assert_eq!(nob(&mut w), ["(3,4)|{\"a\": 2}", "NULL|NULL", "(1,2)|{\"b\": 1}"]);
+    changed(&mut w, "UPDATE s.nob SET p = point '(9,9)' WHERE p IS NULL");
+    assert_eq!(nob(&mut w), ["(3,4)|{\"a\": 2}", "(1,2)|{\"b\": 1}", "(9,9)|NULL"]);
 }
 
 /// The number a table with no column of a B-tree lies along is no column of it: no star, row,
