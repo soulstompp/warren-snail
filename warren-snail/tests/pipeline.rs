@@ -106,8 +106,8 @@ fn a_table_declared_in_a_file_that_holds_others_takes_rows_and_reads_its_runs() 
     let table = WIND_DDL.trim_start_matches("CREATE SCHEMA weather; ");
     let d = w.execute(table.trim_end_matches(';')).unwrap();
     // The rolled-back block's declaration took its OIDs at once, a root of its own, as a
-    // transaction block's DDL does: one generation more.
-    assert_eq!((d.statement, d.generation), ("CREATE TABLE", 3));
+    // transaction block's DDL does, and no commit: the generation moves only at this one.
+    assert_eq!((d.statement, d.generation), ("CREATE TABLE", 2));
     let rows = winds(3000);
     // The lines arrive in reverse, 250 at a time: the table's order is not their arrival.
     for chunk in rows.chunks(250).rev() {
