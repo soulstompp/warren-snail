@@ -5044,10 +5044,12 @@ fn answered(
     let inlined = super::sysviews::inlined_calls(catalog, q)?
         .map(|q| super::spelled::between_written(&q));
     let q = inlined.as_ref().unwrap_or(q);
-    // Each output of its subqueries nothing reads left unmade.
+    // Its cut taken by a FROM subquery it reads alone, and each output of its subqueries nothing
+    // reads left unmade.
     let dropped = super::outputs::holds_subqueries(q).then(|| {
         let mut q = q.clone();
-        super::outputs::dropped(&mut q, catalog.release);
+        super::limited::pushed(&mut q, catalog.release);
+        super::outputs::dropped(&mut q, catalog);
         q
     });
     let q = dropped.as_ref().unwrap_or(q);
@@ -6782,6 +6784,11 @@ pub(super) fn checked(catalog: &Catalog, q: &Query) -> Result<Vec<String>> {
         .iter()
         .map(|f| f.name().clone())
         .collect())
+}
+
+/// The types of the columns a question returns, read over a catalog whose tables hold no rows.
+pub(super) fn types_of(catalog: &Catalog, q: &Query) -> Result<Vec<Option<ColumnType>>> {
+    Ok(answered(&Empty(catalog), q, &[], false)?.0.types)
 }
 
 /// Several snails' tables, each read from the snail that holds it: `at` names, for each table of

@@ -30,6 +30,7 @@ pub(crate) mod image;
 mod join;
 mod json;
 mod level;
+mod limited;
 mod locking;
 mod named;
 mod nearest;
@@ -1984,8 +1985,10 @@ impl Snail {
     ) -> Result<(RecordBatch, Round)> {
         let _rows = handed::rows_of(&self.catalog);
         let mut q = pipeline::windows::written(&spelled::between_written(q))?;
-        // Each output of its subqueries nothing reads left unmade.
-        outputs::dropped(&mut q, self.catalog.release);
+        // Its cut taken by a FROM subquery it reads alone, and each output of its subqueries nothing
+        // reads left unmade.
+        limited::pushed(&mut q, self.catalog.release);
+        outputs::dropped(&mut q, &self.catalog);
         let q = &q;
         // A question naming a system column reads it where each table holds it past its own.
         let names_system = {

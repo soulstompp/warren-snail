@@ -434,3 +434,128 @@ fn a_select_list_is_made_only_for_the_rows_its_limit_keeps() {
         ],
     );
 }
+
+#[test]
+fn an_unread_output_s_aggregate_folds_no_row_and_its_query_groups_as_before() {
+    let mut w = snail("aggregate");
+    let all = || rows(&["1", "2", "3", "4"]);
+    each(
+        &mut w,
+        &[
+            ("SELECT q.k FROM (SELECT k, sum(1/(k - 1)) AS x FROM fo.src GROUP BY k) q ORDER BY 1", all()),
+            (
+                "SELECT q.g FROM (SELECT k % 2 AS g, max(1/(k - 1)) AS x FROM fo.src GROUP BY k % 2) q ORDER BY 1",
+                rows(&["0", "1"]),
+            ),
+            ("SELECT q.k FROM (SELECT 1 AS k, sum(1/(k - 1)) AS x FROM fo.src) q", rows(&["1"])),
+            ("SELECT q.k FROM (SELECT 1 AS k, sum(1/(k - 1)) AS x FROM fo.none) q", rows(&["1"])),
+            ("SELECT count(*) FROM (SELECT k, sum(1/(k - 1)) AS x FROM fo.src GROUP BY k) q", rows(&["4"])),
+            (
+                "SELECT q.k FROM (SELECT k, count(*) FILTER (WHERE 1/(k - 1) > 0) AS x FROM fo.src GROUP BY k) q ORDER BY 1",
+                all(),
+            ),
+            (
+                "SELECT q.k FROM (SELECT k, array_agg(1/(k - 1) ORDER BY v) AS x FROM fo.src GROUP BY k) q ORDER BY 1",
+                all(),
+            ),
+            ("WITH c AS (SELECT k, sum(1/(k - 1)) AS x FROM fo.src GROUP BY k) SELECT k FROM c ORDER BY 1", all()),
+            (
+                "SELECT q.k FROM (SELECT k, sum(1/(k - 1)) AS x, count(*) AS n FROM fo.src GROUP BY k) q WHERE n > 0 ORDER BY 1",
+                all(),
+            ),
+            ("SELECT q.n FROM (SELECT sum(1/(k - 1)) AS x, count(*) AS n FROM fo.src) q", rows(&["4"])),
+            ("SELECT q.k FROM (SELECT k, sum(1/(k - 1)) OVER () AS x FROM fo.src) q ORDER BY 1", all()),
+            ("SELECT q.k FROM (SELECT k, sum(1/(k - 1)) AS x FROM fo.src GROUP BY k) q(k, y) ORDER BY 1", all()),
+            ("SELECT q.k FROM (SELECT k, sum(1/(k - 1)) + k AS x FROM fo.src GROUP BY k) q ORDER BY 1", all()),
+            ("SELECT q.k FROM (SELECT k, count(DISTINCT 1/(k - 1)) AS x FROM fo.src GROUP BY k) q ORDER BY 1", all()),
+            (
+                "SELECT q.k FROM (SELECT k, sum(1/(k - 1)) AS x FROM fo.src GROUP BY k UNION ALL SELECT k, 1::bigint FROM fo.src) q ORDER BY 1",
+                rows(&["1", "1", "2", "2", "3", "3", "4", "4"]),
+            ),
+            // Where it is read, its query keeps it, or its arms are of other types than their
+            // union's, it is made.
+            (
+                "SELECT q.k FROM (SELECT k, sum(1/(k - 1)) AS x FROM fo.src GROUP BY k HAVING sum(1/(k - 1)) > 0) q",
+                zero(),
+            ),
+            ("SELECT q.k FROM (SELECT k, sum(1/(k - 1)) AS x FROM fo.src GROUP BY k ORDER BY x) q", zero()),
+            ("SELECT q.k FROM (SELECT k, sum(1/(k - 1)) + random() AS x FROM fo.src GROUP BY k) q ORDER BY 1", zero()),
+            ("SELECT q.k FROM (SELECT k, sum(1/(k - 1)) AS x FROM fo.src GROUP BY k) q WHERE x IS NULL ORDER BY 1", zero()),
+            (
+                "SELECT q.k FROM (SELECT k, sum(1/(k - 1)) AS x FROM fo.src GROUP BY k UNION ALL SELECT k, 1 FROM fo.src) q ORDER BY 1",
+                zero(),
+            ),
+            (
+                "SELECT q.k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src UNION ALL SELECT k, 1::bigint FROM fo.src) q ORDER BY 1",
+                zero(),
+            ),
+            (
+                "SELECT q.k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src UNION ALL SELECT k, 1::smallint FROM fo.src) q ORDER BY 1",
+                zero(),
+            ),
+            (
+                "SELECT q.k FROM (SELECT k, sum(1/(k - 1)) OVER (PARTITION BY 1/(k - 1)) AS x FROM fo.src) q ORDER BY 1",
+                zero(),
+            ),
+            (
+                "SELECT q.k FROM (SELECT k, row_number() OVER (ORDER BY 1/(k - 1)) AS x FROM fo.src) q ORDER BY 1",
+                zero(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_natural_join_reads_only_the_columns_its_sides_share() {
+    let mut w = snail("natural");
+    let all = || rows(&["1", "2", "3", "4"]);
+    each(
+        &mut w,
+        &[
+            ("SELECT s.k FROM fo.src s NATURAL JOIN (SELECT k, 1/(k - 1) AS x FROM fo.src) q ORDER BY 1", all()),
+            ("SELECT k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src) q NATURAL JOIN fo.src ORDER BY 1", all()),
+            ("SELECT s.k FROM fo.src s NATURAL LEFT JOIN (SELECT k, 1/(k - 1) AS x FROM fo.src) q ORDER BY 1", all()),
+            ("SELECT s.k FROM fo.src s NATURAL FULL JOIN (SELECT k, 1/(k - 1) AS x FROM fo.src) q ORDER BY 1", all()),
+            (
+                "WITH c AS (SELECT k, 1/(k - 1) AS x FROM fo.src) SELECT s.k FROM fo.src s NATURAL JOIN c ORDER BY 1",
+                all(),
+            ),
+            (
+                "SELECT a.k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src) a NATURAL JOIN (SELECT k, 2 AS y FROM fo.src) b ORDER BY 1",
+                all(),
+            ),
+            (
+                "SELECT s.k FROM fo.src s NATURAL JOIN fo.src t, (SELECT k AS z, 1/(k - 1) AS x FROM fo.src) q WHERE s.k = q.z ORDER BY 1",
+                all(),
+            ),
+            // A name both sides share is read, and a star reads every column.
+            ("SELECT s.k FROM fo.src s NATURAL JOIN (SELECT k, 1/(k - 1) AS v FROM fo.src) q ORDER BY 1", zero()),
+            ("SELECT * FROM fo.src s NATURAL JOIN (SELECT k, 1/(k - 1) AS x FROM fo.src) q", zero()),
+            (
+                "SELECT a.k FROM (SELECT k, 1/(k - 1) AS x FROM fo.src) a NATURAL JOIN (SELECT k, 2 AS x FROM fo.src) b ORDER BY 1",
+                zero(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_limit_over_a_subquery_read_alone_is_the_subquery_s() {
+    let mut w = snail("pushed");
+    each(
+        &mut w,
+        &[
+            ("SELECT x FROM (SELECT 1/(k - 2) AS x FROM fo.src) q LIMIT 1", rows(&["-1"])),
+            ("SELECT x FROM (SELECT k, 1/(k - 2) AS x FROM fo.src) q WHERE k > 0 LIMIT 1", rows(&["-1"])),
+            ("SELECT q.x FROM (SELECT 1/(k - 2) AS x FROM fo.src WHERE k > 0) q LIMIT 1", rows(&["-1"])),
+            ("SELECT x FROM (SELECT k, 1/(k - 2) AS x FROM fo.src) q ORDER BY k LIMIT 1", rows(&["-1"])),
+            ("SELECT x, k FROM (SELECT k, 1/(k - 2) AS x FROM fo.src) q LIMIT 1", rows(&["-1|1"])),
+            ("SELECT x + 1 AS y FROM (SELECT 1/(k - 2) AS x FROM fo.src) q LIMIT 1", rows(&["0"])),
+            ("SELECT x FROM (SELECT 1/(k - 2) AS x FROM fo.src ORDER BY k) q LIMIT 1", rows(&["-1"])),
+            ("SELECT x FROM (SELECT 1/(k - 2) AS x, v FROM fo.src) q WHERE v > 0 LIMIT 1", rows(&["-1"])),
+            ("SELECT x FROM (SELECT 1/(k - 2) AS x FROM fo.src) q FETCH FIRST 1 ROW ONLY", rows(&["-1"])),
+            // The rows its OFFSET passes over are made.
+            ("SELECT x FROM (SELECT 1/(k - 2) AS x FROM fo.src) q LIMIT 1 OFFSET 2", zero()),
+        ],
+    );
+}

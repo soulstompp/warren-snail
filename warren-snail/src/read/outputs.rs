@@ -1,13 +1,15 @@
 //! A subquery's outputs nothing reads, left unmade as PostgreSQL 18.6's planner leaves them: a
-//! FROM subquery's, each arm's of a FROM subquery of UNION ALLs, and a WITH query's where it is
-//! read in place (once and not MATERIALIZED, or NOT MATERIALIZED, calling nothing volatile). An
-//! output is made all the same where its query returns each row once (DISTINCT) or sorts, groups
-//! or keeps a run by it, where it makes a set, folds or calls what may be volatile, and where what
-//! reads the subquery reads its whole row, a star, or meets it by NATURAL. One left unmade is read
-//! as `CASE WHEN false THEN … END`: typed as it is, and never evaluated.
+//! FROM subquery's, each arm's of a FROM subquery of UNION ALLs whose arms' columns are of the
+//! union's types, and a WITH query's where it is read in place (once and not MATERIALIZED, or NOT
+//! MATERIALIZED, calling nothing volatile). An output is made all the same where its query returns
+//! each row once (DISTINCT) or sorts, groups or keeps a run by it, where it makes a set, calls a
+//! window that reads its arguments, or calls what may be volatile, and where what reads the
+//! subquery reads its whole row or a star, or meets it by NATURAL on a name it shares. One left
+//! unmade is read as `CASE WHEN false THEN … END`: typed as it is, and never evaluated; each
+//! aggregate it calls folds no row, `FILTER (WHERE false)`, so that its query groups as before.
 
 use super::pipeline;
-use crate::catalog::ident;
+use crate::catalog::{ident, Catalog};
 use sqlparser::ast::{
     CaseWhen, CteAsMaterialized, Distinct, Expr, FunctionArgExpr, FunctionArguments, GroupByExpr,
     Ident, JoinConstraint, JoinOperator, ObjectName, OrderByKind, Query, Select, SelectItem,
@@ -18,9 +20,9 @@ use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 /// Every output nothing reads of the subqueries a statement holds, written to be left unmade.
-pub(super) fn dropped(q: &mut Query, release: u8) {
+pub(super) fn dropped(q: &mut Query, catalog: &Catalog) {
     if holds_subqueries(q) {
-        let _ = VisitMut::visit(q, &mut Dropping { release });
+        let _ = VisitMut::visit(q, &mut Dropping { catalog });
     }
 }
 
@@ -45,11 +47,11 @@ pub(super) fn holds_subqueries(q: &Query) -> bool {
     Visit::visit(q, &mut Holds).is_break()
 }
 
-struct Dropping {
-    release: u8,
+struct Dropping<'c> {
+    catalog: &'c Catalog,
 }
 
-impl VisitorMut for Dropping {
+impl VisitorMut for Dropping<'_> {
     type Break = ();
 
     /// A query's WITH queries and FROM subqueries, before the visit goes inside them: what the
@@ -78,16 +80,21 @@ impl VisitorMut for Dropping {
                 Some(CteAsMaterialized::NotMaterialized) => true,
                 None => refs.len() == 1,
             };
-            if reads.star
-                || reads.natural
-                || !in_place
-                || refs.is_empty()
-                || volatile(&cte.query, self.release)
-            {
+            let release = self.catalog.release;
+            let Some(natural) = reads.natural_names(self.catalog) else {
+                continue;
+            };
+            if reads.star || !in_place || refs.is_empty() || volatile(&cte.query, release) {
                 continue;
             }
             let renames: Vec<String> = cte.alias.columns.iter().map(|c| ident(&c.name)).collect();
-            left_unmade(&mut cte.query, &reads, &refs, &renames, self.release);
+            let read = Read {
+                reads: &reads,
+                natural: &natural,
+                refs: &refs,
+                renames: &renames,
+            };
+            left_unmade(&mut cte.query, &read, self.catalog);
         }
         let mut i = 0;
         while let Some(TableFactor::Derived { subquery, .. }) = nth_derived(q, i) {
@@ -101,16 +108,49 @@ impl VisitorMut for Dropping {
             };
             *subquery = held;
             i += 1;
-            let Some(a) = alias.as_ref().filter(|_| !reads.star && !reads.natural) else {
+            let Some(natural) = reads.natural_names(self.catalog) else {
+                continue;
+            };
+            let Some(a) = alias.as_ref().filter(|_| !reads.star) else {
                 continue;
             };
             let refs = vec![(
                 ident(&a.name),
                 a.columns.iter().map(|c| ident(&c.name)).collect(),
             )];
-            left_unmade(subquery, &reads, &refs, &[], self.release);
+            let read = Read {
+                reads: &reads,
+                natural: &natural,
+                refs: &refs,
+                renames: &[],
+            };
+            left_unmade(subquery, &read, self.catalog);
         }
         ControlFlow::Continue(())
+    }
+}
+
+/// What reads a subquery's outputs: the words of the query around it, the names a NATURAL join
+/// there may meet, and the names the subquery goes by, with those its columns take.
+struct Read<'r> {
+    reads: &'r Reads,
+    natural: &'r HashSet<String>,
+    refs: &'r [(String, Vec<String>)],
+    renames: &'r [String],
+}
+
+impl Read<'_> {
+    /// Whether its `i`th output, named `own` by its query, is read under any name it goes by.
+    fn read(&self, i: usize, own: &str) -> bool {
+        self.refs.iter().any(|(alias, columns)| {
+            let name = columns
+                .get(i)
+                .or_else(|| self.renames.get(i))
+                .map_or(own, String::as_str);
+            self.reads.bare.contains(name)
+                || self.natural.contains(name)
+                || self.reads.qualified.get(alias).is_some_and(|n| n.contains(name))
+        })
     }
 }
 
@@ -175,33 +215,19 @@ fn factors_of(t: &mut TableWithJoins) -> Vec<&mut TableFactor> {
 }
 
 /// Each output of a subquery nothing reads under any of the names it goes by, written to be left
-/// unmade; `renames` the names a WITH query's column list gives its columns.
-fn left_unmade(
-    sub: &mut Query,
-    reads: &Reads,
-    refs: &[(String, Vec<String>)],
-    renames: &[String],
-    release: u8,
-) {
-    if refs.iter().any(|(a, _)| reads.whole.contains(a)) {
+/// unmade.
+fn left_unmade(sub: &mut Query, read: &Read, catalog: &Catalog) {
+    if read.refs.iter().any(|(a, _)| read.reads.whole.contains(a)) {
         return;
     }
-    let read = |i: usize, own: &str| {
-        refs.iter().any(|(alias, columns)| {
-            let name = columns
-                .get(i)
-                .or_else(|| renames.get(i))
-                .map_or(own, String::as_str);
-            reads.bare.contains(name)
-                || reads.qualified.get(alias).is_some_and(|n| n.contains(name))
-        })
-    };
+    let read = |i: usize, own: &str| read.read(i, own);
+    let release = catalog.release;
     let sorted: Vec<Expr> = match sub.order_by.as_ref().map(|o| &o.kind) {
         Some(OrderByKind::Expressions(os)) => os.iter().map(|o| o.expr.clone()).collect(),
         _ => Vec::new(),
     };
     let whole = sorted.is_empty() && sub.limit_clause.is_none() && sub.fetch.is_none();
-    let arms = whole && union_all(&sub.body);
+    let arms = whole && union_all(&sub.body) && arms_typed_alike(sub, catalog);
     match sub.body.as_mut() {
         SetExpr::Select(s) => {
             let names = own_names(s);
@@ -218,6 +244,32 @@ fn left_unmade(
         }
         _ => {}
     }
+}
+
+/// Whether each arm of a set operation, read alone, gives its columns the types the operation
+/// gives them: only then are its arms read as subqueries of their own, each leaving its outputs.
+fn arms_typed_alike(sub: &Query, catalog: &Catalog) -> bool {
+    let types = |q: &Query| -> Option<Vec<Option<crate::catalog::ColumnType>>> {
+        let types = super::relations::types_of(catalog, q).ok()?;
+        Some(types.into_iter().map(|t| t.map(super::typed::unmodified)).collect())
+    };
+    let Some(whole) = types(sub) else {
+        return false;
+    };
+    let mut body = sub.body.as_ref().clone();
+    let mut selects = Vec::new();
+    selects_of(&mut body, &mut selects);
+    selects.into_iter().all(|s| {
+        let arm = Query {
+            body: Box::new(SetExpr::Select(Box::new(s.clone()))),
+            ..sub.clone()
+        };
+        // A literal of no type takes the operation's.
+        types(&arm).is_some_and(|t| {
+            t.len() == whole.len()
+                && t.iter().zip(&whole).all(|(a, w)| a.is_none() || a == w)
+        })
+    })
 }
 
 /// The name each item of a SELECT gives its column; none for a star.
@@ -320,7 +372,8 @@ fn unmade_items(
             || read_as_written(e) && !column_of(e).is_some_and(|c| computed.contains(&c))
             || read(i, &own)
             || keyed.iter().any(by_it)
-            || pipeline::folds_or_makes_sets(e)
+            || pipeline::holds_set(e)
+            || reads_unfiltered_arguments(e)
             || calls_volatile(e, release)
         {
             continue;
@@ -332,14 +385,62 @@ fn unmade_items(
             &mut s.projection[i],
             SelectItem::UnnamedExpr(Expr::Value(Value::Null.into())),
         );
-        let e = match item {
+        let mut e = match item {
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
             _ => unreachable!("an item of an expression"),
         };
+        let _ = VisitMut::visit(&mut e, &mut NeverFolded { depth: 0 });
         s.projection[i] = SelectItem::ExprWithAlias {
             expr: unmade_of(e),
             alias: Ident::with_quote('"', own),
         };
+    }
+}
+
+/// Whether an expression calls what reads an argument it computes that an aggregate's FILTER cannot
+/// keep from being read: a window not an aggregate's, or an ordered-set aggregate's direct one.
+fn reads_unfiltered_arguments(e: &Expr) -> bool {
+    sqlparser::ast::visit_expressions(e, |x| match x {
+        Expr::Function(f)
+            if (f.over.is_some() && !pipeline::is_aggregate(&pipeline::function_name(f))
+                || !f.within_group.is_empty())
+                && pipeline::parts_of(x).into_iter().any(|a| !read_as_written(a)) =>
+        {
+            ControlFlow::Break(())
+        }
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
+/// Each aggregate an expression calls as its query's own, written to fold no row.
+struct NeverFolded {
+    depth: usize,
+}
+
+impl VisitorMut for NeverFolded {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _q: &mut Query) -> ControlFlow<()> {
+        self.depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _q: &mut Query) -> ControlFlow<()> {
+        self.depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        if let Expr::Function(f) = e {
+            if self.depth == 0
+                && (pipeline::is_aggregate(&pipeline::function_name(f))
+                    || !f.within_group.is_empty())
+            {
+                f.filter = Some(Box::new(Expr::Value(Value::Boolean(false).into())));
+            }
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -368,7 +469,7 @@ fn column_of(e: &Expr) -> Option<String> {
 }
 
 /// Whether an expression is a column or a literal, which computes nothing: held as it is.
-fn read_as_written(e: &Expr) -> bool {
+pub(super) fn read_as_written(e: &Expr) -> bool {
     match e {
         Expr::Nested(x) => read_as_written(x),
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => true,
@@ -383,7 +484,7 @@ fn unmade_already(e: &Expr) -> bool {
 }
 
 /// Whether an expression calls what may be volatile.
-fn calls_volatile(e: &Expr, release: u8) -> bool {
+pub(super) fn calls_volatile(e: &Expr, release: u8) -> bool {
     sqlparser::ast::visit_expressions(e, |x| match x {
         Expr::Function(f)
             if super::own::may_be_volatile(&pipeline::function_name(f), release)
@@ -414,7 +515,9 @@ fn volatile(q: &Query, release: u8) -> bool {
 /// alone; each written after a relation's name; each relation read whole or by a star; whether a
 /// star of no relation or a NATURAL join stands in it; and each relation a FROM names, with the
 /// alias it goes by there and the names that alias gives its columns. Nothing inside an expression
-/// left unmade is read.
+/// left unmade is read. For a NATURAL join, the columns each relation of its FROMs may give: each
+/// table's by its name, each subquery's and each WITH query's by their own names, none known of
+/// any other.
 #[derive(Default)]
 struct Reads {
     bare: HashSet<String>,
@@ -424,6 +527,10 @@ struct Reads {
     natural: bool,
     factors: HashMap<String, Vec<(String, Vec<String>)>>,
     skipping: Option<*const Expr>,
+    tables: Vec<String>,
+    derived: Vec<Option<Vec<String>>>,
+    ctes: HashMap<String, Option<Vec<String>>>,
+    opaque: bool,
 }
 
 impl Reads {
@@ -438,6 +545,58 @@ impl Reads {
             self.whole.insert(ident(last));
         }
     }
+
+    /// The names a NATURAL join among its FROMs may meet: every column of every relation they
+    /// name, none where it holds no NATURAL join; nothing known where a relation's are not.
+    fn natural_names(&self, catalog: &Catalog) -> Option<HashSet<String>> {
+        let mut out = HashSet::new();
+        if !self.natural {
+            return Some(out);
+        }
+        if self.opaque {
+            return None;
+        }
+        for t in &self.tables {
+            if let Some(c) = self.ctes.get(t).filter(|_| !t.contains('.')) {
+                out.extend(c.clone()?);
+            } else if let Some(table) = catalog.table(t).or_else(|| {
+                catalog
+                    .tables
+                    .iter()
+                    .find(|x| !t.contains('.') && x.name.rsplit('.').next() == Some(t.as_str()))
+            }) {
+                out.extend(table.own_columns().iter().map(|c| c.name.clone()));
+            } else if let Some(v) = catalog.view(t) {
+                out.extend(v.columns.iter().cloned());
+            } else {
+                return None;
+            }
+        }
+        for d in &self.derived {
+            out.extend(d.clone()?);
+        }
+        Some(out)
+    }
+}
+
+/// The names a query's columns go by: its first SELECT's, renamed first by `renames`; none known
+/// where it returns a star.
+pub(super) fn names_of(q: &Query, renames: &[String]) -> Option<Vec<String>> {
+    let mut body = q.body.as_ref();
+    while let SetExpr::SetOperation { left, .. } = body {
+        body = left;
+    }
+    let own = match body {
+        SetExpr::Select(s) => own_names(s).into_iter().collect::<Option<Vec<_>>>()?,
+        SetExpr::Query(q) => names_of(q, &[])?,
+        _ => return None,
+    };
+    Some(
+        own.into_iter()
+            .enumerate()
+            .map(|(i, n)| renames.get(i).cloned().unwrap_or(n))
+            .collect(),
+    )
 }
 
 impl Visitor for Reads {
@@ -456,6 +615,11 @@ impl Visitor for Reads {
                 }
                 _ => {}
             }
+        }
+        for cte in q.with.iter().flat_map(|w| &w.cte_tables) {
+            let renames: Vec<String> = cte.alias.columns.iter().map(|c| ident(&c.name)).collect();
+            self.ctes
+                .insert(ident(&cte.alias.name), names_of(&cte.query, &renames));
         }
         let mut found = Vec::new();
         selects(&q.body, &mut found);
@@ -501,6 +665,23 @@ impl Visitor for Reads {
     fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
         if self.skipping.is_some() {
             return ControlFlow::Continue(());
+        }
+        match t {
+            TableFactor::Table { name, args, .. } if args.is_none() => {
+                self.tables.push(crate::catalog::object_name(name));
+            }
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let renames: Vec<String> = alias
+                    .iter()
+                    .flat_map(|a| &a.columns)
+                    .map(|c| ident(&c.name))
+                    .collect();
+                self.derived.push(names_of(subquery, &renames));
+            }
+            TableFactor::NestedJoin { .. } => {}
+            _ => self.opaque = true,
         }
         if let TableFactor::Table { name, alias, .. } = t {
             if let Some(last) = name.0.last().and_then(|p| p.as_ident()) {
